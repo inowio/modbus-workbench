@@ -16,7 +16,7 @@
     "@tauri-apps/plugin-dialog": "^2",
     "@tauri-apps/plugin-fs": "^2",
     "echarts": "^6.0.0",
-    "echarts-for-react": "^3.0.5",
+    "echarts-for-react": "^3.0.6",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
     "react-grid-layout": "^2.2.2",
@@ -36,6 +36,6 @@
     "tailwindcss": "^4.1.18",
     "typescript": "~5.8.3",
     "vite": "^7.0.4",
-    "vitest": "^2.0.5"
+    "vitest": "^4.1.6"
   }
 }
