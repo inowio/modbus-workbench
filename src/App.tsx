@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Navigate, Route, Routes, useNavigate } from "react-router-dom";
+import { openUrl } from "@tauri-apps/plugin-opener";
 
 import Screen2Layout from "./screen2/Screen2Layout";
 import AboutPage from "./screen2/pages/AboutPage";
@@ -11,6 +12,7 @@ import SlavesPage from "./screen2/pages/SlavesPage";
 import WorkspacePage from "./screen2/pages/WorkspacePage";
 import WorkspaceScreen, { Workspace } from "./screens/WorkspaceScreen";
 import UpdateDialog from "./components/UpdateDialog";
+import EditableContextMenu from "./components/EditableContextMenu";
 import { checkForUpdate, installAndRelaunch } from "./screen2/api/updater";
 import type { Update } from "@tauri-apps/plugin-updater";
 
@@ -69,6 +71,29 @@ function App() {
     };
   }, []);
 
+  // Route external links (`<a target="_blank">`) through the OS browser via
+  // the opener plugin. The Tauri webview otherwise swallows navigation
+  // requests, so plain anchor clicks silently do nothing.
+  useEffect(() => {
+    function onClick(e: MouseEvent) {
+      if (e.defaultPrevented) return;
+      if (e.button !== 0) return;
+      const anchor = (e.target as Element | null)?.closest("a");
+      if (!(anchor instanceof HTMLAnchorElement)) return;
+      const href = anchor.getAttribute("href");
+      if (!href) return;
+      const isExternal =
+        anchor.target === "_blank" || /^https?:\/\//i.test(href) || /^mailto:/i.test(href);
+      if (!isExternal) return;
+      e.preventDefault();
+      void openUrl(href).catch(() => {
+        // Best-effort; if the opener plugin is unavailable (e.g. in dev), do nothing.
+      });
+    }
+    document.addEventListener("click", onClick);
+    return () => document.removeEventListener("click", onClick);
+  }, []);
+
   return (
     <>
       <Routes>
@@ -98,6 +123,8 @@ function App() {
           onClose={() => setUpdatePrompt(null)}
         />
       ) : null}
+
+      <EditableContextMenu />
     </>
   );
 }

@@ -4,7 +4,24 @@ All notable changes to this project are tracked here following [Keep a Changelog
 
 ## [Unreleased]
 
-_No changes yet._
+### Added
+- Custom right-click context menu on text inputs and textareas with Cut,
+  Copy, Paste, Delete, and Select All. Replaces the browser's default
+  context menu so the app feels consistently desktop-native.
+
+### Changed
+- External links (GitHub source, releases, etc.) now open in the system
+  browser via the Tauri opener plugin. Previously they silently did nothing
+  inside the locked-down webview.
+- GitHub Actions release workflow now uses `actions/checkout@v5` and
+  `actions/setup-node@v5` (Node.js 24 runtime), clearing the Node.js 20
+  deprecation warnings GitHub started emitting.
+
+### Documentation
+- `docs/RELEASING.md` now documents the mandatory
+  `bundle.createUpdaterArtifacts: true` flag, the PR-required release flow
+  under branch protection, and a troubleshooting section for missing
+  updater artifacts.
 
 ## [0.2.0] - 2026-05-20
 ### Added

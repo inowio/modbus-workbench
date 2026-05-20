@@ -53,6 +53,13 @@ Replace the placeholder in [`src-tauri/tauri.conf.json`](../src-tauri/tauri.conf
 printed. Commit and push the change on `main` **before** cutting your first
 release.
 
+> **Don't forget `bundle.createUpdaterArtifacts: true`.** Tauri 2 defaults
+> this flag to `false`, which means the bundler will skip producing `.sig`
+> files and `latest.json` *regardless* of whether the signing key is set.
+> Verify the flag is present in `src-tauri/tauri.conf.json` before the
+> first release — without it, the workflow succeeds but the auto-updater
+> has no manifest to fetch and no signatures to verify.
+
 ### 3. Set the CI secrets
 
 The release workflow reads two secrets:
@@ -84,10 +91,20 @@ it.
       The bump script refuses to run if this section is empty.
 - [ ] CI is green on `main`.
 
-### Run the bump
+### Cut the release through a release branch
+
+`main` is protected — direct pushes are rejected. Every release goes through
+a one-commit release branch and a PR. The tag is created **after** the PR
+merges, on the canonical merge commit.
 
 ```bash
+git checkout main
+git pull
+git checkout -b release/v0.2.0
 npm run release -- 0.2.0
+git add -A
+git commit -m "chore(release): v0.2.0"
+git push -u origin release/v0.2.0
 ```
 
 The script:
@@ -100,15 +117,27 @@ The script:
   and the `inowio-modbus-toolbox` entry in `src-tauri/Cargo.lock`.
 - Renames `## [Unreleased]` in `CHANGELOG.md` to `## [0.2.0] - YYYY-MM-DD`
   and inserts a fresh empty `## [Unreleased]` block above it.
+- Does **not** commit or tag — you do that explicitly so the commit message
+  stays under your control.
 
-The script does **not** commit or tag — you do that explicitly:
+Open a PR from `release/v0.2.0` → `main`, title `chore(release): v0.2.0`,
+and **squash-merge** it (linear history is enforced). After the merge:
 
 ```bash
-git add -A
-git commit -m "chore(release): v0.2.0"
+git checkout main
+git pull
 git tag v0.2.0
-git push && git push origin v0.2.0
+git push origin v0.2.0
 ```
+
+The `git push origin v0.2.0` is what fires the release workflow — the tag
+points at the squash-merge commit on `main`, which is what users will browse
+on GitHub.
+
+> **Why not just push the tag to the release branch?** Because squash-merge
+> changes the commit hash. A tag created on the release branch would dangle
+> at a commit that never reaches `main`. Tag the canonical commit on `main`,
+> not the branch one.
 
 ### Watch the workflow
 
@@ -128,17 +157,65 @@ installers, `.sig` files, and `latest.json` attached.
 ### Publish the draft
 
 1. Open the draft release.
-2. Skim the artifact list — you should see `.msi`, `.exe`, `.AppImage`,
-   `.deb`, `.rpm`, `.dmg`, matching `.sig` files for each, and one
-   `latest.json`.
-3. Edit the release notes if you want richer formatting than the changelog
+2. Skim the artifact list. For a healthy updater-enabled release you should
+   see ~16 assets:
+   - 6 installers — `.msi`, `*-setup.exe`, `.dmg`, `.AppImage`, `.deb`, `.rpm`
+   - 5 `.sig` files — one per installer **except** the `.dmg`
+   - `*_universal.app.tar.gz` and its `.sig` — the macOS update artifact
+   - `latest.json` — the updater manifest
+   - 2 source-code archives (auto-added by GitHub)
+3. **Critical sanity check:** if `latest.json` or any `.sig` files are
+   missing, do **not** publish. See [Updater artifacts didn't generate](#updater-artifacts-didnt-generate)
+   below.
+4. Edit the release notes if you want richer formatting than the changelog
    provides.
-4. Click **Publish release**.
+5. Click **Publish release**.
 
 Within seconds, the GitHub Releases "latest" URL points to your new release.
 Installed apps with the auto-updater enabled will see it on next startup.
 
 ## Recovering from a failed build
+
+### Updater artifacts didn't generate
+
+Symptom: draft release has installers but no `latest.json` and no `.sig`
+files. The build log shows `Signature not found for the updater JSON.
+Skipping upload...`.
+
+Root cause is almost always **one** of these, in order of frequency:
+
+1. `bundle.createUpdaterArtifacts` is `false` (or missing) in
+   `src-tauri/tauri.conf.json`. This is the Tauri 2 default — must be
+   explicitly set to `true`.
+2. `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` doesn't match the password used
+   when the keypair was generated. Signing fails silently and `tauri-action`
+   carries on without the `.sig` files.
+3. Either signing secret is missing or malformed (line endings mangled by a
+   copy-paste, etc.).
+
+Quick local check for #2: try signing a throwaway file with the key locally:
+
+```bash
+echo test > t.txt
+npx tauri signer sign -f /path/to/your.key -p "<YOUR-PASSWORD>" t.txt
+```
+
+If that produces `t.txt.sig`, your password matches the key. If it errors,
+regenerate the keypair ([Updater key rotation](#updater-key-rotation)
+below — but read the warning first).
+
+After fixing the cause: delete the draft release, delete the tag locally
+and on origin, re-tag `main`, and push the tag again.
+
+```bash
+git tag -d v0.2.0
+git push origin --delete v0.2.0
+git checkout main && git pull
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+
 
 ### One platform failed, the others succeeded
 
