@@ -1,0 +1,157 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to release (e.g. v0.2.0). Must already be pushed."
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify-version:
+    name: Verify version matches tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - name: Resolve tag
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "${{ github.event.inputs.tag }}" ]]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Tag '$TAG' is not a v<semver> tag."
+            exit 1
+          fi
+          VERSION="${TAG#v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Resolved tag: $TAG"
+          echo "Resolved version: $VERSION"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.resolve.outputs.tag }}
+
+      - name: Check every version field agrees with the tag
+        shell: bash
+        env:
+          EXPECTED: ${{ steps.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          PKG=$(node -p "require('./package.json').version")
+          TAURI=$(node -p "JSON.parse(require('fs').readFileSync('./src-tauri/tauri.conf.json','utf8')).version")
+          CARGO=$(grep -m1 '^version' src-tauri/Cargo.toml | sed -E 's/version *= *"([^"]+)"/\1/')
+
+          echo "tag       = $EXPECTED"
+          echo "package.json     = $PKG"
+          echo "tauri.conf.json  = $TAURI"
+          echo "Cargo.toml       = $CARGO"
+
+          MISMATCH=0
+          if [[ "$PKG" != "$EXPECTED" ]]; then
+            echo "::error file=package.json::package.json version ($PKG) does not match tag ($EXPECTED)"
+            MISMATCH=1
+          fi
+          if [[ "$TAURI" != "$EXPECTED" ]]; then
+            echo "::error file=src-tauri/tauri.conf.json::tauri.conf.json version ($TAURI) does not match tag ($EXPECTED)"
+            MISMATCH=1
+          fi
+          if [[ "$CARGO" != "$EXPECTED" ]]; then
+            echo "::error file=src-tauri/Cargo.toml::Cargo.toml version ($CARGO) does not match tag ($EXPECTED)"
+            MISMATCH=1
+          fi
+          if [[ $MISMATCH -ne 0 ]]; then
+            exit 1
+          fi
+          echo "All version fields agree with the tag."
+
+  build:
+    name: Build (${{ matrix.platform }})
+    needs: verify-version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: "macos-latest"
+            args: "--target universal-apple-darwin"
+            rust-targets: "aarch64-apple-darwin,x86_64-apple-darwin"
+          - platform: "ubuntu-22.04"
+            args: ""
+            rust-targets: ""
+          - platform: "windows-latest"
+            args: ""
+            rust-targets: ""
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.verify-version.outputs.tag }}
+
+      - name: Install Linux build dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libudev-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libssl-dev
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "lts/*"
+          cache: "npm"
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-targets }}
+
+      - name: Rust build cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+          shared-key: ${{ matrix.platform }}
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build and upload release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ needs.verify-version.outputs.tag }}
+          releaseName: ${{ needs.verify-version.outputs.tag }}
+          releaseDraft: true
+          prerelease: ${{ contains(needs.verify-version.outputs.tag, '-') }}
+          includeUpdaterJson: true
+          args: ${{ matrix.args }}
