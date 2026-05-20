@@ -1,4 +1,3 @@
-#!/usr/bin/env node
 // Bump the app version across every place it lives, validate the changelog,
 // and refuse to run when the local state would conflict with a future
 // `git push --tags`. The script never commits or tags — it just rewrites

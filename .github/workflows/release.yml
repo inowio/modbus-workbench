@@ -46,7 +46,7 @@ jobs:
           echo "Resolved tag: $TAG"
           echo "Resolved version: $VERSION"
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ steps.resolve.outputs.tag }}
 
@@ -101,7 +101,7 @@ jobs:
             rust-targets: ""
     runs-on: ${{ matrix.platform }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ needs.verify-version.outputs.tag }}
 
@@ -123,7 +123,7 @@ jobs:
             libssl-dev
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: "lts/*"
           cache: "npm"
