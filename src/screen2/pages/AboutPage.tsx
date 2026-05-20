@@ -1,5 +1,47 @@
+import { useState } from "react";
+import { FiRefreshCcw, FiCheckCircle, FiAlertCircle, FiDownload } from "react-icons/fi";
+import type { Update } from "@tauri-apps/plugin-updater";
+
+import UpdateDialog from "../../components/UpdateDialog";
+import { checkForUpdate, installAndRelaunch } from "../api/updater";
+
+const RELEASES_URL = "https://github.com/inowio/modbus-toolbox/releases/latest";
+
+type CheckState =
+  | { kind: "idle" }
+  | { kind: "checking" }
+  | { kind: "up-to-date" }
+  | { kind: "error"; message: string };
+
+type UpdatePrompt = {
+  version: string;
+  currentVersion: string;
+  notes: string | null;
+  update: Update;
+};
+
 export default function AboutPage() {
   const versionLabel = __APP_VERSION__;
+  const [checkState, setCheckState] = useState<CheckState>({ kind: "idle" });
+  const [updatePrompt, setUpdatePrompt] = useState<UpdatePrompt | null>(null);
+
+  async function handleCheck() {
+    setCheckState({ kind: "checking" });
+    const result = await checkForUpdate();
+    if (result.status === "available") {
+      setUpdatePrompt({
+        version: result.version,
+        currentVersion: result.currentVersion,
+        notes: result.notes,
+        update: result.update,
+      });
+      setCheckState({ kind: "idle" });
+    } else if (result.status === "up-to-date") {
+      setCheckState({ kind: "up-to-date" });
+    } else {
+      setCheckState({ kind: "error", message: result.message });
+    }
+  }
 
   return (
     <div className="flex flex-1 flex-col gap-4">
@@ -26,13 +68,41 @@ export default function AboutPage() {
               width={128}
               height={128}
             />
-            <div>
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:gap-3">
               <h3 className="text-lg font-semibold text-slate-900 dark:text-slate-200">
                 Modbus Toolbox
                 <span className="ml-2 inline-flex items-center rounded-full bg-emerald-500/10 px-2 py-1 text-xs font-medium text-emerald-700 dark:text-emerald-400">
                   {versionLabel}
                 </span>
               </h3>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  className="inline-flex items-center gap-2 rounded-full border border-slate-300 bg-slate-100 px-3 py-1 text-xs font-semibold text-slate-700 transition hover:border-emerald-500/60 hover:text-emerald-700 disabled:cursor-not-allowed disabled:opacity-60 dark:border-slate-700 dark:bg-white/5 dark:text-slate-100 dark:hover:text-emerald-100"
+                  onClick={handleCheck}
+                  disabled={checkState.kind === "checking"}
+                  title="Check for updates"
+                >
+                  {checkState.kind === "checking" ? (
+                    <FiRefreshCcw className="h-3 w-3 animate-spin" aria-hidden="true" />
+                  ) : (
+                    <FiRefreshCcw className="h-3 w-3" aria-hidden="true" />
+                  )}
+                  Check for updates
+                </button>
+                {checkState.kind === "up-to-date" ? (
+                  <span className="inline-flex items-center gap-1 text-xs text-emerald-700 dark:text-emerald-300">
+                    <FiCheckCircle className="h-3 w-3" aria-hidden="true" />
+                    You're on the latest version.
+                  </span>
+                ) : null}
+                {checkState.kind === "error" ? (
+                  <span className="inline-flex items-center gap-1 text-xs text-rose-700 dark:text-rose-300" title={checkState.message}>
+                    <FiAlertCircle className="h-3 w-3" aria-hidden="true" />
+                    Could not check for updates.
+                  </span>
+                ) : null}
+              </div>
             </div>
           </div>
 
@@ -45,7 +115,7 @@ export default function AboutPage() {
                 The tool supports commissioning, troubleshooting, and validation of Modbus-based systems across TCP and Serial (RTU) networks, keeping everything local and offline-first for field reliability.
               </p>
             </div>
-            
+
             <div className="grid gap-6 lg:grid-cols-2 ">
               <div className="group relative overflow-hidden rounded-xl border border-slate-200 bg-linear-to-br from-slate-50 to-white p-6 transition-all hover:border-emerald-600/30 shadow-inner shadow-black/5 dark:shadow-black/30 hover:shadow-lg hover:shadow-emerald-600/10 dark:border-slate-800/50 dark:from-slate-800/40 dark:to-slate-900/60 dark:hover:border-emerald-500/30 dark:hover:shadow-emerald-500/10">
                 <h4 className="text-sm font-semibold uppercase tracking-widest text-emerald-700 dark:text-emerald-300">What this software can do</h4>
@@ -99,6 +169,18 @@ export default function AboutPage() {
                 https://github.com/inowio/modbus-toolbox
               </a>
             </p>
+            <p>
+              <span className="font-semibold text-slate-900 dark:text-slate-100">Downloads:</span>
+              <a
+                href={RELEASES_URL}
+                className="ml-2 inline-flex items-center gap-1 text-emerald-800 transition hover:text-sky-700 dark:text-emerald-400 dark:hover:text-emerald-300"
+                target="_blank"
+                rel="noreferrer"
+              >
+                <FiDownload className="h-3 w-3" aria-hidden="true" />
+                Latest release on GitHub
+              </a>
+            </p>
             </div>
           </div>
 
@@ -135,6 +217,17 @@ export default function AboutPage() {
           </div>
         </div>
       </div>
+
+      {updatePrompt ? (
+        <UpdateDialog
+          open
+          version={updatePrompt.version}
+          currentVersion={updatePrompt.currentVersion}
+          notes={updatePrompt.notes}
+          install={(onProgress) => installAndRelaunch(updatePrompt.update, onProgress)}
+          onClose={() => setUpdatePrompt(null)}
+        />
+      ) : null}
     </div>
   );
 }

@@ -1,5 +1,9 @@
 # Inowio Modbus Toolbox
 
+[![Latest release](https://img.shields.io/github/v/release/inowio/modbus-toolbox?include_prereleases&sort=semver)](https://github.com/inowio/modbus-toolbox/releases/latest)
+[![Release workflow](https://github.com/inowio/modbus-toolbox/actions/workflows/release.yml/badge.svg)](https://github.com/inowio/modbus-toolbox/actions/workflows/release.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-emerald.svg)](LICENSE)
+
 Desktop toolkit for configuring, testing, and monitoring Modbus TCP/RTU devices. Built with Tauri, React, and TypeScript for a lightweight, cross-platform experience.
 
 ![Inowio Modbus Toolbox](public/logo.svg)
@@ -11,6 +15,36 @@ Desktop toolkit for configuring, testing, and monitoring Modbus TCP/RTU devices.
 - Real-time analyzer powered by ECharts plus traffic capture for debugging
 - Rich logging, dark/light theming, and keyboard-friendly UI
 - Ships as a native desktop app for Windows, macOS, and Linux
+- In-app auto-updater with a manual "Check for updates" button on the About page
+
+## Install
+
+Pre-built installers for every release live on the
+**[Releases page](https://github.com/inowio/modbus-toolbox/releases/latest)**.
+Pick the right one for your OS:
+
+| OS      | Recommended installer | Auto-update | Notes                                    |
+| ------- | --------------------- | ----------- | ---------------------------------------- |
+| Windows | `*-setup.exe` (NSIS)  | Yes         | Use this for personal/desktop installs.  |
+| Windows | `*.msi`               | No          | Manual re-install only; for MDM/IT use.  |
+| macOS   | `*.dmg`               | Yes         | Universal binary (Intel + Apple Silicon).|
+| Linux   | `*.AppImage`          | Yes         | Mark executable, then run.               |
+| Linux   | `*.deb` / `*.rpm`     | No          | Manual re-install only.                  |
+
+> **First-launch warning.** The binary is currently unsigned at the OS level,
+> so the first time you run it Windows SmartScreen will show "Windows
+> protected your PC" — click **More info → Run anyway**. macOS Gatekeeper
+> will say the app cannot be opened — right-click the app and choose
+> **Open**, then confirm. After this one-time approval, auto-updates inherit
+> the trust and install silently.
+
+### How updates work
+
+Every release after the auto-update feature shipped checks
+`https://github.com/inowio/modbus-toolbox/releases/latest` on startup. If a
+newer version exists, the app prompts you to install — you can also trigger
+the check manually from the **About** page. Updates are minisign-signed by
+the updater key, so a tampered download is rejected.
 
 ## Getting Started
 
@@ -45,6 +79,14 @@ npm run lint        # Frontend linting
 npm run fmt         # Format Rust sources
 ```
 
+## Unit Testing
+
+```bash
+npm run test:run
+cd src-tauri
+cargo test
+```
+
 Configuration tips:
 
 - Dev server defaults: `VITE_DEV_SERVER_HOST=127.0.0.1`, `VITE_DEV_SERVER_PORT=1422`
@@ -71,6 +113,8 @@ cd modbus-toolbox/
 ## Contributing
 
 Please read [CONTRIBUTING.md](CONTRIBUTING.md) before opening an issue or pull request. Conventional commits, automated tests, and linted code help us triage quickly.
+
+Maintainers cutting a release: see [docs/RELEASING.md](docs/RELEASING.md).
 
 ## License
 

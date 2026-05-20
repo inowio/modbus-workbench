@@ -43,6 +43,13 @@ Please add or update tests alongside new features or bug fixes.
 - **Bug reports**: include OS, app version, Node/Rust versions, reproduction steps, expected vs actual results, and logs/screenshots if possible.
 - **Feature ideas**: describe the use case, desired outcome, and any alternatives considered.
 
+## Releasing
+
+Maintainers cut releases via `npm run release -- X.Y.Z` followed by pushing
+the `vX.Y.Z` tag. The full runbook — one-time keypair setup, CI secrets,
+publishing the draft release, failure recovery, and pre-release tags — is
+in [docs/RELEASING.md](docs/RELEASING.md).
+
 ## Community Expectations
 
 Be respectful, inclusive, and helpful. Use GitHub Issues for bugs/features and Discussions for questions or ideas.
