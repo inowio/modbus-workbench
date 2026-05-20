@@ -4,6 +4,9 @@ All notable changes to this project are tracked here following [Keep a Changelog
 
 ## [Unreleased]
 
+_No changes yet._
+
+## [0.2.0] - 2026-05-20
 ### Added
 - GitHub Actions release workflow that builds Windows, Linux, and macOS
   installers on every `v*` tag and publishes them as a draft release with
