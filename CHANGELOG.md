@@ -4,6 +4,9 @@ All notable changes to this project are tracked here following [Keep a Changelog
 
 ## [Unreleased]
 
+_No changes yet._
+
+## [0.2.1] - 2026-05-20
 ### Added
 - Custom right-click context menu on text inputs and textareas with Cut,
   Copy, Paste, Delete, and Select All. Replaces the browser's default
