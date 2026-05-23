@@ -9,7 +9,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
 
 const SEMVER_RE = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/;
-const CARGO_PACKAGE_NAME = "inowio-modbus-toolbox";
+const CARGO_PACKAGE_NAME = "modbus-workbench";
 
 export function parseSemver(version) {
   const m = SEMVER_RE.exec(version);

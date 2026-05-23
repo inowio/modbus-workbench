@@ -6,6 +6,26 @@ All notable changes to this project are tracked here following [Keep a Changelog
 
 _No changes yet._
 
+## [0.3.0] - 2026-05-23
+### Changed
+- **Renamed the project from "Modbus Toolbox" to "Modbus Workbench"** to
+  avoid a trademark conflict with Infineon's ModbusToolbox. The GitHub
+  repository moved to <https://github.com/inowio/modbus-workbench>.
+- Bundle identifier changed from `in.inowio.modbus.toolbox` to
+  `in.inowio.modbus.workbench`. **This is a breaking change for existing
+  installs:** the OS treats v0.3.0 as a new application, so v0.2.x users
+  will not receive an automatic update and must download and install
+  v0.3.0 manually. Workspaces and settings stored under the old
+  `in.inowio.modbus.toolbox` config directory are not migrated
+  automatically.
+- Dropped the `inowio-` prefix from internal package identifiers: Cargo
+  package `inowio-modbus-workbench` → `modbus-workbench`, Rust library
+  `inowio_modbus_workbench_lib` → `modbus_workbench_lib`, npm package
+  name `inowio-modbus-workbench` → `modbus-workbench`. The GitHub
+  organization (`inowio/`) already provides the namespace.
+- Updater feed URL now points at the new repository's
+  `releases/latest/download/latest.json`.
+
 ## [0.2.1] - 2026-05-20
 ### Added
 - Custom right-click context menu on text inputs and textareas with Cut,
@@ -43,7 +63,7 @@ _No changes yet._
 ## [0.1.0] - 2025-02-05
 
 ### Added
-- Initial public release of Inowio Modbus Toolbox
+- Initial public release of Inowio Modbus Workbench
 - Modbus TCP/RTU connection management with persistent workspaces
 - Device registry, analyzer, traffic monitor, and logging system
 - Cross-platform bundles plus documentation and help content

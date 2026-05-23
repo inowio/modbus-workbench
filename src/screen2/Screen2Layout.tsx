@@ -112,8 +112,8 @@ export default function Screen2Layout() {
 
   useEffect(() => {
     const title = workspaceName
-      ? `Inowio - Modbus Toolbox v${__APP_VERSION__} - ${workspaceName}`
-      : `Inowio - Modbus Toolbox v${__APP_VERSION__}`;
+      ? `Inowio - Modbus Workbench v${__APP_VERSION__} - ${workspaceName}`
+      : `Inowio - Modbus Workbench v${__APP_VERSION__}`;
     void getCurrentWebviewWindow().setTitle(title);
   }, [workspaceName]);
 
@@ -515,7 +515,7 @@ export default function Screen2Layout() {
                 <p className="text-xs uppercase font-semibold  dark:font-normal tracking-[0.45em] text-emerald-700 dark:text-emerald-400">
                   <span className="brand-name">INOWIO</span>
                 </p>
-                <div className="truncate tracking-widest text-lg">Modbus Toolbox</div>
+                <div className="truncate tracking-widest text-lg">Modbus Workbench</div>
               </div>
             </div>
           </div>

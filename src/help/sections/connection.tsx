@@ -5,7 +5,7 @@ import type { HelpSectionDefinition } from "../types";
 const connectionSection: HelpSectionDefinition = {
   slug: "connection",
   title: "Connection",
-  description: "Define how Modbus Toolbox reaches your devices—RTU, TCP, testing, inheritance, and best practices.",
+  description: "Define how Modbus Workbench reaches your devices—RTU, TCP, testing, inheritance, and best practices.",
   keywords: ["connection", "rtu", "tcp", "serial", "test", "inheritance", "examples"],
   searchText:
     "Connection screen sets the workspace-wide transport. Learn the difference between RTU and TCP, serial field meanings, TCP host/port, save & test behavior, status indicators, inheritance model, common mistakes, practical examples, and best practices.",
@@ -26,7 +26,7 @@ const connectionSection: HelpSectionDefinition = {
     <div className="space-y-6">
       <SectionBlock section="connection" anchor="overview" title="What is the Connection screen?">
         <p>
-          The Connection screen defines <strong>how Modbus Toolbox communicates with devices</strong>. It answers the question,
+          The Connection screen defines <strong>how Modbus Workbench communicates with devices</strong>. It answers the question,
           “How do I reach the Modbus slaves in this workspace?” and acts as the default communication layer that every slave inherits.
         </p>
       </SectionBlock>

@@ -1,12 +1,12 @@
-# Inowio Modbus Toolbox
+# Inowio Modbus Workbench
 
-[![Latest release](https://img.shields.io/github/v/release/inowio/modbus-toolbox?include_prereleases&sort=semver)](https://github.com/inowio/modbus-toolbox/releases/latest)
-[![Release workflow](https://github.com/inowio/modbus-toolbox/actions/workflows/release.yml/badge.svg)](https://github.com/inowio/modbus-toolbox/actions/workflows/release.yml)
+[![Latest release](https://img.shields.io/github/v/release/inowio/modbus-workbench?include_prereleases&sort=semver)](https://github.com/inowio/modbus-workbench/releases/latest)
+[![Release workflow](https://github.com/inowio/modbus-workbench/actions/workflows/release.yml/badge.svg)](https://github.com/inowio/modbus-workbench/actions/workflows/release.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-emerald.svg)](LICENSE)
 
 Desktop toolkit for configuring, testing, and monitoring Modbus TCP/RTU devices. Built with Tauri, React, and TypeScript for a lightweight, cross-platform experience.
 
-![Inowio Modbus Toolbox](public/logo.svg)
+![Inowio Modbus Workbench](public/logo.svg)
 
 ## Highlights
 
@@ -20,7 +20,7 @@ Desktop toolkit for configuring, testing, and monitoring Modbus TCP/RTU devices.
 ## Install
 
 Pre-built installers for every release live on the
-**[Releases page](https://github.com/inowio/modbus-toolbox/releases/latest)**.
+**[Releases page](https://github.com/inowio/modbus-workbench/releases/latest)**.
 Pick the right one for your OS:
 
 | OS      | Recommended installer | Auto-update | Notes                                    |
@@ -41,7 +41,7 @@ Pick the right one for your OS:
 ### How updates work
 
 Every release after the auto-update feature shipped checks
-`https://github.com/inowio/modbus-toolbox/releases/latest` on startup. If a
+`https://github.com/inowio/modbus-workbench/releases/latest` on startup. If a
 newer version exists, the app prompts you to install — you can also trigger
 the check manually from the **About** page. Updates are minisign-signed by
 the updater key, so a tampered download is rejected.
@@ -56,8 +56,8 @@ the updater key, so a tampered download is rejected.
 ### Quick Start
 
 ```bash
-git clone https://github.com/inowio/modbus-toolbox.git
-cd modbus-toolbox
+git clone https://github.com/inowio/modbus-workbench.git
+cd modbus-workbench
 npm install
 npm run tauri dev
 ```
@@ -90,13 +90,13 @@ cargo test
 Configuration tips:
 
 - Dev server defaults: `VITE_DEV_SERVER_HOST=127.0.0.1`, `VITE_DEV_SERVER_PORT=1422`
-- Bundled identifier: `TAURI_BUNDLE_IDENTIFIER=in.inowio.modbus.toolbox`
-- App data lives under the OS config directory (e.g., `%APPDATA%/in.inowio.modbus.toolbox/` on Windows)
+- Bundled identifier: `TAURI_BUNDLE_IDENTIFIER=in.inowio.modbus.workbench`
+- App data lives under the OS config directory (e.g., `%APPDATA%/in.inowio.modbus.workbench/` on Windows)
 
 ## Project Structure
 
 ```
-cd modbus-toolbox/
+cd modbus-workbench/
 ├── src/            # React + TypeScript UI
 ├── src-tauri/      # Rust backend, Tauri config, icons
 ├── public/         # Static assets & screenshots
@@ -122,8 +122,8 @@ Released under the [MIT License](LICENSE).
 
 ## Support & Contact
 
-- Issues: <https://github.com/inowio/modbus-toolbox/issues>
-- Discussions: <https://github.com/inowio/modbus-toolbox/discussions>
+- Issues: <https://github.com/inowio/modbus-workbench/issues>
+- Discussions: <https://github.com/inowio/modbus-workbench/discussions>
 - Email: <support@inowio.in>
 
 ---

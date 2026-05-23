@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Inowio-Modbus-Toolbox",
-  "version": "0.2.1",
-  "identifier": "in.inowio.modbus.toolbox",
+  "productName": "Modbus-Workbench",
+  "version": "0.3.0",
+  "identifier": "in.inowio.modbus.workbench",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1422",
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "Inowio - Modbus Toolbox",
+        "title": "Inowio - Modbus Workbench",
         "width": 1280,
         "height": 720,
         "maximized": true,
@@ -36,7 +36,7 @@
       "icons/icon.ico"
     ],
     "copyright": "Inowio Technologies LLP",
-    "longDescription": "Modbus Toolbox",
+    "longDescription": "Modbus Workbench",
     "homepage": "https://inowio.in",
     "publisher": "Inowio Technologies LLP",
     "shortDescription": "Configure, test, monitor the Modbus devices.",
@@ -60,7 +60,7 @@
   "plugins": {
     "updater": {
       "endpoints": [
-        "https://github.com/inowio/modbus-toolbox/releases/latest/download/latest.json"
+        "https://github.com/inowio/modbus-workbench/releases/latest/download/latest.json"
       ],
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDBCMERGRTU0MTJERURFQTUKUldTbDN0NFNWUDROQyt0dmdoVlVOSS9udGlhbmxnbG5UdkVSeGhaQWdGemN6MUxpZm1ZdWVhT1kK"
     }

@@ -134,7 +134,7 @@ pub fn run() {
         .setup(|app| {
             let version = app.package_info().version.to_string();
             if let Some(window) = app.get_webview_window("main") {
-                let _ = window.set_title(&format!("Inowio - Modbus Toolbox v{}", version));
+                let _ = window.set_title(&format!("Inowio - Modbus Workbench v{}", version));
             }
 
             let handle = app.handle();

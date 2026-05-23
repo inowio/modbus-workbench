@@ -5,7 +5,7 @@ import type { Update } from "@tauri-apps/plugin-updater";
 import UpdateDialog from "../../components/UpdateDialog";
 import { checkForUpdate, installAndRelaunch } from "../api/updater";
 
-const RELEASES_URL = "https://github.com/inowio/modbus-toolbox/releases/latest";
+const RELEASES_URL = "https://github.com/inowio/modbus-workbench/releases/latest";
 
 type CheckState =
   | { kind: "idle" }
@@ -70,7 +70,7 @@ export default function AboutPage() {
             />
             <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:gap-3">
               <h3 className="text-lg font-semibold text-slate-900 dark:text-slate-200">
-                Modbus Toolbox
+                Modbus Workbench
                 <span className="ml-2 inline-flex items-center rounded-full bg-emerald-500/10 px-2 py-1 text-xs font-medium text-emerald-700 dark:text-emerald-400">
                   {versionLabel}
                 </span>
@@ -109,7 +109,7 @@ export default function AboutPage() {
           <div className="mt-4 space-y-4 text-base leading-relaxed text-slate-900 dark:text-slate-200">
             <div className="mb-6 flex flex-col gap-2">
               <p>
-                <strong>Modbus Toolbox</strong> is for configuring, testing, and analyzing Modbus devices in a structured and repeatable way. It helps engineers build workspaces, manage connections, define register maps, and monitor live data through a clean, predictable workflow.
+                <strong>Modbus Workbench</strong> is for configuring, testing, and analyzing Modbus devices in a structured and repeatable way. It helps engineers build workspaces, manage connections, define register maps, and monitor live data through a clean, predictable workflow.
               </p>
               <p>
                 The tool supports commissioning, troubleshooting, and validation of Modbus-based systems across TCP and Serial (RTU) networks, keeping everything local and offline-first for field reliability.
@@ -161,12 +161,12 @@ export default function AboutPage() {
             <p>
               <span className="font-semibold text-slate-900 dark:text-slate-100">Source:</span>
               <a
-                href="https://github.com/inowio/modbus-toolbox"
+                href="https://github.com/inowio/modbus-workbench"
                 className="ml-2 inline-flex items-center gap-1 text-emerald-800 transition hover:text-sky-700 dark:text-emerald-400 dark:hover:text-emerald-300"
                 target="_blank"
                 rel="noreferrer"
               >
-                https://github.com/inowio/modbus-toolbox
+                https://github.com/inowio/modbus-workbench
               </a>
             </p>
             <p>
