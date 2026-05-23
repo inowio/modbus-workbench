@@ -1,12 +1,12 @@
-# Contributing to Inowio Modbus Toolbox
+# Contributing to Inowio Modbus Workbench
 
-Thanks for helping us improve the toolbox! This guide keeps contribution steps short and consistent.
+Thanks for helping us improve the workbench! This guide keeps contribution steps short and consistent.
 
 ## Quick Start
 
 ```bash
-git clone https://github.com/inowio/modbus-toolbox.git
-cd modbus-toolbox
+git clone https://github.com/inowio/modbus-workbench.git
+cd modbus-workbench
 npm install
 npm run tauri dev
 ```

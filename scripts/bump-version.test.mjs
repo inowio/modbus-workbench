@@ -110,19 +110,19 @@ describe("rewriteVersionInCargoLock", () => {
       'version = "1.0.0"',
       '',
       '[[package]]',
-      'name = "inowio-modbus-toolbox"',
+      'name = "modbus-workbench"',
       'version = "0.1.0"',
       'dependencies = []',
       '',
     ].join("\n");
-    const out = rewriteVersionInCargoLock(input, "0.2.0", "inowio-modbus-toolbox");
-    expect(out).toContain('name = "inowio-modbus-toolbox"\nversion = "0.2.0"');
+    const out = rewriteVersionInCargoLock(input, "0.2.0", "modbus-workbench");
+    expect(out).toContain('name = "modbus-workbench"\nversion = "0.2.0"');
     expect(out).toContain('name = "other-crate"\nversion = "1.0.0"');
   });
 
   it("throws when the package is missing", () => {
     expect(() =>
-      rewriteVersionInCargoLock("", "0.2.0", "inowio-modbus-toolbox"),
+      rewriteVersionInCargoLock("", "0.2.0", "modbus-workbench"),
     ).toThrow();
   });
 });

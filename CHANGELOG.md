@@ -43,7 +43,7 @@ _No changes yet._
 ## [0.1.0] - 2025-02-05
 
 ### Added
-- Initial public release of Inowio Modbus Toolbox
+- Initial public release of Inowio Modbus Workbench
 - Modbus TCP/RTU connection management with persistent workspaces
 - Device registry, analyzer, traffic monitor, and logging system
 - Cross-platform bundles plus documentation and help content

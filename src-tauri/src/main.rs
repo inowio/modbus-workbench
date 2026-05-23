@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    inowio_modbus_toolbox_lib::run()
+    inowio_modbus_workbench_lib::run()
 }

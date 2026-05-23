@@ -1,4 +1,4 @@
-# Releasing Inowio Modbus Toolbox
+# Releasing Inowio Modbus Workbench
 
 This runbook is for maintainers cutting a new public release. The app ships
 through GitHub Actions and ships an in-app auto-updater, so the release flow
@@ -35,7 +35,7 @@ The updater verifies download artifacts with a minisign signature. Generate
 the keypair locally:
 
 ```bash
-npx tauri signer generate -w ~/.tauri/modbus-toolbox-updater.key
+npx tauri signer generate -w ~/.tauri/modbus-workbench-updater.key
 ```
 
 Pick a strong password when prompted. The command prints a **public key** and
@@ -72,7 +72,7 @@ The release workflow reads two secrets:
 Using `gh`:
 
 ```bash
-gh secret set TAURI_SIGNING_PRIVATE_KEY < ~/.tauri/modbus-toolbox-updater.key
+gh secret set TAURI_SIGNING_PRIVATE_KEY < ~/.tauri/modbus-workbench-updater.key
 gh secret set TAURI_SIGNING_PRIVATE_KEY_PASSWORD
 # (paste the password when prompted)
 ```
@@ -114,7 +114,7 @@ The script:
 - Refuses to run if the working tree is dirty, or if a `v0.2.0` tag already
   exists locally or on `origin`.
 - Updates `package.json`, `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml`,
-  and the `inowio-modbus-toolbox` entry in `src-tauri/Cargo.lock`.
+  and the `modbus-workbench` entry in `src-tauri/Cargo.lock`.
 - Renames `## [Unreleased]` in `CHANGELOG.md` to `## [0.2.0] - YYYY-MM-DD`
   and inserts a fresh empty `## [Unreleased]` block above it.
 - Does **not** commit or tag — you do that explicitly so the commit message
@@ -151,7 +151,7 @@ Open the Actions tab on GitHub and find the **Release** run for your tag.
   `Swatinem/rust-cache`.
 
 When all three platforms succeed, a **draft** release appears on the
-[releases page](https://github.com/inowio/modbus-toolbox/releases) with
+[releases page](https://github.com/inowio/modbus-workbench/releases) with
 installers, `.sig` files, and `latest.json` attached.
 
 ### Publish the draft

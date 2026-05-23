@@ -227,7 +227,7 @@ export default function WorkspaceScreen({ onOpen }: Props) {
   }
 
   useEffect(() => {
-    const title = `Inowio - Modbus Toolbox v${__APP_VERSION__}`;
+    const title = `Inowio - Modbus Workbench v${__APP_VERSION__}`;
     void getCurrentWebviewWindow().setTitle(title);
     load();
   }, []);
@@ -329,7 +329,7 @@ export default function WorkspaceScreen({ onOpen }: Props) {
               <p className="text-xs uppercase font-semibold  dark:font-normal tracking-[0.45em] text-emerald-700 dark:text-emerald-400">
                 <span className="brand-name">INOWIO</span>
               </p>
-              <div className="truncate tracking-widest text-lg">Modbus Toolbox</div>
+              <div className="truncate tracking-widest text-lg">Modbus Workbench</div>
             </div>
           </div>
 

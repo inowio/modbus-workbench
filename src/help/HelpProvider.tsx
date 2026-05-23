@@ -430,7 +430,7 @@ function HelpModal(props: HelpModalProps) {
             </div>
             <div>
               <div className="text-xs uppercase font-semibold  dark:font-normal tracking-[0.35em] text-emerald-700 dark:text-emerald-300">Help</div>
-              <div className="text-sm text-slate-600 dark:text-slate-300">Modbus Toolbox</div>
+              <div className="text-sm text-slate-600 dark:text-slate-300">Modbus Workbench</div>
             </div>
           </div>
           <button

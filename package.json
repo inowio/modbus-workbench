@@ -1,5 +1,5 @@
 {
-  "name": "inowio-modbus-toolbox",
+  "name": "modbus-workbench",
   "private": true,
   "version": "0.2.1",
   "type": "module",

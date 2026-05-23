@@ -30,7 +30,7 @@ const workspaceSection: HelpSectionDefinition = {
     <div className="space-y-6">
       <SectionBlock section="workspace" anchor="overview" title="Why workspaces matter">
         <p>
-          A <strong>Workspace</strong> is the top-level container inside Modbus Toolbox. It represents a single logical project—a
+          A <strong>Workspace</strong> is the top-level container inside Modbus Workbench. It represents a single logical project—a
           site, panel, test rig, or machine. Everything else (connections, slaves, registers, analyzer layouts, logs) belongs to
           the currently selected workspace so your projects never bleed into each other.
         </p>
@@ -190,7 +190,7 @@ const workspaceSection: HelpSectionDefinition = {
           <li>They act as project containers for every downstream feature.</li>
           <li>They provide a mental reset button between systems.</li>
         </ul>
-        <p>Master workspaces and the rest of Modbus Toolbox feels effortless.</p>
+        <p>Master workspaces and the rest of Modbus Workbench feels effortless.</p>
       </SectionBlock>
     </div>
   ),

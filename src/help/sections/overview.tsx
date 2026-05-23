@@ -6,7 +6,7 @@ import type { HelpSectionDefinition } from "../types";
 const overviewAnchors: HelpSectionDefinition["anchors"] = [
   {
     id: "hero",
-    label: "What is Modbus Toolbox?",
+    label: "What is Modbus Workbench?",
     description: "High-level positioning plus key capabilities and example workflow.",
     etaMinutes: 2,
   },
@@ -45,17 +45,17 @@ const overviewAnchors: HelpSectionDefinition["anchors"] = [
 const overviewSection: HelpSectionDefinition = {
   slug: "overview",
   title: "Overview",
-  description: "High-level tour of the Modbus toolbox, core workflow, guiding principles, and troubleshooting cues.",
+  description: "High-level tour of the Modbus workbench, core workflow, guiding principles, and troubleshooting cues.",
   keywords: ["introduction", "workflow", "principles", "troubleshooting", "modbus"],
   searchText:
-    "Understand what Modbus Toolbox does, see the Workspace → Connection → Slaves → Analyzer → Logs journey, review design principles, best practices, troubleshooting table, and a real-world pump station scenario.",
+    "Understand what Modbus Workbench does, see the Workspace → Connection → Slaves → Analyzer → Logs journey, review design principles, best practices, troubleshooting table, and a real-world pump station scenario.",
   anchors: overviewAnchors,
   Component: (): React.ReactElement => (
     <div className="space-y-6">
       <SectionBlock
         section="overview"
         anchor="hero"
-        title="What Modbus Toolbox delivers"
+        title="What Modbus Workbench delivers"
         meta={overviewAnchors[0]}
         actions={
           <HelpAnchorLink section="workspace" anchor="details">
@@ -64,7 +64,7 @@ const overviewSection: HelpSectionDefinition = {
         }
       >
         <p>
-          <strong>Modbus Toolbox</strong> is a client-side suite for testing, simulating, and monitoring industrial hardware over
+          <strong>Modbus Workbench</strong> is a client-side suite for testing, simulating, and monitoring industrial hardware over
           Modbus RTU or Modbus TCP. It replaces ad-hoc scripts with a visual workspace that keeps register definitions,
           analyzer layouts, and logs in one place so engineers can diagnose field issues quickly.
         </p>
