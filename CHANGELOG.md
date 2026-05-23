@@ -4,6 +4,9 @@ All notable changes to this project are tracked here following [Keep a Changelog
 
 ## [Unreleased]
 
+_No changes yet._
+
+## [0.3.0] - 2026-05-23
 ### Changed
 - **Renamed the project from "Modbus Toolbox" to "Modbus Workbench"** to
   avoid a trademark conflict with Infineon's ModbusToolbox. The GitHub
