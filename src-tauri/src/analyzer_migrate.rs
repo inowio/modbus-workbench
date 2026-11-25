@@ -156,6 +156,70 @@ pub(crate) fn migrate_analyzer_signals_kind(conn: &Connection) -> Result<(), Str
         .map_err(|e| format!("failed to create analyzer_signal_inputs: {e}"))
 }
 
+const TABS_DDL: &str = "
+CREATE TABLE IF NOT EXISTS analyzer_tabs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  position INTEGER NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);";
+
+fn tabs_in_tx(conn: &Connection) -> Result<(), String> {
+    let has_tiles: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='analyzer_tiles'",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(|e| format!("failed to inspect analyzer_tiles: {e}"))?;
+    if has_tiles == 0 {
+        return Ok(());
+    }
+    conn.execute_batch(TABS_DDL)
+        .map_err(|e| format!("failed to create analyzer_tabs: {e}"))?;
+    let has_col: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('analyzer_tiles') WHERE name='tab_id'",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(|e| format!("failed to inspect analyzer_tiles: {e}"))?;
+    if has_col == 0 {
+        conn.execute_batch(
+            "ALTER TABLE analyzer_tiles ADD COLUMN tab_id INTEGER REFERENCES analyzer_tabs(id);",
+        )
+        .map_err(|e| format!("failed to add analyzer_tiles.tab_id: {e}"))?;
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_analyzer_tiles_tab ON analyzer_tiles(tab_id);
+         INSERT INTO analyzer_tabs (name, position, created_at, updated_at)
+           SELECT 'Main', 0, strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now')
+           WHERE NOT EXISTS (SELECT 1 FROM analyzer_tabs);
+         UPDATE analyzer_tiles
+           SET tab_id = (SELECT id FROM analyzer_tabs ORDER BY position, id LIMIT 1)
+           WHERE tab_id IS NULL;",
+    )
+    .map_err(|e| format!("failed to populate analyzer_tabs: {e}"))
+}
+
+/// Idempotent. Creates `analyzer_tabs`, adds `analyzer_tiles.tab_id`, guarantees
+/// at least one tab (`Main`), and back-fills tiles without a tab onto the first
+/// one. Does nothing when `analyzer_tiles` does not exist.
+pub(crate) fn migrate_analyzer_tabs(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch("BEGIN IMMEDIATE;")
+        .map_err(|e| format!("failed to begin analyzer_tabs migration: {e}"))?;
+    match tabs_in_tx(conn) {
+        Ok(()) => conn
+            .execute_batch("COMMIT;")
+            .map_err(|e| format!("failed to commit analyzer_tabs migration: {e}")),
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK;");
+            Err(e)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -424,6 +488,110 @@ mod tests {
         let conn = Connection::open(dir.join("workspace.db")).expect("open");
         assert!(signal_columns(&conn).unwrap().iter().any(|c| c == "kind"));
         assert!(table_exists(&conn, "analyzer_signal_inputs"));
+        cleanup(dir, conn);
+    }
+
+    /// Simulates a 0.5-era workspace: no `analyzer_tabs`, tiles without `tab_id`,
+    /// tile 1 with desktop+mobile layouts, tile 2 with desktop only. Foreign keys
+    /// are off while reshaping so dropping `analyzer_tiles` cannot cascade into layouts.
+    fn pre_tabs_db() -> (PathBuf, Connection) {
+        let dir = temp_dir();
+        ensure_workspace_db(&dir, "workspace.db").expect("schema");
+        let conn = Connection::open(dir.join("workspace.db")).expect("open");
+        conn.execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             DROP TABLE analyzer_tiles;
+             DROP TABLE analyzer_tabs;
+             CREATE TABLE analyzer_tiles (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               kind TEXT NOT NULL,
+               title TEXT NOT NULL DEFAULT '',
+               config_json TEXT NOT NULL DEFAULT '',
+               polling_enabled INTEGER NOT NULL DEFAULT 1,
+               created_at TEXT NOT NULL,
+               updated_at TEXT NOT NULL,
+               UNIQUE(id)
+             );
+             INSERT INTO analyzer_tiles (id,kind,created_at,updated_at) VALUES (1,'k','t','t'),(2,'k','t','t');
+             INSERT INTO analyzer_tile_layouts (tile_id,breakpoint,x,y,w,h) VALUES
+               (1,'desktop',0,0,4,3),(1,'mobile',1,2,2,5),(2,'desktop',4,0,4,3);
+             PRAGMA foreign_keys = ON;",
+        )
+        .expect("0.5 shape");
+        (dir, conn)
+    }
+
+    fn tabs(conn: &Connection) -> Vec<(i64, String, i64)> {
+        let mut stmt = conn
+            .prepare("SELECT id, name, position FROM analyzer_tabs ORDER BY position, id")
+            .unwrap();
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap();
+        rows.collect::<Result<Vec<_>, _>>().unwrap()
+    }
+
+    fn tile_tab(conn: &Connection, id: i64) -> Option<i64> {
+        conn.query_row("SELECT tab_id FROM analyzer_tiles WHERE id=?1", [id], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn tabs_upgrade_puts_existing_tiles_in_main() {
+        let (dir, conn) = pre_tabs_db();
+        migrate_analyzer_tabs(&conn).expect("migrate");
+
+        let t = tabs(&conn);
+        assert_eq!(t.len(), 1);
+        assert_eq!((t[0].1.as_str(), t[0].2), ("Main", 0));
+        assert_eq!(tile_tab(&conn, 1), Some(t[0].0));
+        assert_eq!(tile_tab(&conn, 2), Some(t[0].0));
+
+        let mut stmt = conn
+            .prepare("SELECT tile_id,breakpoint,x,y,w,h FROM analyzer_tile_layouts ORDER BY tile_id,breakpoint")
+            .unwrap();
+        let layouts: Vec<(i64, String, i64, i64, i64, i64)> = stmt
+            .query_map([], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?, r.get::<_, i64>(4)?, r.get::<_, i64>(5)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        drop(stmt);
+        assert_eq!(
+            layouts,
+            vec![
+                (1, "desktop".to_string(), 0, 0, 4, 3),
+                (1, "mobile".to_string(), 1, 2, 2, 5),
+                (2, "desktop".to_string(), 4, 0, 4, 3),
+            ]
+        );
+        cleanup(dir, conn);
+    }
+
+    #[test]
+    fn tabs_upgrade_is_idempotent_and_backfills_nulls() {
+        let (dir, conn) = pre_tabs_db();
+        migrate_analyzer_tabs(&conn).expect("first");
+        migrate_analyzer_tabs(&conn).expect("second");
+        let t = tabs(&conn);
+        assert_eq!(t.len(), 1);
+
+        conn.execute("UPDATE analyzer_tiles SET tab_id = NULL WHERE id = 2", []).unwrap();
+        migrate_analyzer_tabs(&conn).expect("third");
+        assert_eq!(tile_tab(&conn, 2), Some(t[0].0));
+        cleanup(dir, conn);
+    }
+
+    #[test]
+    fn tabs_upgrade_creates_main_for_empty_workspace() {
+        let dir = temp_dir();
+        ensure_workspace_db(&dir, "workspace.db").expect("schema");
+        let conn = Connection::open(dir.join("workspace.db")).expect("open");
+        let t = tabs(&conn);
+        assert_eq!(t.len(), 1);
+        assert_eq!((t[0].1.as_str(), t[0].2), ("Main", 0));
         cleanup(dir, conn);
     }
 }

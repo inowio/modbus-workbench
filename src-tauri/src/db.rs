@@ -212,6 +212,10 @@ pub(crate) fn ensure_workspace_db(workspace_folder: &PathBuf, db_file: &str) -> 
     // register columns) and creation of `analyzer_signal_inputs`.
     crate::analyzer_migrate::migrate_analyzer_signals_kind(&conn)?;
 
+    // Analyzer tabs: create `analyzer_tabs`, add `analyzer_tiles.tab_id`, put
+    // existing tiles in "Main", and back-fill any NULL `tab_id`.
+    crate::analyzer_migrate::migrate_analyzer_tabs(&conn)?;
+
     // Idempotent dev-DB migration: older workspace DBs were created before
     // `unit`/`display_format` existed on `sim_registers`. Ignore the error
     // when the column is already present.
