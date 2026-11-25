@@ -66,6 +66,47 @@ describe("AnalyzerFocusOverlay", () => {
     expect(toolbar()).toBeNull();
   });
 
+  it("hides after mouse use even when a clicked control keeps focus", () => {
+    setup();
+    const bar = toolbar()!;
+    const next = screen.getByRole("button", { name: "Next tab" });
+    fireEvent.mouseEnter(bar);
+    // A real click: mousedown, then the browser focuses the button.
+    fireEvent.mouseDown(next);
+    act(() => next.focus());
+    fireEvent.click(next);
+    expect(next).toHaveFocus();
+
+    fireEvent.mouseLeave(bar);
+    fireEvent.mouseMove(window);
+    act(() => vi.advanceTimersByTime(1999));
+    expect(toolbar()).toBeInTheDocument();
+    act(() => vi.advanceTimersByTime(1));
+    expect(toolbar()).toBeNull();
+  });
+
+  it("a control focused without any key press does not pin the overlay", () => {
+    setup();
+    act(() => screen.getByRole("combobox", { name: "Cycle tabs" }).focus());
+    act(() => vi.advanceTimersByTime(2000));
+    expect(toolbar()).toBeNull();
+  });
+
+  it("stays shown while a control has keyboard focus, and hides 2000 ms after it leaves", () => {
+    setup();
+    fireEvent.keyDown(window, { key: "Tab" });
+    const exit = screen.getByRole("button", { name: "Exit focus view" });
+    act(() => exit.focus());
+    act(() => vi.advanceTimersByTime(10_000));
+    expect(toolbar()).toBeInTheDocument();
+
+    act(() => exit.blur());
+    act(() => vi.advanceTimersByTime(1999));
+    expect(toolbar()).toBeInTheDocument();
+    act(() => vi.advanceTimersByTime(1));
+    expect(toolbar()).toBeNull();
+  });
+
   it("each control calls its handler", () => {
     const props = setup();
     expect(screen.getByText("Boiler")).toBeInTheDocument();

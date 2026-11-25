@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { FiChevronLeft, FiChevronRight, FiMaximize, FiMinimize, FiPlay, FiRefreshCw, FiX } from "react-icons/fi";
 import type { CycleSeconds } from "./tabs";
 
-/** The overlay hides this long after the last mouse move (unless the pointer or keyboard focus is on it). */
+/** The overlay hides this long after the last mouse move (unless the pointer or *keyboard* focus is on it). */
 const HIDE_AFTER_MS = 2000;
 
 const CYCLE_OPTIONS: { value: CycleSeconds; label: string }[] = [
@@ -35,7 +35,10 @@ const BTN =
 export default function AnalyzerFocusOverlay(props: Props) {
   const [visible, setVisible] = useState(true);
   const hoveredRef = useRef(false);
-  const focusedRef = useRef(false);
+  /** A control holds focus that arrived by keyboard. Focus left behind by a mouse click doesn't pin the bar. */
+  const keyboardFocusRef = useRef(false);
+  /** The last interaction was a key press (true) or a mouse press (false). */
+  const keyboardModalityRef = useRef(false);
   const hideTimerRef = useRef<number | null>(null);
   const onHoverChangeRef = useRef(props.onHoverChange);
   onHoverChangeRef.current = props.onHoverChange;
@@ -50,7 +53,7 @@ export default function AnalyzerFocusOverlay(props: Props) {
   function show() {
     setVisible(true);
     clearHide();
-    if (hoveredRef.current || focusedRef.current) return;
+    if (hoveredRef.current || keyboardFocusRef.current) return;
     hideTimerRef.current = window.setTimeout(() => {
       hideTimerRef.current = null;
       setVisible(false);
@@ -61,15 +64,24 @@ export default function AnalyzerFocusOverlay(props: Props) {
     // Shown when focus view opens, so the exit control is seen at least once.
     show();
     const onMouseMove = () => show();
-    // Tab brings the hidden bar back for keyboard users.
+    // Clicking focuses buttons (and a select keeps focus after a choice): that focus must not pin the bar.
+    const onMouseDown = () => {
+      keyboardModalityRef.current = false;
+      keyboardFocusRef.current = false;
+    };
     const onKeyDown = (e: KeyboardEvent) => {
+      keyboardModalityRef.current = true;
+      // Tab brings the hidden bar back for keyboard users.
       if (e.key === "Tab") show();
     };
     window.addEventListener("mousemove", onMouseMove);
-    window.addEventListener("keydown", onKeyDown);
+    // Capture phase, so it runs before the focus change a click causes.
+    window.addEventListener("mousedown", onMouseDown, true);
+    window.addEventListener("keydown", onKeyDown, true);
     return () => {
       window.removeEventListener("mousemove", onMouseMove);
-      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("mousedown", onMouseDown, true);
+      window.removeEventListener("keydown", onKeyDown, true);
       clearHide();
       // Don't leave cycling paused when the overlay goes away under the pointer.
       if (hoveredRef.current) onHoverChangeRef.current(false);
@@ -95,11 +107,11 @@ export default function AnalyzerFocusOverlay(props: Props) {
         show();
       }}
       onFocus={() => {
-        focusedRef.current = true;
+        keyboardFocusRef.current = keyboardModalityRef.current;
         show();
       }}
       onBlur={() => {
-        focusedRef.current = false;
+        keyboardFocusRef.current = false;
         show();
       }}
       className={`fixed inset-x-0 top-0 z-40 flex flex-wrap items-center gap-2 border-b border-slate-200 bg-white/90 px-3 py-2 shadow-sm backdrop-blur-sm transition duration-200 dark:border-slate-800 dark:bg-slate-900/90 ${
