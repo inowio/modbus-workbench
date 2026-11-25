@@ -23,6 +23,7 @@ import {
   sanitizeSignalIdPart,
   suggestCalculatedId,
   transformsChanged,
+  dependentUses,
   validateDraft,
   type SignalDraft,
   type SignalKind,
@@ -184,6 +185,7 @@ export default function SignalEditorPanel(props: {
     setResultsFromLive(fromLive);
   }, []);
   const liveBlockedReason = isRegister && transformsChanged(draft, savedDisplay) ? LIVE_BLOCKED_TRANSFORMS : null;
+  const usedBy = useMemo(() => (editing && isRegister ? dependentUses(signal.id, signals) : []), [editing, isRegister, signal, signals]);
 
   const savingRef = useRef(false);
   useEffect(() => {
@@ -310,6 +312,7 @@ export default function SignalEditorPanel(props: {
               onRegisterSample={setRegisterSample}
               polling={props.polling}
               liveBlockedReason={liveBlockedReason}
+              usedBy={usedBy}
             />
           </div>
         </div>

@@ -7,6 +7,7 @@ type Props = {
   open: boolean;
   title: string;
   description: ReactNode;
+  /** Empty string = information only: no confirm button, just the cancel/close one. */
   confirmText: string;
   cancelText?: string;
   confirmIcon?: ReactNode;
@@ -80,10 +81,12 @@ export default function ConfirmDialog({
           >
             {cancelText}
           </button>
-          <button type="button" className={confirmClass} onClick={() => onConfirm()} disabled={busy}>
-            {confirmIcon}
-            {confirmText}
-          </button>
+          {confirmText ? (
+            <button type="button" className={confirmClass} onClick={() => onConfirm()} disabled={busy}>
+              {confirmIcon}
+              {confirmText}
+            </button>
+          ) : null}
         </div>
       </div>
     </div>

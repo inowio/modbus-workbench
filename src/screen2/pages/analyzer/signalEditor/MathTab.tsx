@@ -48,8 +48,10 @@ export default function MathTab(props: {
   polling: boolean;
   /** When set, live values don't match this draft (e.g. unsaved Scale): Try it can't use them. */
   liveBlockedReason?: string | null;
+  /** Register signals only: calculated signals that read this one, and what they read. */
+  usedBy?: { signalId: string; values: string[] }[];
 }) {
-  const { kind, math, onChange, signals, evaluations, selfSignalId, issues, onResults, onRegisterSample, polling, liveBlockedReason } = props;
+  const { kind, math, onChange, signals, evaluations, selfSignalId, issues, onResults, onRegisterSample, polling, liveBlockedReason, usedBy } = props;
   const [manual, setManual] = useState<Record<string, string>>({});
   const [useLiveChoice, setUseLiveChoice] = useState<boolean | null>(null);
 
@@ -144,6 +146,18 @@ export default function MathTab(props: {
               Register value →{" "}
               <span className="font-mono text-amber-600 dark:text-amber-400">{liveBlockedReason ? "save to see it with your changes" : liveRegister ? formatMathResult(liveRegister) || "error" : "no live value yet"}</span>
             </p>
+            {usedBy && usedBy.length > 0 ? (
+              <p role="note" className="rounded-2xl border border-sky-500/40 bg-sky-500/10 px-4 py-2 text-xs text-sky-900 dark:text-sky-100">
+                {usedBy.map((u, i) => (
+                  <span key={u.signalId}>
+                    {i > 0 ? "; " : ""}
+                    Used by calculated signal <span className="font-semibold">{u.signalId}</span>, which reads{" "}
+                    {u.values.map((v) => (v === "shown" ? "the Show value" : v === "register" ? "the register value" : `"${v}"`)).join(", ")}
+                  </span>
+                ))}
+                . Changes here change {usedBy.length === 1 ? "it" : "them"} too.
+              </p>
+            ) : null}
             {inputIssues.map((i) => (
               <IssueText key={`${i.path}:${i.message}`} message={i.message} />
             ))}

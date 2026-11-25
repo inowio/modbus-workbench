@@ -289,6 +289,29 @@ describe("SignalEditorPanel", () => {
     expect(preview()).toContain("Live value");
   });
 
+  it("a variable a calculated signal reads can't be renamed away, and the Math tab says who uses it", async () => {
+    const src = signal("Temp_1", { decoderJson: JSON.stringify({ show: "y", math: EXAMPLE }) });
+    const calcMath = {
+      version: 1,
+      inputs: [{ name: "C", signalId: "Temp_1", value: "y" }],
+      variables: [{ name: "F", kind: "calc", start: { ref: "C" }, steps: [] }],
+    };
+    const calc = signal("Calc_F", {
+      kind: "calculated", slaveId: null, registerRowId: null, address: null, functionKind: "", inputSignalIds: ["Temp_1"],
+      decoderJson: JSON.stringify({ show: "F", math: calcMath }),
+    });
+    await renderPanel({ signal: src, signals: [src, calc] });
+    fireEvent.click(screen.getByRole("tab", { name: /Math/ }));
+    expect(screen.getByRole("note").textContent).toContain('Used by calculated signal Calc_F, which reads "y"');
+    expect((saveButton() as HTMLButtonElement).disabled).toBe(false);
+
+    const name = screen.getByLabelText("Variable 2 name");
+    fireEvent.change(name, { target: { value: "y2" } });
+    fireEvent.blur(name);
+    expect(screen.getByText('Calc_F uses variable "y". Keep that variable, or change the calculated signal\'s inputs first.')).toBeTruthy();
+    expect((saveButton() as HTMLButtonElement).disabled).toBe(true);
+  });
+
   it("while stopped, the stored value is labelled as the last value, not live", async () => {
     const s = signal("Temp_1", { decoderJson: JSON.stringify({ unit: "°C", decimals: 1, show: "y", math: EXAMPLE }) });
     const last = evaluation({ register: ok(328), formatted: "32.8 °C", shown: ok(32.8) });

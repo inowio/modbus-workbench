@@ -317,19 +317,13 @@ export default function AnalyzerConfigureSignalsModal(props: Props) {
               </div>
             </div>
           }
-          confirmText={`Edit ${blockingDependents[0]}`}
+          confirmText=""
           cancelText="Close"
           onClose={() => {
             setDeleteError(null);
             setSignalIdToDelete(null);
           }}
-          onConfirm={() => {
-            const target = blockingDependents[0];
-            setDeleteError(null);
-            setSignalIdToDelete(null);
-            setSelectedSignalId(target);
-            setMode("edit");
-          }}
+          onConfirm={() => {}}
         />
       ) : (
         <ConfirmDialog

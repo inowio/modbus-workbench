@@ -66,17 +66,16 @@ describe("AnalyzerConfigureSignalsModal list", () => {
     expect(screen.queryByText(/Slave #null/)).toBeNull();
   });
 
-  it("a signal used by a calculated signal says so up front and offers to edit it, with no Delete", async () => {
+  it("a signal used by a calculated signal says so up front, with only a Close button", async () => {
     renderModal([signal("A"), CALC]);
     fireEvent.click(screen.getByRole("button", { name: "Delete A" }));
     expect(screen.getByText("Can't delete this signal yet")).toBeTruthy();
     expect(screen.getByText("Calc_1", { selector: "li" })).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Delete" })).toBeNull();
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Edit Calc_1" }));
-    });
+    expect(screen.queryByRole("button", { name: /^Edit Calc_1$/ })).toBeNull();
+    fireEvent.click(screen.getByText("Close", { selector: "button" }));
+    expect(screen.queryByText("Can't delete this signal yet")).toBeNull();
     expect(deleteSignal).not.toHaveBeenCalled();
-    expect(screen.getByText("Edit signal · Calc_1")).toBeTruthy();
   });
 
   it("an unused signal still gets the normal Delete confirmation", async () => {

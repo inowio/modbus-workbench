@@ -491,6 +491,41 @@ mod tests {
     }
 
     #[test]
+    fn register_save_cannot_drop_a_variable_a_calculated_signal_reads() {
+        let (dir, mut conn) = temp_db();
+        let (slave_id, row_a, row_b) = seed_slave_and_rows(&conn);
+        let with_c = r#"{"math":{"version":1,"inputs":[],"variables":[{"name":"C","kind":"calc","start":{"ref":"register"},"steps":[]}]}}"#;
+        let mut a = reg_upsert("A", slave_id, row_a);
+        a.decoder_json = with_c.to_string();
+        upsert_analyzer_signal_in_conn(&mut conn, &a).expect("a");
+
+        let mut f = calc_upsert("F", &["A"]);
+        f.decoder_json = r#"{"show":"FH","math":{"version":1,"inputs":[{"name":"T","signalId":"A","value":"C"}],"variables":[{"name":"FH","kind":"calc","start":{"ref":"T"},"steps":[]}]}}"#.to_string();
+        upsert_analyzer_signal_in_conn(&mut conn, &f).expect("f");
+
+        // Renaming C to D in A would break F.
+        a.decoder_json = with_c.replace("\"C\"", "\"D\"");
+        let err = upsert_analyzer_signal_in_conn(&mut conn, &a).expect_err("blocked");
+        assert_eq!(
+            err,
+            "F uses variable \"C\". Keep that variable, or change the calculated signal's inputs first."
+        );
+
+        // Other edits that keep C are fine (e.g. a unit).
+        a.decoder_json = with_c.replacen("{\"math\"", "{\"unit\":\"°C\",\"math\"", 1);
+        upsert_analyzer_signal_in_conn(&mut conn, &a).expect("keeps C");
+
+        // A signal read only via "shown" can drop all its math.
+        let mut b = reg_upsert("B", slave_id, row_b);
+        b.decoder_json = with_c.to_string();
+        upsert_analyzer_signal_in_conn(&mut conn, &b).expect("b");
+        upsert_analyzer_signal_in_conn(&mut conn, &calc_upsert("G", &["B"])).expect("g");
+        b.decoder_json = "{}".to_string();
+        upsert_analyzer_signal_in_conn(&mut conn, &b).expect("shown-only dependents don't block");
+        cleanup(dir, conn);
+    }
+
+    #[test]
     fn delete_blocked_when_used_as_input() {
         let (dir, mut conn) = temp_db();
         let (slave_id, row_a, _) = seed_slave_and_rows(&conn);
@@ -848,11 +883,76 @@ fn query_signals(conn: &Connection, only_id: Option<&str>) -> Result<Vec<Analyze
     Ok(out)
 }
 
+/// Variable names defined by `decoder_json`'s `math.variables[*].name`.
+fn math_variable_names(decoder_json: &str) -> Vec<String> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(decoder_json) else {
+        return Vec::new();
+    };
+    v.pointer("/math/variables")
+        .and_then(|vars| vars.as_array())
+        .map(|vars| {
+            vars.iter()
+                .filter_map(|var| var.get("name").and_then(|n| n.as_str()).map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Refuses a register-signal save that drops a variable a calculated signal reads
+/// (`math.inputs[*].value` naming a variable of this signal) — it would break silently.
+fn check_dependent_variables(conn: &Connection, id: &str, new_decoder_json: &str) -> Result<(), String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT s.id, s.decoder_json FROM analyzer_signals s
+             JOIN analyzer_signal_inputs i ON i.signal_id = s.id
+             WHERE i.input_signal_id = ?1
+             ORDER BY s.id ASC;",
+        )
+        .map_err(|e| format!("failed to prepare query: {e}"))?;
+    let users: Vec<(String, String)> = stmt
+        .query_map((id,), |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(|e| format!("failed to check signal usage: {e}"))?
+        .collect::<Result<_, _>>()
+        .map_err(|e| format!("failed to check signal usage: {e}"))?;
+    if users.is_empty() {
+        return Ok(());
+    }
+
+    let defined = math_variable_names(new_decoder_json);
+    let mut missing: Vec<String> = Vec::new();
+    for (user_id, user_json) in &users {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(user_json) else { continue };
+        let Some(inputs) = v.pointer("/math/inputs").and_then(|i| i.as_array()) else { continue };
+        for input in inputs {
+            if input.get("signalId").and_then(|s| s.as_str()).map(str::trim) != Some(id) {
+                continue;
+            }
+            let Some(value) = input.get("value").and_then(|s| s.as_str()) else { continue };
+            if value == "shown" || value == "register" || defined.iter().any(|d| d == value) {
+                continue;
+            }
+            let entry = format!("{user_id} uses variable \"{value}\"");
+            if !missing.contains(&entry) {
+                missing.push(entry);
+            }
+        }
+    }
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "{}. Keep {}, or change the calculated signal's inputs first.",
+        missing.join("; "),
+        if missing.len() == 1 { "that variable" } else { "those variables" }
+    ))
+}
+
 fn upsert_register_signal(
     conn: &Connection,
     id: &str,
     s: &AnalyzerSignalUpsert,
 ) -> Result<(), String> {
+    check_dependent_variables(conn, id, s.decoder_json.trim())?;
     let slave_id = s.slave_id.ok_or_else(|| "slave_id is required".to_string())?;
     let register_row_id = s
         .register_row_id

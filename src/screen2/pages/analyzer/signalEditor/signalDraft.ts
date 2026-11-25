@@ -195,6 +195,41 @@ export function sourceVariableNames(signal: AnalyzerSignal | undefined): string[
   }
 }
 
+/**
+ * What each calculated signal reads from `selfId`: "shown", "register" and/or variable names
+ * (in input order, de-duplicated). Calculated signals can only read register signals.
+ */
+export function dependentUses(selfId: string, signals: AnalyzerSignal[]): { signalId: string; values: string[] }[] {
+  const out: { signalId: string; values: string[] }[] = [];
+  for (const s of signals) {
+    if (s.kind !== "calculated" || s.id === selfId) continue;
+    let math: SignalMath | null = null;
+    try {
+      const raw: unknown = JSON.parse(s.decoderJson);
+      math = parseSignalMath(raw && typeof raw === "object" ? (raw as { math?: unknown }).math : null);
+    } catch {
+      math = null;
+    }
+    const values: string[] = [];
+    for (const inp of math?.inputs ?? []) if (inp.signalId === selfId && !values.includes(inp.value)) values.push(inp.value);
+    if (values.length > 0) out.push({ signalId: s.id, values });
+  }
+  return out;
+}
+
+/** Variables of this draft that calculated signals read but the draft no longer defines. */
+export function missingDependentVariables(
+  d: SignalDraft,
+  uses: { signalId: string; values: string[] }[],
+): { signalId: string; variable: string }[] {
+  const names = new Set(d.math.variables.map((v) => v.name));
+  const out: { signalId: string; variable: string }[] = [];
+  for (const u of uses) {
+    for (const v of u.values) if (v !== "shown" && v !== "register" && !names.has(v)) out.push({ signalId: u.signalId, variable: v });
+  }
+  return out;
+}
+
 export function mathInputTypes(math: SignalMath, signals: AnalyzerSignal[]): Record<string, MathValueType> {
   const out: Record<string, MathValueType> = {};
   for (const inp of math.inputs) out[inp.name] = mathInputType(inp, signals.find((s) => s.id === inp.signalId));
@@ -386,7 +421,15 @@ export function validateDraft(
   }
 
   let blocking: string | null = null;
-  if (!fields.show && d.show && d.show !== SHOW_REGISTER && ctx.chartTiles.length > 0) {
+  // Calculated signals that read a variable of this one: removing/renaming it would break them.
+  if (isRegister && ctx.mode === "edit") {
+    const missing = missingDependentVariables(d, dependentUses(d.id.trim(), ctx.signals));
+    if (missing.length > 0) {
+      const parts = missing.map((m) => `${m.signalId} uses variable "${m.variable}"`);
+      blocking = `${parts.join("; ")}. Keep ${missing.length === 1 ? "that variable" : "those variables"}, or change the calculated signal's inputs first.`;
+    }
+  }
+  if (!blocking && !fields.show && d.show && d.show !== SHOW_REGISTER && ctx.chartTiles.length > 0) {
     const type = variableTypes(d.math, inputTypes)[d.show];
     if (type === "text") {
       const names = ctx.chartTiles.map((t) => t.title?.trim() || `Tile ${t.id}`);
