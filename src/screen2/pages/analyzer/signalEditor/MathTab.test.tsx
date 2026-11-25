@@ -89,6 +89,30 @@ describe("MathTab", () => {
     expect(text("Result z")).toContain("Medium");
   });
 
+  it("a new signal with nothing typed shows 'waiting for a value', not an error", () => {
+    render(<Harness />);
+    expect(document.body.textContent).not.toContain("unknown name");
+    expect(text("Result x")).toContain("waiting for a value");
+    expect(text("Result z")).toContain("waiting for a value");
+    expect(screen.getAllByText(/waiting for a value \(see Try it\)/).length).toBe(3);
+  });
+
+  it("a calculated signal with an input not typed yet waits instead of erroring", () => {
+    const initial: SignalMath = {
+      version: 1,
+      inputs: [
+        { name: "V", signalId: "r1", value: "shown" },
+        { name: "A", signalId: "r2", value: "shown" },
+      ],
+      variables: [{ name: "P", kind: "calc", start: { ref: "V" }, steps: [{ op: "mul", operand: { ref: "A" } }] }],
+    };
+    render(<Harness kind="calculated" initial={initial} signals={[signal("r1"), signal("r2")]} />);
+    fireEvent.change(screen.getByLabelText("Try it V value"), { target: { value: "230" } });
+    expect(text("Result P")).toContain("waiting for a value");
+    fireEvent.change(screen.getByLabelText("Try it A value"), { target: { value: "2" } });
+    expect(text("Result P")).toContain("460");
+  });
+
   it("defaults Use live values to off when there is no live data", () => {
     render(<Harness />);
     expect((screen.getByLabelText("Use live values") as HTMLInputElement).checked).toBe(false);

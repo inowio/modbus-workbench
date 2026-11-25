@@ -1,5 +1,5 @@
 import { useId } from "react";
-import type { MathResult } from "../../../utils/analyzerMath";
+import { isWaiting, type MathResult } from "../../../utils/analyzerMath";
 import { formatMathNumber, type SignalEvaluation } from "../../../utils/analyzerSignalEval";
 import { formatMathResult } from "./TryItPanel";
 import UnitPicker from "./UnitPicker";
@@ -7,7 +7,7 @@ import { SHOW_REGISTER, transformsChanged, validateOptionalNonNegativeInt, type 
 import { FieldError, FIELD_CLASS, LABEL_CLASS, SECTION_CLASS, SectionTitle } from "./dataTabUi";
 
 function optionLabel(name: string, r: MathResult | undefined): string {
-  if (!r) return name;
+  if (!r || isWaiting(r)) return name;
   if (!r.ok) return `${name} · error`;
   return r.value.kind === "text" ? `${name} · ${r.value.value} · text` : `${name} · ${formatMathResult(r)}`;
 }
@@ -59,7 +59,7 @@ export function tilePreview(args: {
   if (transformsChanged(draft, saved) && (resultsFromLive || (liveOk && (!r || !r.ok)))) {
     return { text: "—", note: SAVE_TRANSFORMS_NOTE, error: false };
   }
-  if (!r) {
+  if (!r || isWaiting(r)) {
     const note = isRegisterShow
       ? "No register value yet. Start the analyzer, or type one in the Math tab's Try it panel."
       : "Type sample values in the Math tab's Try it panel";

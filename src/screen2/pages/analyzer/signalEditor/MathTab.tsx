@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import {
   evaluateSignalMath,
   renameVariable,
+  waitingResult,
   type MathInput,
   type MathIssue,
   type MathResult,
@@ -75,7 +76,14 @@ export default function MathTab(props: {
   const useLive = !!live && (useLiveChoice ?? polling);
 
   const results = useMemo(() => {
-    if (useLive && live) return evaluateSignalMath(math, live);
+    // A source with no value (nothing typed, no live data) is "waiting", not an error.
+    const withWaiting = (src: Sources): Sources => {
+      if (kind === "register") return { ...src, register: src.register ?? waitingResult() };
+      const inputs = { ...src.inputs };
+      for (const inp of math.inputs) if (!Object.prototype.hasOwnProperty.call(inputs, inp.name)) inputs[inp.name] = waitingResult();
+      return { ...src, inputs };
+    };
+    if (useLive && live) return evaluateSignalMath(math, withWaiting(live));
     const src: Sources = { inputs: {} };
     const reg = parseManual(manual.register ?? "");
     if (kind === "register" && reg) src.register = reg;
@@ -85,7 +93,7 @@ export default function MathTab(props: {
         if (r) src.inputs[inp.name] = r;
       }
     }
-    return evaluateSignalMath(math, src);
+    return evaluateSignalMath(math, withWaiting(src));
   }, [useLive, live, manual, math, kind]);
 
   const resultsFromLive = useLive && !!live;

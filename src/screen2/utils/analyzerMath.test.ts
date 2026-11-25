@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
   evaluateSignalMath,
+  isWaiting,
   parseSignalMath,
+  waitingResult,
   referencesOf,
   renameVariable,
   validateSignalMath,
@@ -56,6 +58,35 @@ const errorOf = (r: MathResult | undefined) => {
   if (!r || r.ok) throw new Error(`not an error: ${JSON.stringify(r)}`);
   return r.error;
 };
+describe("waiting for a value", () => {
+  it("propagates through calculations and rules without becoming an error", () => {
+    const m = mathOf([
+      calc("x", ref("register")),
+      calc("y", ref("x"), [{ op: "div", operand: n(10) }]),
+      rules("z", [rule([cond(ref("y"), "ge", n(50))], t("High"))], t("Low")),
+    ]);
+    const out = evaluateSignalMath(m, { register: waitingResult(), inputs: {} });
+    for (const name of ["x", "y", "z"]) expect(isWaiting(out[name])).toBe(true);
+    expect(errorOf(out.x)).toBe("waiting for a value");
+  });
+
+  it("a real error wins over waiting", () => {
+    const m = mathOf(
+      [
+        calc("bad", ref("A"), [{ op: "div", operand: n(0) }]),
+        rules("r", [rule([cond(ref("V"), "gt", n(1)), cond(ref("bad"), "gt", n(1))], t("hi"))], t("lo")),
+      ],
+      [
+        { name: "V", signalId: "s1", value: "shown" },
+        { name: "A", signalId: "s2", value: "shown" },
+      ],
+    );
+    const out = evaluateSignalMath(m, { inputs: { V: waitingResult(), A: num(5) } });
+    expect(isWaiting(out.bad)).toBe(false);
+    expect(errorOf(out.r)).toBe("depends on bad, which has an error");
+  });
+});
+
 const messages = (m: SignalMath, hasRegister = true) => validateSignalMath(m, { hasRegister }).map((i) => i.message);
 
 const example2Rules = (subject: string) =>

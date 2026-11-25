@@ -1,4 +1,4 @@
-import type { MathResult } from "../../../utils/analyzerMath";
+import { isWaiting, type MathResult } from "../../../utils/analyzerMath";
 import { formatMathNumber } from "../../../utils/analyzerSignalEval";
 import { FIELD_CLASS } from "./mathUi";
 
@@ -82,7 +82,15 @@ export default function TryItPanel(props: {
           {Object.entries(results).map(([name, r]) => (
             <li key={name} data-result={name} className="flex items-baseline justify-between gap-2 font-mono text-sm">
               <span className="text-emerald-700 dark:text-emerald-300">{name}</span>
-              <span className={r.ok ? "text-amber-600 dark:text-amber-400" : "text-xs text-red-600 dark:text-red-400"}>
+              <span
+                className={
+                  r.ok
+                    ? "text-amber-600 dark:text-amber-400"
+                    : isWaiting(r)
+                      ? "text-xs italic text-slate-400 dark:text-slate-500"
+                      : "text-xs text-red-600 dark:text-red-400"
+                }
+              >
                 {r.ok ? formatMathResult(r) : r.error}
               </span>
             </li>

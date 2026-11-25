@@ -14,7 +14,8 @@ export type MathVariable = CalcVariable | RulesVariable;
 export type MathInput = { name: string; signalId: string; value: string }; // "shown" | "register" | <variable name>
 export type SignalMath = { version: 1; inputs: MathInput[]; variables: MathVariable[] };
 export type MathValue = { kind: "number"; value: number } | { kind: "text"; value: string };
-export type MathResult = { ok: true; value: MathValue } | { ok: false; error: string };
+/** `waiting` marks "no value to compute with yet" (nothing typed, no live data): not a real error. */
+export type MathResult = { ok: true; value: MathValue } | { ok: false; error: string; waiting?: true };
 export type MathIssue = { path: string; message: string }; // path e.g. "variables.1.steps.0.operand"
 export type MathValueType = "number" | "text";
 
@@ -318,23 +319,30 @@ export function validateSignalMath(
 // ------------------------------------------------------------- evaluation
 
 const fail = (error: string): MathResult => ({ ok: false, error });
+
+export const WAITING_MESSAGE = "waiting for a value";
+/** A source with no value yet. Anything computed from it is "waiting" too, never an error. */
+export const waitingResult = (): MathResult => ({ ok: false, error: WAITING_MESSAGE, waiting: true });
+export const isWaiting = (r: MathResult | undefined | null): boolean => !!r && !r.ok && r.waiting === true;
+type Failure = { ok: false; error: string; waiting?: true };
+const carry = (r: Failure): MathResult => (r.waiting ? waitingResult() : fail(r.error));
 const numberResult = (value: number): MathResult =>
   Number.isFinite(value)
     ? { ok: true, value: { kind: "number", value: value === 0 ? 0 : value } } // value === 0 also folds -0 to 0
     : fail("result is not a finite number");
 
-type Resolved = { ok: true; value: MathValue; label: string } | { ok: false; error: string };
+type Resolved = { ok: true; value: MathValue; label: string } | Failure;
 
 function resolve(o: MathOperand, scope: Map<string, MathResult>): Resolved {
   if ("num" in o) return { ok: true, value: { kind: "number", value: o.num }, label: "number" };
   if ("text" in o) return { ok: true, value: { kind: "text", value: o.text }, label: "text" };
   const found = scope.get(o.ref);
   if (!found) return { ok: false, error: `unknown name ${o.ref}` };
-  if (!found.ok) return { ok: false, error: `depends on ${o.ref}, which has an error` };
+  if (!found.ok) return found.waiting ? found : { ok: false, error: `depends on ${o.ref}, which has an error` };
   return { ok: true, value: found.value, label: o.ref };
 }
 
-function resolveNumber(o: MathOperand, scope: Map<string, MathResult>): { ok: true; value: number } | { ok: false; error: string } {
+function resolveNumber(o: MathOperand, scope: Map<string, MathResult>): { ok: true; value: number } | Failure {
   const r = resolve(o, scope);
   if (!r.ok) return r;
   if (r.value.kind !== "number") return { ok: false, error: `${r.label} is text, not a number` };
@@ -387,13 +395,13 @@ function applyUnary(op: UnaryOp, a: number, n: number | undefined): MathResult {
 
 function evalCalc(v: CalcVariable, scope: Map<string, MathResult>): MathResult {
   const start = resolveNumber(v.start, scope);
-  if (!start.ok) return fail(start.error);
+  if (!start.ok) return carry(start);
   let acc = start.value;
   for (const step of v.steps) {
     let next: MathResult;
     if ("operand" in step) {
       const rhs = resolveNumber(step.operand, scope);
-      if (!rhs.ok) return fail(rhs.error);
+      if (!rhs.ok) return carry(rhs);
       next = applyBinary(step.op, acc, rhs.value);
     } else {
       next = applyUnary(step.op, acc, step.n);
@@ -422,7 +430,7 @@ function compare(cmp: CmpOp, a: number | string, b: number | string): boolean {
   }
 }
 
-function evalCondition(c: MathCondition, scope: Map<string, MathResult>): { ok: true; value: boolean } | { ok: false; error: string } {
+function evalCondition(c: MathCondition, scope: Map<string, MathResult>): { ok: true; value: boolean } | Failure {
   const l = resolve(c.left, scope);
   if (!l.ok) return l;
   const r = resolve(c.right, scope);
@@ -436,16 +444,22 @@ function evalCondition(c: MathCondition, scope: Map<string, MathResult>): { ok: 
 
 function evalRules(v: RulesVariable, scope: Map<string, MathResult>): MathResult {
   // An error in any referenced variable propagates, even if its branch is never reached.
+  // A real error wins over "waiting for a value".
+  let waiting = false;
   for (const name of referencesOf(v)) {
     const found = scope.get(name);
     if (!found) return fail(`unknown name ${name}`);
-    if (!found.ok) return fail(`depends on ${name}, which has an error`);
+    if (!found.ok) {
+      if (!found.waiting) return fail(`depends on ${name}, which has an error`);
+      waiting = true;
+    }
   }
+  if (waiting) return waitingResult();
   for (const rule of v.rules) {
     let matched = rule.join === "and";
     for (const c of rule.conds) {
       const res = evalCondition(c, scope);
-      if (!res.ok) return fail(res.error);
+      if (!res.ok) return carry(res);
       if (rule.join === "and" && !res.value) {
         matched = false;
         break;
@@ -463,7 +477,7 @@ function evalRules(v: RulesVariable, scope: Map<string, MathResult>): MathResult
 
 function outputOf(o: MathOperand, scope: Map<string, MathResult>): MathResult {
   const r = resolve(o, scope);
-  return r.ok ? { ok: true, value: r.value } : fail(r.error);
+  return r.ok ? { ok: true, value: r.value } : carry(r);
 }
 
 function sanitizeSource(r: MathResult): MathResult {

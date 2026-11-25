@@ -3,6 +3,7 @@ import { FiArrowDown, FiArrowUp, FiCopy, FiTrash2 } from "react-icons/fi";
 import {
   MATH_LIMITS,
   REGISTER_REF,
+  isWaiting,
   referencesOf,
   renameVariable,
   variableTypes,
@@ -21,11 +22,17 @@ import RulesVariableCard from "./RulesVariableCard";
 import type { OperandOption } from "./OperandPicker";
 import { FIELD_CLASS, IconButton, IssueText, issueAt } from "./mathUi";
 
-function formatResult(r: MathResult | undefined): { text: string; ok: boolean } | null {
+const RESULT_TONE = {
+  ok: "text-amber-600 dark:text-amber-400",
+  waiting: "italic text-slate-400 dark:text-slate-500",
+  error: "text-red-600 dark:text-red-400",
+} as const;
+
+function formatResult(r: MathResult | undefined): { text: string; tone: keyof typeof RESULT_TONE } | null {
   if (!r) return null;
-  if (!r.ok) return { text: r.error, ok: false };
+  if (!r.ok) return isWaiting(r) ? { text: "→ waiting for a value (see Try it)", tone: "waiting" } : { text: r.error, tone: "error" };
   const v = r.value;
-  return { text: `→ ${v.kind === "number" ? formatMathNumber(v.value, undefined) : v.value}`, ok: true };
+  return { text: `→ ${v.kind === "number" ? formatMathNumber(v.value, undefined) : v.value}`, tone: "ok" };
 }
 
 function uniqueName(math: SignalMath, base: string): string {
@@ -137,7 +144,7 @@ export default function VariablesList(props: {
                 {v.kind === "calc" ? "Calculation" : "Rules"} · {types[v.name] ?? "number"}
               </span>
               {result && (
-                <span className={`ml-auto font-mono text-sm ${result.ok ? "text-amber-600 dark:text-amber-400" : "text-red-600 dark:text-red-400"}`}>
+                <span className={`ml-auto font-mono text-sm ${RESULT_TONE[result.tone]}`}>
                   {result.text}
                 </span>
               )}
