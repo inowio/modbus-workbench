@@ -29,6 +29,7 @@ Desktop toolkit for configuring, testing, and monitoring Modbus TCP/RTU devices.
 - **TCP Simulator (server mode)** — run a Modbus TCP server that answers external masters (SCADA/PLCs/test tools) across all four register banks (Coils, Discrete Inputs, Holding, Input) and multiple Unit IDs. Values can be fixed, generated (sine/ramp/decrement/step/random/toggle), or **routed from a real slave** (turning the app into a Modbus gateway with scale/offset). Tabbed workspace (Registers, Devices, Rules, Live Values, Activity), automation rules (trigger → action with delays), a clients/events Activity view, and workspace **Profile export/import**
 - **Virtual Devices** — build a device's register map once and reuse it in any workspace's simulator via *Add Device*. A built-in catalog plus fully editable custom devices, a searchable icon picker, form-or-JSON parameters, **save-as** from a live device, one-click **expose a real slave as a routed device**, and **export/import as JSON** for community sharing
 - Real-time analyzer powered by ECharts plus traffic capture for debugging
+- **Analyzer math and calculated signals** — shape a signal with guided calculations and IF/AND/OR rules, pick a unit from a grouped list, and build calculated signals (e.g. power = V × A) from other signals, with a live **Try it** panel to test before saving
 - Grid/list workspace browser that remembers your view, and per-slave register-type recall
 - Rich logging, dark/light theming, and keyboard-friendly UI
 - Ships as a native desktop app for Windows, macOS, and Linux

@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import AnalyzerPage from "./AnalyzerPage";
 
@@ -123,6 +123,18 @@ vi.mock("./analyzer/AnalyzerTilesCard", () => ({
       <button type="button" onClick={props.onAddTile}>
         Add Tile
       </button>
+      {props.tiles.map((t: any) =>
+        t.kind === "trend" ? (
+          <div key={t.id} data-testid={`trend-${t.id}`}>
+            {JSON.stringify(props.renderTrendTile(t, props.pollingWanted).points)}
+          </div>
+        ) : t.kind === "value" ? (
+          <div key={t.id}>
+            <div data-testid={`value-${t.id}`}>{props.renderTileValue(t, props.pollingWanted).label}</div>
+            <div data-testid={`info-${t.id}`}>{JSON.stringify(props.getTileInfo(t.id))}</div>
+          </div>
+        ) : null,
+      )}
     </div>
   ),
 }));
@@ -143,6 +155,8 @@ function setupAnalyzerData(options?: { tiles?: any[] }) {
 
   const signal = {
     id: "sig-1",
+    kind: "register",
+    inputSignalIds: [],
     slaveId: 1,
     connectionKind: "serial",
     functionKind: "holding",
@@ -155,6 +169,7 @@ function setupAnalyzerData(options?: { tiles?: any[] }) {
   const link = {
     tileId: 1,
     signalId: "sig-1",
+    kind: "register",
     role: "primary",
     functionCode: 3,
     address: 0,
@@ -267,5 +282,173 @@ describe("AnalyzerPage", () => {
     await waitFor(() =>
       expect(setAnalyzerTilePollingEnabledMock).toHaveBeenCalledWith("UnitTest", 1, expect.any(Boolean)),
     );
+  });
+
+  describe("calculated signals", () => {
+    const power = JSON.stringify({
+      math: {
+        version: 1,
+        inputs: [
+          { name: "V", signalId: "a", value: "shown" },
+          { name: "A", signalId: "b", value: "shown" },
+        ],
+        variables: [
+          { name: "P", kind: "calc", start: { ref: "V" }, steps: [{ op: "mul", operand: { ref: "A" } }, { op: "div", operand: { num: 1000 } }] },
+        ],
+      },
+      show: "P",
+      decimals: 3,
+    });
+
+    const longAgo = () => Date.now() - 3_600_000;
+    const regSignal = (id: string, raw: number, lastUpdatedTsMs: number = Date.now()) => ({
+      id,
+      kind: "register",
+      inputSignalIds: [],
+      slaveId: 1,
+      connectionKind: "serial",
+      functionKind: "holding",
+      registerRowId: 1,
+      address: 0,
+      functionCode: 3,
+      alias: null,
+      dataType: "u16",
+      order: "ABCD",
+      displayFormat: "dec",
+      decoderJson: JSON.stringify({ scale: 0.1, decimals: 1 }),
+      lastValueJson: JSON.stringify({ rawWords: [raw] }),
+      lastUpdatedTsMs,
+      state: "OK",
+    });
+
+    const calcSignal = {
+      id: "p",
+      kind: "calculated",
+      inputSignalIds: ["a", "b"],
+      slaveId: null,
+      connectionKind: "serial",
+      functionKind: "holding",
+      registerRowId: null,
+      address: null,
+      functionCode: null,
+      alias: null,
+      dataType: null,
+      order: null,
+      displayFormat: null,
+      decoderJson: power,
+      state: "OK",
+    };
+
+    const tile = (id: number, kind: string) => ({
+      id,
+      kind,
+      title: `T${id}`,
+      configJson: "{}",
+      pollingEnabled: true,
+      createdAt: "",
+      updatedAt: "",
+    });
+
+    const link = (tileId: number) => ({
+      tileId,
+      signalId: "p",
+      kind: "calculated",
+      role: "primary",
+      functionCode: 0,
+      address: -1,
+      alias: "",
+      dataType: "",
+      order: "",
+      displayFormat: "dec",
+      decoderJson: power,
+      state: "OK",
+    });
+
+    const handlers: Record<string, (event: { payload: unknown }) => void> = {};
+
+    function setupCalculated(tiles: any[], opts?: { tsA?: number; tsB?: number; signalFor?: (tileId: number) => string }) {
+      setupAnalyzerData({ tiles });
+      listAnalyzerSignalsMock.mockResolvedValue([
+        regSignal("a", 2304, opts?.tsA),
+        regSignal("b", 42, opts?.tsB),
+        calcSignal,
+      ]);
+      listAnalyzerTileSignalsMock.mockImplementation((_ws: string, tileId: number) =>
+        Promise.resolve([{ ...link(tileId), signalId: opts?.signalFor?.(tileId) ?? "p" }]),
+      );
+      for (const k of Object.keys(handlers)) delete handlers[k];
+      listenMock.mockImplementation((name: string, cb: (event: { payload: unknown }) => void) => {
+        handlers[name] = cb;
+        return Promise.resolve(() => {});
+      });
+    }
+
+    const update = (signalId: string, extra: Record<string, unknown> = {}) => ({
+      payload: { workspace: "UnitTest", signalId, tsMs: Date.now(), state: "OK", rawWords: [2304], ...extra },
+    });
+
+    async function startPolling() {
+      await waitFor(() => expect(handlers["analyzer_signal_update"]).toBeDefined());
+      fireEvent.click(screen.getByRole("button", { name: /start polling/i }));
+      await waitFor(() => expect(startAnalyzerPollingMock).toHaveBeenCalled());
+    }
+
+    it("value tile on a calculated signal renders its computed label", async () => {
+      setupCalculated([tile(1, "value")]);
+      render(<AnalyzerPage />);
+      await waitFor(() => expect(screen.getByTestId("value-1").textContent).toBe("0.968"));
+    });
+
+    it("tile information names a calculated signal's inputs instead of a register", async () => {
+      setupCalculated([tile(1, "value"), tile(3, "value")], { signalFor: (id) => (id === 3 ? "a" : "p") });
+      render(<AnalyzerPage />);
+      await waitFor(() => expect(screen.getByTestId("value-1").textContent).toBe("0.968"));
+      const info = (id: number) => JSON.parse(screen.getByTestId(`info-${id}`).textContent ?? "null");
+      expect(info(1).calculatedSource).toBe("Calculated · inputs: a, b");
+      expect(info(3).calculatedSource).toBeNull();
+    });
+
+    it("at rest with old timestamps, register and calculated tiles show last values (no stale label)", async () => {
+      setupCalculated([tile(1, "value"), tile(3, "value")], {
+        tsA: longAgo(),
+        tsB: longAgo(),
+        signalFor: (id) => (id === 3 ? "a" : "p"),
+      });
+      render(<AnalyzerPage />);
+      await waitFor(() => expect(screen.getByTestId("value-1").textContent).toBe("0.968"));
+      expect(screen.getByTestId("value-3").textContent).toBe("230.4");
+    });
+
+    it("trend history appends for a calculated tile when an input updates", async () => {
+      setupCalculated([tile(2, "trend")]);
+      render(<AnalyzerPage />);
+      await startPolling();
+      await waitFor(() => expect(listAnalyzerTileSignalsMock).toHaveBeenCalled());
+
+      act(() => {
+        handlers["analyzer_signal_update"](update("a"));
+      });
+      await waitFor(() => {
+        const points = JSON.parse(screen.getByTestId("trend-2").textContent ?? "[]");
+        expect(points).toHaveLength(1);
+        expect(points[0].value).toBe(0.968);
+      });
+    });
+
+    it("trend history appends a null point for a calculated tile when an input is stale", async () => {
+      // B never updates and its last value is an hour old, so while polling it is age-STALE.
+      setupCalculated([tile(2, "trend")], { tsB: longAgo() });
+      render(<AnalyzerPage />);
+      await startPolling();
+
+      act(() => {
+        handlers["analyzer_signal_update"](update("a"));
+      });
+      await waitFor(() => {
+        const points = JSON.parse(screen.getByTestId("trend-2").textContent ?? "[]");
+        expect(points).toHaveLength(1);
+        expect(points[0].value).toBeNull();
+      });
+    });
   });
 });

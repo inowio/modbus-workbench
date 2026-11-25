@@ -5,6 +5,7 @@ use serialport::SerialPortType;
 use tauri::Manager;
 
 mod db;
+mod analyzer_migrate;
 mod models;
 mod settings;
 mod slaves;

@@ -4,7 +4,30 @@ All notable changes to this project are tracked here following [Keep a Changelog
 
 ## [Unreleased]
 
-_No changes yet._
+### Added
+- **Unit dropdown** — Analyzer signals now pick a unit from a grouped list
+  (Temperature, Electrical, Pressure, Flow, Vibration, Time and more), with
+  **Custom…** for your own label. The unit is only a label and never converts
+  the value; existing units open as Custom.
+- **Data and Math tabs with guided variables** — the signal editor has a
+  **Math** tab where you build named variables as step-by-step **Calculations**
+  (evaluated strictly left to right) or **Rules** (IF / AND / OR → value, with
+  OTHERWISE). **Show value** picks the register value or any variable for
+  tiles. When a value can't be computed, tiles show the reason (for example
+  "division by zero") instead of a number, never an invented one, and text
+  results stay off trend charts.
+- **Calculated signals** — create a signal with no register that combines
+  other register signals as inputs (for example power = V × A), usable on value
+  and trend tiles. Signals used as inputs are protected from deletion.
+- **Try it panel** — test your math with live values or typed values before
+  saving, without touching the device.
+- **Larger signal editor** — a sticky header and footer give the new Data and
+  Math tabs room to work.
+
+### Changed
+- **Workspace upgrade** — when 0.6.0 starts, every workspace is upgraded as the
+  workspace list loads, and upgraded workspaces can no longer be opened by
+  0.5.x. Export a backup of important workspaces before upgrading.
 
 ## [0.5.0] - 2026-08-10
 ### Added

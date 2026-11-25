@@ -22,10 +22,7 @@ import {
   type AnalyzerTile,
   type AnalyzerTileSignalInfo,
 } from "../api/analyzer";
-import {
-  decodeAnalyzerSignal,
-  parseAnalyzerRawSnapshotFromJson,
-} from "../utils/analyzerSignalDecoder";
+import type { SignalEvaluation } from "../utils/analyzerSignalEval";
 import { listSlaves, type SlaveItem } from "../api/slaves";
 import type { AnalyzerTrendPoint } from "../components/AnalyzerTrendTile";
 import {
@@ -39,6 +36,7 @@ import AnalyzerTilesCard from "./analyzer/AnalyzerTilesCard";
 import AnalyzerAddEditTileModal from "./analyzer/AnalyzerAddEditTileModal";
 import AnalyzerConfigureSignalsModal from "./analyzer/AnalyzerConfigureSignalsModal";
 import { getChartKind } from "./analyzer/chartKind";
+import { computeSignalEvaluations, dependentsBySignalId, type LiveSignalUpdate } from "./analyzer/signalEvaluations";
 import type { BreakpointLayouts, GridLayout } from "./analyzer/layoutTypes";
 import { buildLayoutsFromSaved } from "./analyzer/layoutTypes";
 import { logEvent, type LogLevel } from "../api/logs";
@@ -104,7 +102,9 @@ export default function AnalyzerPage() {
   const [historyByTileId, setHistoryByTileId] = useState<Record<number, AnalyzerTrendPoint[]>>({});
   const [trendWindowMinutes, setTrendWindowMinutes] = useState<number | null>(5);
   const [addressFormat, setAddressFormat] = useState<AnalyzerAddressFormat>("dec");
-  const signalInfoBySignalIdRef = useRef<Record<string, AnalyzerTileSignalInfo>>({});
+  const latestLiveRef = useRef<Record<string, AnalyzerSignalUpdate>>({});
+  const signalsRef = useRef<AnalyzerSignal[]>([]);
+  const getSignalPollIntervalMsRef = useRef<(signalId: string, seen?: Set<string>) => number>(() => 1000);
   const pendingLiveUpdatesRef = useRef<Record<string, AnalyzerSignalUpdate>>({});
   const pendingHistoryPointsRef = useRef<Record<number, AnalyzerTrendPoint[]>>({});
   const pendingFlushTimerRef = useRef<number | null>(null);
@@ -252,25 +252,73 @@ export default function AnalyzerPage() {
     return out;
   }, [signals]);
 
-  function getSignalPollIntervalMs(signalId: string): number {
+  function getSignalPollIntervalMs(signalId: string, seen: Set<string> = new Set()): number {
     const sig = signalsById.get(signalId) ?? null;
     if (!sig) return 1000;
-    const slave = slavesById.get(sig.slaveId) ?? null;
+    if (sig.kind === "calculated") {
+      // A calculated signal updates whenever one of its inputs does: use the fastest input.
+      if (seen.has(signalId)) return 1000;
+      seen.add(signalId);
+      let min = Infinity;
+      for (const inputId of sig.inputSignalIds ?? []) {
+        min = Math.min(min, getSignalPollIntervalMs(inputId, seen));
+      }
+      return Number.isFinite(min) ? min : 1000;
+    }
+    const slave = slavesById.get(sig.slaveId ?? -1) ?? null;
     const interval = slave?.pollIntervalMs ?? 0;
     return interval > 0 ? interval : 1000;
   }
+  getSignalPollIntervalMsRef.current = getSignalPollIntervalMs;
 
   useEffect(() => {
-    const next: Record<string, AnalyzerTileSignalInfo> = {};
-    for (const links of Object.values(tileSignals)) {
-      for (const l of links) {
-        if (!next[l.signalId]) {
-          next[l.signalId] = l;
-        }
-      }
-    }
-    signalInfoBySignalIdRef.current = next;
-  }, [tileSignals]);
+    signalsRef.current = signals;
+  }, [signals]);
+
+  // Same stale rule the tiles always used: a base state of OK turns STALE/DISCONNECTED by age.
+  function deriveUiState(
+    signal: { id: string; state?: string | null; lastUpdatedTsMs?: number | null },
+    live: LiveSignalUpdate | null,
+    nowMs: number,
+  ): string {
+    const baseState = (live?.state ?? signal.state ?? "DISCONNECTED").toString().toUpperCase();
+    if (baseState !== "OK") return baseState;
+
+    const expectedMs = getSignalPollIntervalMsRef.current(signal.id);
+    const staleAfterMs = Math.max(1500, Math.round(expectedMs * 2.5));
+    const lastTs = live?.tsMs ?? signal.lastUpdatedTsMs ?? null;
+    if (lastTs == null) return "DISCONNECTED";
+
+    const age = nowMs - lastTs;
+    if (Number.isFinite(age) && age > staleAfterMs) return "STALE";
+    return "OK";
+  }
+
+  const evaluations = useMemo(
+    () =>
+      computeSignalEvaluations({
+        signals,
+        live: pollingWanted ? liveUpdates : {},
+        // Age staleness applies only while polling; at rest values decode from the stored state alone.
+        uiState: pollingWanted ? (sig, live) => deriveUiState(sig, live, nowTsMs) : undefined,
+      }),
+    // deriveUiState reads poll intervals derived from signals/slaves.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [signals, slaves, liveUpdates, pollingWanted, nowTsMs],
+  );
+
+  const staticEvaluations = useMemo(
+    () =>
+      computeSignalEvaluations({
+        signals,
+        live: {},
+      }),
+    [signals],
+  );
+
+  const dependents = useMemo(() => dependentsBySignalId(signals), [signals]);
+  const dependentsRef = useRef(dependents);
+  dependentsRef.current = dependents;
 
   useEffect(() => {
     return () => {
@@ -428,33 +476,6 @@ export default function AnalyzerPage() {
       return changed ? next : prev;
     });
   }, [tiles]);
-
-  function deriveNumericSample(update: AnalyzerSignalUpdate, info: AnalyzerTileSignalInfo): number | null {
-    const state = (update.state || "").toUpperCase();
-    if (state !== "OK") return null;
-
-    const rawWords = update.rawWords ?? null;
-    const rawBools = update.rawBools ?? null;
-    const decoded = decodeAnalyzerSignal({
-      state,
-      error: update.error ?? null,
-      rawWords,
-      rawBools,
-      functionCode: info.functionCode,
-      dataType: info.dataType,
-      order: info.order,
-      displayFormat: info.displayFormat,
-      decoderJson: info.decoderJson,
-    });
-
-    if (!decoded.ok) return null;
-    if (decoded.value.kind === "bool") return decoded.value.value ? 1 : 0;
-    if (decoded.value.kind === "bigint") {
-      const n = Number(decoded.value.value);
-      return Number.isFinite(n) ? n : null;
-    }
-    return Number.isFinite(decoded.value.value) ? decoded.value.value : null;
-  }
 
   function openAddTileModal(kind: "trend" | "value") {
     setTileModalError(null);
@@ -618,6 +639,7 @@ export default function AnalyzerPage() {
   }
 
   useEffect(() => {
+    latestLiveRef.current = {};
     void refreshAll();
   }, [workspaceName]);
 
@@ -638,9 +660,46 @@ export default function AnalyzerPage() {
           if (!pollingWantedRef.current) return;
 
           pendingLiveUpdatesRef.current[payload.signalId] = payload;
+          latestLiveRef.current[payload.signalId] = payload;
 
-          const info = signalInfoBySignalIdRef.current[payload.signalId] ?? null;
-          if (info) {
+          {
+            const currentSignals = signalsRef.current;
+            const deps = dependentsRef.current;
+            const byId = new Map(currentSignals.map((sg) => [sg.id, sg] as const));
+
+            // affected = the updated signal plus every calculated signal reading it (transitively).
+            const affected = new Set<string>([payload.signalId]);
+            const queue = [payload.signalId];
+            while (queue.length > 0) {
+              const id = queue.pop() as string;
+              for (const d of deps[id] ?? []) {
+                if (!affected.has(d)) {
+                  affected.add(d);
+                  queue.push(d);
+                }
+              }
+            }
+
+            // needed = affected plus everything those need as inputs (closure over inputs).
+            const needed = new Set<string>(affected);
+            const need = [...affected];
+            while (need.length > 0) {
+              const sg = byId.get(need.pop() as string);
+              if (!sg || sg.kind !== "calculated") continue;
+              for (const inId of sg.inputSignalIds ?? []) {
+                if (!needed.has(inId)) {
+                  needed.add(inId);
+                  need.push(inId);
+                }
+              }
+            }
+
+            const evals = computeSignalEvaluations({
+              signals: currentSignals.filter((sg) => needed.has(sg.id)),
+              live: latestLiveRef.current,
+              uiState: (sg, live) => deriveUiState(sg, live, Date.now()),
+            });
+
             const currentTiles = tilesRef.current;
             const currentTileSignals = tileSignalsRef.current;
 
@@ -655,13 +714,15 @@ export default function AnalyzerPage() {
               const links = currentTileSignals[t.id] ?? [];
               const primary = links.find((s) => s.role === "primary") ?? links[0] ?? null;
               if (!primary) continue;
-              if (primary.signalId !== payload.signalId) continue;
+              if (!affected.has(primary.signalId)) continue;
+              const evaluation = evals[primary.signalId];
+              if (!evaluation) continue;
               const tsMs = payload.tsMs ?? Date.now();
-              const sample = deriveNumericSample(payload, primary);
+              const sample = evaluation.sample;
               const existing = pendingHistoryPointsRef.current[t.id] ?? [];
               const last = existing.length > 0 ? existing[existing.length - 1] : null;
 
-              const expectedMs = getSignalPollIntervalMs(primary.signalId);
+              const expectedMs = getSignalPollIntervalMsRef.current(primary.signalId);
               const gapBreakMs = Math.max(1000, Math.round(expectedMs * 6));
               if (last && Number.isFinite(last.tsMs) && tsMs - last.tsMs >= gapBreakMs) {
                 existing.push({ tsMs: last.tsMs + 1, value: null });
@@ -790,18 +851,8 @@ export default function AnalyzerPage() {
     }
   }
 
-  function deriveUiState(primary: AnalyzerTileSignalInfo, live: AnalyzerSignalUpdate | null): string {
-    const baseState = (live?.state ?? primary.state ?? "DISCONNECTED").toString().toUpperCase();
-    if (baseState !== "OK") return baseState;
-
-    const expectedMs = getSignalPollIntervalMs(primary.signalId);
-    const staleAfterMs = Math.max(1500, Math.round(expectedMs * 2.5));
-    const lastTs = live?.tsMs ?? primary.lastUpdatedTsMs ?? null;
-    if (lastTs == null) return "DISCONNECTED";
-
-    const age = nowTsMs - lastTs;
-    if (Number.isFinite(age) && age > staleAfterMs) return "STALE";
-    return "OK";
+  function evaluationFor(signalId: string, isRunning: boolean): SignalEvaluation | null {
+    return (isRunning ? evaluations : staticEvaluations)[signalId] ?? null;
   }
 
   function renderTileValue(tile: AnalyzerTile, isRunning: boolean): { label: string; state: string } {
@@ -809,37 +860,9 @@ export default function AnalyzerPage() {
     const primary = links.find((s) => s.role === "primary") ?? links[0] ?? null;
     if (!primary) return { label: "No signal", state: "DISCONNECTED" };
 
-    const live = isRunning ? (liveUpdates[primary.signalId] ?? null) : null;
-
-    const uiState = deriveUiState(primary, live);
-    const decoderState = (live?.state ?? primary.state ?? "DISCONNECTED").toString();
-
-    const rawFromLive = {
-      rawWords: live?.rawWords ?? undefined,
-      rawBools: live?.rawBools ?? undefined,
-    };
-
-    const rawFromDb = parseAnalyzerRawSnapshotFromJson(primary.lastValueJson ?? null);
-
-    const rawWords = rawFromLive.rawWords ?? rawFromDb?.rawWords ?? null;
-    const rawBools = rawFromLive.rawBools ?? rawFromDb?.rawBools ?? null;
-
-    const decoded = decodeAnalyzerSignal({
-      state: decoderState,
-      error: live?.error ?? null,
-      errorJson: primary.errorJson ?? null,
-      rawWords,
-      rawBools,
-      functionCode: primary.functionCode,
-      dataType: primary.dataType,
-      order: primary.order,
-      displayFormat: primary.displayFormat,
-      decoderJson: primary.decoderJson,
-    });
-
-    if (!decoded.ok) return { label: decoded.formatted, state: uiState };
-
-    return { label: decoded.formatted, state: uiState };
+    const evaluation = evaluationFor(primary.signalId, isRunning);
+    if (!evaluation) return { label: "No signal", state: "DISCONNECTED" };
+    return { label: evaluation.formatted, state: evaluation.state };
   }
 
   function renderTrendTile(tile: AnalyzerTile, isRunning: boolean): { points: AnalyzerTrendPoint[]; state: string } {
@@ -847,8 +870,7 @@ export default function AnalyzerPage() {
     const primary = links.find((s) => s.role === "primary") ?? links[0] ?? null;
     if (!primary) return { points: [], state: "DISCONNECTED" };
 
-    const live = isRunning ? (liveUpdates[primary.signalId] ?? null) : null;
-    const state = deriveUiState(primary, live);
+    const state = evaluationFor(primary.signalId, isRunning)?.state ?? "DISCONNECTED";
     const points = historyByTileId[tile.id] ?? [];
     return { points, state };
   }
@@ -892,6 +914,8 @@ export default function AnalyzerPage() {
     registerAddress: number | null;
     registerAddressFormatted: string;
     registerType: string;
+    /** "Calculated · inputs: A, B" for calculated signals (they have no register); otherwise null. */
+    calculatedSource: string | null;
     pollIntervalMs: number | null;
   } | null {
     const tile = tiles.find((t) => t.id === tileId) ?? null;
@@ -920,6 +944,10 @@ export default function AnalyzerPage() {
     const registerType = formatRegisterType(primary?.functionCode ?? null);
 
     const pollIntervalMs = getTilePollingIntervalMs(tileId);
+    const calculatedSource =
+      (sig ? sig.kind : primary?.kind) === "calculated"
+        ? `Calculated · inputs: ${(sig?.inputSignalIds ?? []).join(", ") || "none"}`
+        : null;
 
     return {
       tileType,
@@ -931,6 +959,7 @@ export default function AnalyzerPage() {
       registerAddress,
       registerAddressFormatted,
       registerType,
+      calculatedSource,
       pollIntervalMs,
     };
   }
@@ -1004,6 +1033,9 @@ export default function AnalyzerPage() {
         isPollingWanted={pollingWanted}
         nowTsMs={nowTsMs}
         getSignalPollIntervalMs={getSignalPollIntervalMs}
+        tiles={tiles}
+        tileSignals={tileSignals}
+        evaluations={evaluations}
         onClose={() => setConfigureSignalsOpen(false)}
         onAfterMutation={async () => {
           await refreshSignals();
@@ -1017,7 +1049,7 @@ export default function AnalyzerPage() {
         open={tileModalOpen}
         mode={tileModalMode}
         signals={signals}
-        slavesById={slavesById}
+        getSignalPollIntervalMs={getSignalPollIntervalMs}
         editingTile={tileModalEditingTile}
         editingTilePrimary={editingTilePrimary}
         initialKind={tileModalInitialKind}
@@ -1081,6 +1113,7 @@ export default function AnalyzerPage() {
               }
 
               setTileModalOpen(false);
+              await refreshSignals();
               await refreshTiles();
             } catch (e) {
               logWorkspace("error", "Analyzer tile save failed", {
@@ -1196,6 +1229,7 @@ export default function AnalyzerPage() {
               pushToast("Tile deleted", "info");
               logWorkspace("info", "Analyzer tile deleted", { tileId: tile.id });
               setConfirmDeleteTile(null);
+              await refreshSignals();
               await refreshTiles();
             } catch (e) {
               logWorkspace("error", "Analyzer tile delete failed", { tileId: tile.id, error: String(e) });

@@ -50,6 +50,7 @@ type Props = {
     registerAddress: number | null;
     registerAddressFormatted: string;
     registerType: string;
+    calculatedSource: string | null;
     pollIntervalMs: number | null;
   } | null;
 
@@ -616,17 +617,26 @@ export default function AnalyzerTilesCard(props: Props) {
                           <div className="mt-1 text-sm text-slate-900 dark:text-slate-100">{slaveLabel}</div>
                         </div>
 
-                        <div>
-                          <div className="text-xs font-semibold text-slate-500 dark:text-slate-400">Register Type:</div>
-                          <div className="mt-1 ml-1 text-sm text-slate-900 dark:text-slate-100">{info.registerType}</div>
-                        </div>
-
-                        <div>
-                          <div className="text-xs font-semibold text-slate-500 dark:text-slate-400">Register Address:</div>
-                          <div className="mt-1 ml-1 text-sm text-slate-900 dark:text-slate-100">
-                            {info.registerAddress != null ? info.registerAddressFormatted : ""}
+                        {info.calculatedSource != null ? (
+                          <div className="sm:col-span-2">
+                            <div className="text-xs font-semibold text-slate-500 dark:text-slate-400">Source:</div>
+                            <div className="mt-1 ml-1 text-sm text-slate-900 dark:text-slate-100">{info.calculatedSource}</div>
                           </div>
-                        </div>
+                        ) : (
+                          <>
+                            <div>
+                              <div className="text-xs font-semibold text-slate-500 dark:text-slate-400">Register Type:</div>
+                              <div className="mt-1 ml-1 text-sm text-slate-900 dark:text-slate-100">{info.registerType}</div>
+                            </div>
+
+                            <div>
+                              <div className="text-xs font-semibold text-slate-500 dark:text-slate-400">Register Address:</div>
+                              <div className="mt-1 ml-1 text-sm text-slate-900 dark:text-slate-100">
+                                {info.registerAddress != null ? info.registerAddressFormatted : ""}
+                              </div>
+                            </div>
+                          </>
+                        )}
 
                         <div>
                           <div className="text-xs font-semibold text-slate-500 dark:text-slate-400">Poll interval:</div>

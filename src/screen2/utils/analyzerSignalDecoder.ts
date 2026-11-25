@@ -6,6 +6,7 @@ import {
   formatBytesAsAscii,
   formatValueTyped,
 } from "./modbusValueCodec";
+import { parseSignalMath, type SignalMath } from "./analyzerMath";
 
 export type AnalyzerRawSnapshot = {
   rawWords?: number[];
@@ -20,6 +21,8 @@ export type AnalyzerDecoderConfig = {
   clampMax?: number;
   decimals?: number;
   unit?: string;
+  show?: string;
+  math?: SignalMath;
 };
 
 export type AnalyzerDecodedValue =
@@ -66,7 +69,7 @@ function asStringOrUndefined(v: unknown): string | undefined {
    return message?.trim() ? message.trim() : null;
  }
 
-function formatNonOkStateMessage(state: string, errorMessage: string): string {
+export function formatNonOkStateMessage(state: string, errorMessage: string): string {
   const s = (state || "").toUpperCase();
   if (s === "DISCONNECTED") return "Disconnected";
 
@@ -148,6 +151,8 @@ export function parseAnalyzerDecoderConfig(decoderJson: string | null | undefine
   const clampMax = asNumberOrUndefined(obj.clampMax);
   const decimals = asNumberOrUndefined(obj.decimals);
   const unit = asStringOrUndefined(obj.unit);
+  const show = asStringOrUndefined(obj.show);
+  const math = obj.math === undefined ? null : parseSignalMath(obj.math);
 
   const out: AnalyzerDecoderConfig = {};
   if (bit != null) out.bit = Math.trunc(bit);
@@ -157,6 +162,8 @@ export function parseAnalyzerDecoderConfig(decoderJson: string | null | undefine
   if (clampMax != null) out.clampMax = clampMax;
   if (decimals != null) out.decimals = Math.trunc(decimals);
   if (unit != null) out.unit = unit;
+  if (show != null) out.show = show;
+  if (math) out.math = math;
 
   return out;
 }

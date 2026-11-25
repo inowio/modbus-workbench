@@ -1,5 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
 import type { AnalyzerSignal, AnalyzerTile, AnalyzerTileSignalInfo } from "../../api/analyzer";
+import { parseSignalMath } from "../../utils/analyzerMath";
+import { shownValueType } from "../../utils/analyzerSignalEval";
+import { mathInputTypes } from "./signalEditor/signalDraft";
 
 type TileKind = "trend" | "value";
 
@@ -7,7 +10,8 @@ type Props = {
   open: boolean;
   mode: "add" | "edit";
   signals: AnalyzerSignal[];
-  slavesById: Map<number, { pollIntervalMs: number }>;
+  /** The page's poll interval (calculated signals: the fastest of their inputs). */
+  getSignalPollIntervalMs: (signalId: string) => number;
   editingTile: AnalyzerTile | null;
   editingTilePrimary: AnalyzerTileSignalInfo | null;
   initialKind?: TileKind;
@@ -27,15 +31,32 @@ function normalizeKind(raw: string | null | undefined): TileKind {
   return "value";
 }
 
+function isTextSignal(sig: AnalyzerSignal, signals: AnalyzerSignal[]): boolean {
+  if (sig.kind !== "calculated") return shownValueType(sig.decoderJson) === "text";
+  try {
+    const raw: unknown = JSON.parse(sig.decoderJson);
+    const math = parseSignalMath(raw && typeof raw === "object" ? (raw as { math?: unknown }).math : null);
+    return shownValueType(sig.decoderJson, math ? mathInputTypes(math, signals) : undefined) === "text";
+  } catch {
+    return false;
+  }
+}
+
 export default function AnalyzerAddEditTileModal(props: Props) {
   const [kind, setKind] = useState<TileKind>(props.initialKind ?? "value");
   const [title, setTitle] = useState<string>("");
   const [signalId, setSignalId] = useState<string>("");
 
-  const defaultSignalId = useMemo(() => {
-    const first = props.signals[0]?.id ?? "";
-    return first;
-  }, [props.signals]);
+  const textSignalIds = useMemo(
+    () => new Set(props.signals.filter((s) => isTextSignal(s, props.signals)).map((s) => s.id)),
+    [props.signals],
+  );
+
+  const defaultSignalId = useMemo(() => props.signals[0]?.id ?? "", [props.signals]);
+  const firstNumericId = useMemo(
+    () => props.signals.find((s) => !textSignalIds.has(s.id))?.id ?? "",
+    [props.signals, textSignalIds],
+  );
 
   useEffect(() => {
     if (!props.open) return;
@@ -48,18 +69,13 @@ export default function AnalyzerAddEditTileModal(props: Props) {
       return;
     }
 
-    setKind(props.initialKind ?? "value");
+    const initial = props.initialKind ?? "value";
+    setKind(initial);
     setTitle("");
-    setSignalId(defaultSignalId);
-  }, [defaultSignalId, props.editingTile, props.editingTilePrimary, props.initialKind, props.mode, props.open]);
+    setSignalId(initial === "trend" ? firstNumericId : defaultSignalId);
+  }, [defaultSignalId, firstNumericId, props.editingTile, props.editingTilePrimary, props.initialKind, props.mode, props.open]);
 
-  const pollIntervalMs = useMemo(() => {
-    const sig = props.signals.find((s) => s.id === signalId) ?? null;
-    if (!sig) return 1000;
-    const slave = props.slavesById.get(sig.slaveId) ?? null;
-    const fromSlave = slave?.pollIntervalMs ?? 0;
-    return fromSlave > 0 ? fromSlave : 1000;
-  }, [props.signals, props.slavesById, signalId]);
+  const pollIntervalMs = props.getSignalPollIntervalMs(signalId);
 
   useEffect(() => {
     if (!props.open) return;
@@ -77,6 +93,7 @@ export default function AnalyzerAddEditTileModal(props: Props) {
 
   const busy = !!props.busy;
   const hasSignals = props.signals.length > 0;
+  const noChartableSignal = kind === "trend" && (!firstNumericId || textSignalIds.has(signalId));
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/70 p-4 backdrop-blur-sm">
@@ -101,11 +118,18 @@ export default function AnalyzerAddEditTileModal(props: Props) {
 
         <div className="grid grid-cols-1 gap-3">
           <div>
-            <div className="text-xs font-semibold text-slate-700 dark:text-slate-200">Tile type</div>
+            <label htmlFor="analyzer-tile-kind" className="text-xs font-semibold text-slate-700 dark:text-slate-200">Tile type</label>
             <select
+              id="analyzer-tile-kind"
               className="mt-1 w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 outline-hidden focus:border-emerald-600/60 focus:ring-2 focus:ring-emerald-500/10 dark:border-slate-700 dark:bg-slate-950/40 dark:text-slate-100 dark:focus:border-emerald-500/60"
               value={kind}
-              onChange={(e) => setKind(e.currentTarget.value === "trend" ? "trend" : "value")}
+              onChange={(e) => {
+                const next: TileKind = e.currentTarget.value === "trend" ? "trend" : "value";
+                setKind(next);
+                if (next === "trend" && textSignalIds.has(signalId)) {
+                  setSignalId(firstNumericId);
+                }
+              }}
               disabled={busy}
               title="Tile type"
             >
@@ -115,25 +139,37 @@ export default function AnalyzerAddEditTileModal(props: Props) {
           </div>
 
           <div>
-            <div className="text-xs font-semibold text-slate-700 dark:text-slate-200">Primary signal</div>
+            <label htmlFor="analyzer-tile-signal" className="text-xs font-semibold text-slate-700 dark:text-slate-200">Primary signal</label>
             <select
+              id="analyzer-tile-signal"
               className="mt-1 w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 outline-hidden focus:border-emerald-600/60 focus:ring-2 focus:ring-emerald-500/10 dark:border-slate-700 dark:bg-slate-950/40 dark:text-slate-100 dark:focus:border-emerald-500/60"
               value={signalId}
               onChange={(e) => setSignalId(e.currentTarget.value)}
               disabled={busy || !hasSignals}
             >
               {props.signals.length === 0 ? <option value="">No signals</option> : null}
-              {props.signals.map((s) => (
-                <option key={s.id} value={s.id}>
-                  {s.id}
-                </option>
-              ))}
+              {props.signals.map((s) => {
+                const noChart = kind === "trend" && textSignalIds.has(s.id);
+                return (
+                  <option key={s.id} value={s.id} disabled={noChart}>
+                    {s.id}
+                    {s.kind === "calculated" ? " · calculated" : ""}
+                    {noChart ? " (text — can't be charted)" : ""}
+                  </option>
+                );
+              })}
             </select>
+            {noChartableSignal ? (
+              <div className="mt-1 text-xs text-amber-700 dark:text-amber-300">
+                Text values can't be charted — pick a numeric signal or use a Value tile.
+              </div>
+            ) : null}
           </div>
 
           <div>
-            <div className="text-xs font-semibold text-slate-700 dark:text-slate-200">Title <span className="text-xs text-slate-500 dark:text-slate-400">(optional)</span></div>
+            <label htmlFor="analyzer-tile-title" className="text-xs font-semibold text-slate-700 dark:text-slate-200">Title <span className="text-xs text-slate-500 dark:text-slate-400">(optional)</span></label>
             <input
+              id="analyzer-tile-title"
               className="mt-1 w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 outline-hidden placeholder:text-slate-400 focus:border-emerald-600/60 focus:ring-2 focus:ring-emerald-500/10 dark:border-slate-700 dark:bg-slate-950/40 dark:text-slate-100 dark:placeholder:text-slate-500 dark:focus:border-emerald-500/60"
               value={title}
               onChange={(e) => setTitle(e.currentTarget.value)}
@@ -168,7 +204,7 @@ export default function AnalyzerAddEditTileModal(props: Props) {
                 signalId: sid,
               });
             }}
-            disabled={busy || !hasSignals || !signalId.trim()}
+            disabled={busy || !hasSignals || !signalId.trim() || (kind === "trend" && textSignalIds.has(signalId))}
           >
             {props.mode === "edit" ? "Save" : "Add"}
           </button>

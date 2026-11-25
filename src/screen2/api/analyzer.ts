@@ -29,11 +29,18 @@ export type AnalyzerTileLayoutUpsert = {
 
 export type AnalyzerSignal = {
   id: string;
-  slaveId: number;
+  kind: "register" | "calculated";
+  slaveId: number | null;
   connectionKind: string;
   functionKind: string;
-  registerRowId: number;
-  address: number;
+  registerRowId: number | null;
+  address: number | null;
+  functionCode: number | null;
+  alias: string | null;
+  dataType: string | null;
+  order: string | null;
+  displayFormat: string | null;
+  inputSignalIds: string[];
   decoderJson: string;
   lastValueJson?: string | null;
   lastUpdatedTsMs?: number | null;
@@ -43,15 +50,17 @@ export type AnalyzerSignal = {
 
 export type AnalyzerSignalUpsert = {
   id: string;
-  slaveId: number;
+  kind?: "register" | "calculated";
+  slaveId: number | null;
   functionKind: string;
-  registerRowId: number;
+  registerRowId: number | null;
   decoderJson?: string;
 };
 
 export type AnalyzerTileSignalInfo = {
   tileId: number;
   signalId: string;
+  kind: "register" | "calculated";
   role: string;
   functionCode: number;
   address: number;

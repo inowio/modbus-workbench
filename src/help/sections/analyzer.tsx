@@ -15,9 +15,15 @@ const analyzerSection: HelpSectionDefinition = {
     "poll interval",
     "value tile",
     "chart",
+    "math",
+    "variables",
+    "rules",
+    "calculated signal",
+    "unit",
+    "try it",
   ],
   searchText:
-    "Analyzer pipeline Register → Signal → Tile. Learn screen controls, how to define signals, configure decoders (unit, scale, offset, bit, clamp), manage poll intervals, add tiles (value/trend), use tile menus, run/stop polling, avoid anti-patterns, and follow real-world examples.",
+    "Analyzer pipeline Register → Signal → Tile. Learn screen controls, how to define signals, configure decoders (unit, scale, offset, bit, clamp), manage poll intervals, add tiles (value/trend), use tile menus, run/stop polling, avoid anti-patterns, and follow real-world examples. Pick a unit from the grouped dropdown, add math with variables, calculations and rules (IF / AND / OR, OTHERWISE), choose what a tile shows, create calculated signals from other signals, and test with Try it.",
   anchors: [
     { id: "overview", label: "Register → Signal → Tile" },
     { id: "controls", label: "Screen controls" },
@@ -26,6 +32,10 @@ const analyzerSection: HelpSectionDefinition = {
     { id: "create-signal", label: "Create / edit signal" },
     { id: "signal-decoder", label: "Decoder configuration" },
     { id: "poll-delete", label: "Poll interval & delete" },
+    { id: "units", label: "Units" },
+    { id: "math", label: "Math: variables, calculations and rules" },
+    { id: "calculated-signals", label: "Calculated signals" },
+    { id: "try-it", label: "Try it" },
     { id: "tiles", label: "Tiles" },
     { id: "tile-types", label: "Tile types" },
     { id: "add-tile", label: "Add tile" },
@@ -102,10 +112,10 @@ Address: 0
         <div className="grid gap-4 md:grid-cols-2">
           <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm shadow-black/5 dark:border-slate-800/60 dark:bg-slate-900/20 dark:shadow-black/0">
             <ul className="list-disc space-y-1 pl-5">
-              <li><strong>Unit</strong> – text label such as °C, V, %, bar.</li>
+              <li><strong>Unit</strong> – pick from the grouped list (see Units below); it is only a label.</li>
               <li><strong>Scale</strong> – multiplier; raw 268 × 0.1 = 26.8 °C.</li>
               <li><strong>Offset</strong> – applied after scaling, e.g., subtract 40 for RTD sensors.</li>
-              <li><strong>Decimals</strong> – presentation precision only.</li>
+              <li><strong>Decimals</strong> – rounds only what tiles show; the stored value keeps full precision.</li>
             </ul>
           </div>
           <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm shadow-black/5 dark:border-slate-800/60 dark:bg-slate-900/20 dark:shadow-black/0">
@@ -121,7 +131,84 @@ Address: 0
         <p>
           Each signal can override its poll interval (e.g., 500 ms for fast loops, 5000 ms for slow sensors). Analyzer respects these intervals even when multiple signals live on the same tile layout.
         </p>
-        <p className="mt-2 text-sm text-slate-700 dark:text-slate-300">Deleting a signal removes it from the workspace and automatically detaches it from any tiles—no orphaned bindings remain.</p>
+        <p className="mt-2 text-sm text-slate-700 dark:text-slate-300">Deleting a signal removes it from the workspace and automatically detaches it from any tiles—no orphaned bindings remain. A signal that a calculated signal uses as an input cannot be deleted; remove it from those calculated signals first.</p>
+      </SectionBlock>
+      <SectionBlock section="analyzer" anchor="units" title="Units">
+        <p>
+          The <strong>Unit</strong> field is a dropdown grouped by topic: Temperature, Electrical, Pressure, Flow, Level / volume / mass, Speed / motion, Vibration, Time, and Ratio / environment. Choose <strong>None</strong> for a unitless number, or <strong>Custom…</strong> to type your own label (up to 16 characters).
+        </p>
+        <p className="mt-2 text-sm text-slate-700 dark:text-slate-300">
+          The unit is only a label shown next to the value. Choosing kPa instead of bar does <strong>not</strong> convert the number—do any conversion in the Math tab. Signals saved earlier with a unit that is not in the list open with <strong>Custom…</strong> and keep their text.
+        </p>
+      </SectionBlock>
+      <SectionBlock section="analyzer" anchor="math" title="Math: variables, calculations and rules">
+        <p>
+          The signal editor has two tabs: <strong>Data</strong> (where the value comes from, scale, offset, clamp, what tiles show, unit, decimals) and <strong>Math</strong>. In Math you build named <strong>variables</strong>, each one a <em>Calculation</em> or a <em>Rules</em> card. Variables run top to bottom and can use the register value, inputs, and any variable above them.
+        </p>
+        <div className="mt-3 grid gap-4 md:grid-cols-2">
+          <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm shadow-black/5 dark:border-slate-800/60 dark:bg-slate-900/20 dark:shadow-black/0">
+            <h3 className="text-base font-semibold text-slate-900 dark:text-white">Calculation</h3>
+            <p>Start with a value, then add steps such as + − × ÷, remainder, min, max, power, abs, round, floor, ceil, bit N of, or negate. Steps run strictly <strong>left to right</strong>, with no operator precedence: V × A ÷ 1000 means ((V × A) ÷ 1000). To group differently, put part of the work in another variable and use it.</p>
+          </div>
+          <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm shadow-black/5 dark:border-slate-800/60 dark:bg-slate-900/20 dark:shadow-black/0">
+            <h3 className="text-base font-semibold text-slate-900 dark:text-white">Rules</h3>
+            <p>Rows of <strong>IF</strong> conditions joined by <strong>AND</strong> or <strong>OR</strong> (one choice per row) that give a number or text. The first matching row wins, and <strong>OTHERWISE</strong> covers everything else. To mix AND and OR, use a second variable.</p>
+          </div>
+        </div>
+        <p className="mt-3">
+          <strong>Show value</strong> (on the Data tab) picks what tiles display: the register value or any variable. A variable that gives text, such as Low or Medium, can appear on a value tile but <strong>can't be charted</strong>; trend tiles list only numeric signals.
+        </p>
+        <ul className="mt-3 list-disc space-y-1 pl-5">
+          <li>If a step cannot produce a number (for example dividing by zero, or a missing input), the tile shows the reason instead of a value, such as <em>division by zero</em> or <em>missing: V</em>. In the editor, the tile preview shows <strong>—</strong> with the same reason. Analyzer never invents a number.</li>
+          <li><strong>Decimals</strong> rounds only what tiles show. Calculations keep full precision.</li>
+          <li>The Unit is only a label; it never changes the value.</li>
+        </ul>
+        <div className="mt-3 space-y-3 rounded-2xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-700 dark:border-slate-800/60 dark:bg-slate-900/20 dark:text-slate-300">
+          <div>
+            <p className="font-semibold text-slate-900 dark:text-white">Example 1 — scale a register</p>
+            <ol className="mt-2 list-decimal space-y-1 pl-5">
+              <li><code>x</code> = Register value (328).</li>
+              <li><code>y</code> = x ÷ 10 = 32.8.</li>
+              <li>On the Data tab set <strong>Show value</strong> to <code>y</code> and <strong>Unit</strong> to °C. The tile shows <strong>32.8 °C</strong>.</li>
+            </ol>
+          </div>
+          <div>
+            <p className="font-semibold text-slate-900 dark:text-white">Example 2 — turn a number into a label</p>
+            <p className="mt-2"><code>z</code> is a Rules variable on <code>y</code>:</p>
+            <ul className="mt-2 list-disc space-y-1 pl-5">
+              <li>y &lt; 20 → Low</li>
+              <li>y ≥ 20 AND y &lt; 40 → Medium</li>
+              <li>y ≥ 40 AND y &lt; 60 → High</li>
+              <li>y ≥ 60 AND y &lt; 80 → Critical</li>
+              <li>OTHERWISE → Unknown</li>
+            </ul>
+            <p className="mt-2">With y = 32.8 the result is <strong>Medium</strong>.</p>
+          </div>
+        </div>
+      </SectionBlock>
+      <SectionBlock section="analyzer" anchor="calculated-signals" title="Calculated signals">
+        <p>
+          A <strong>calculated signal</strong> has no register of its own. When adding a signal, choose <strong>Calculated signal</strong> as the kind (it cannot be changed after saving). On the Math tab, add <strong>inputs</strong>: each is a register signal plus which of its values to use (its shown value, register value, or one of its variables). Then build variables from those inputs as usual.
+        </p>
+        <pre className="mt-3 rounded-2xl border border-slate-200 bg-slate-50 p-3 text-sm text-slate-900 dark:border-slate-800/60 dark:bg-slate-900/40 dark:text-slate-100">
+Inputs:  V = voltage signal,  A = current signal
+Variable p = V × A ÷ 1000   → Show value p, Unit kW
+        </pre>
+        <ul className="mt-3 list-disc space-y-1 pl-5">
+          <li>It updates whenever one of its inputs updates, and its tile state follows the worst input (for example Disconnected or Stale if a source stops).</li>
+          <li>Inputs must be register signals; calculated signals cannot be chained.</li>
+          <li>A signal used as an input cannot be deleted until it is removed from every calculated signal that uses it.</li>
+          <li>The Signals list labels each signal as Register or Calculated.</li>
+        </ul>
+      </SectionBlock>
+      <SectionBlock section="analyzer" anchor="try-it" title="Try it">
+        <p>
+          The panel on the right of the Math tab lets you test your math before saving. It has one box for the register value (or each input) and lists the result of every variable, or the error if one fails.
+        </p>
+        <ul className="mt-3 list-disc space-y-1 pl-5">
+          <li><strong>Use live values</strong> fills the boxes from the latest polled data. Typing your own value switches it off so you can test edge cases such as 0 or 100.</li>
+          <li>Try it is a preview only: nothing is saved and nothing is written to the device.</li>
+        </ul>
       </SectionBlock>
       <SectionBlock section="analyzer" anchor="tiles" title="Tiles">
         <p>
