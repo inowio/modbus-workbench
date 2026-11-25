@@ -24,6 +24,12 @@ All notable changes to this project are tracked here following [Keep a Changelog
 - **Larger signal editor** — a sticky header and footer give the new Data and
   Math tabs room to work.
 
+### Fixed
+- **Trend chart time labels** — on narrow trend tiles the time labels no longer
+  overlap; the number of labels now follows the tile width.
+- **Dark-mode dropdowns** — unavailable (greyed-out) options, such as
+  "Add a variable in the Math tab first", are readable in dark mode.
+
 ### Changed
 - **Workspace upgrade** — when 0.6.0 starts, every workspace is upgraded as the
   workspace list loads, and upgraded workspaces can no longer be opened by
