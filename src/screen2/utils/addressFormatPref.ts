@@ -46,13 +46,19 @@ export function useAppAddressFormat(): [AddressFormat, (f: AddressFormat) => voi
 
   useEffect(() => {
     const sync = () => setFmt(readAppAddressFormat());
+    // Use the written value, not storage: it still holds for the session when storage throws.
+    const onChange = (e: Event) => {
+      const f = (e as CustomEvent<unknown>).detail;
+      if (f === "dec" || f === "hex") setFmt(f);
+      else sync();
+    };
     const onStorage = (e: StorageEvent) => {
       if (e.key === null || e.key === APP_ADDRESS_FORMAT_KEY) sync();
     };
-    window.addEventListener(CHANGE_EVENT, sync);
+    window.addEventListener(CHANGE_EVENT, onChange);
     window.addEventListener("storage", onStorage);
     return () => {
-      window.removeEventListener(CHANGE_EVENT, sync);
+      window.removeEventListener(CHANGE_EVENT, onChange);
       window.removeEventListener("storage", onStorage);
     };
   }, []);

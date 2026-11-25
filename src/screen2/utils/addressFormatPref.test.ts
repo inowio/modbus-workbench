@@ -52,4 +52,18 @@ describe("addressFormatPref", () => {
     expect(readAppAddressFormat()).toBe("dec");
     expect(() => writeAppAddressFormat("hex")).not.toThrow();
   });
+
+  it("hex chosen while localStorage throws holds for the session in every hook", () => {
+    vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => {
+      throw new Error("denied");
+    });
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new Error("denied");
+    });
+    const a = renderHook(() => useAppAddressFormat());
+    const b = renderHook(() => useAppAddressFormat());
+    act(() => a.result.current[1]("hex"));
+    expect(a.result.current[0]).toBe("hex");
+    expect(b.result.current[0]).toBe("hex");
+  });
 });
