@@ -1,12 +1,8 @@
-import type { AnalyzerAddressFormat } from "../../utils/analyzerAddressFormat";
-
 type Props = {
   loading: boolean;
   onRefresh: () => void;
   trendWindowMinutes: number | null;
   onChangeTrendWindowMinutes: (next: number | null) => void;
-  addressFormat: AnalyzerAddressFormat;
-  onChangeAddressFormat: (next: AnalyzerAddressFormat) => void;
 };
 
 export default function AnalyzerHeaderCard(props: Props) {
@@ -17,20 +13,7 @@ export default function AnalyzerHeaderCard(props: Props) {
       </div>
 
       <div className="flex flex-wrap items-center gap-2">
-        <div className="text-xs text-slate-600 dark:text-slate-400">Address:</div>
-        <select
-          className="rounded-full border border-slate-300 bg-white px-3 py-1 text-xs font-semibold text-slate-700 outline-hidden transition hover:border-slate-400 dark:border-slate-700 dark:bg-white/5 dark:text-slate-100 dark:hover:border-slate-600"
-          value={props.addressFormat}
-          onChange={(e) => {
-            props.onChangeAddressFormat(e.currentTarget.value === "hex" ? "hex" : "dec");
-          }}
-          title="Analyzer address display format"
-        >
-          <option value="dec">Dec</option>
-          <option value="hex">Hex</option>
-        </select>
-
-        <div className="ml-2 text-xs text-slate-600 dark:text-slate-400">Trends to show:</div>
+        <div className="text-xs text-slate-600 dark:text-slate-400">Trends to show:</div>
         <select
           className="rounded-full border border-slate-300 bg-white px-3 py-1 text-xs font-semibold text-slate-700 outline-hidden transition hover:border-slate-400 dark:border-slate-700 dark:bg-white/5 dark:text-slate-100 dark:hover:border-slate-600"
           value={props.trendWindowMinutes == null ? "all" : String(props.trendWindowMinutes)}

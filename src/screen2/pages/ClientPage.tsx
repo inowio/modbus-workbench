@@ -7,6 +7,7 @@ import ConfirmDialog from "../../components/ConfirmDialog";
 import { useErrorToast, useToast } from "../../components/ToastProvider";
 import { logEvent } from "../api/logs";
 import { CTRL_S } from "../../components/ShortcutKeys";
+import { useAppAddressFormat } from "../utils/addressFormatPref";
 
 type ClientSettings = {
   responseTimeoutMs?: number | null;
@@ -39,6 +40,7 @@ export default function ClientPage() {
   const { workspace } = useOutletContext<Screen2OutletContext>();
 
   const { pushToast } = useToast();
+  const [addressFormat, setAddressFormat] = useAppAddressFormat();
 
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -401,6 +403,30 @@ export default function ClientPage() {
                 )}
                 for the selected range in this workspace.
               </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div className="w-full rounded-2xl border border-slate-200 bg-white p-4 shadow-sm dark:border-slate-800/70 dark:bg-slate-900/60">
+        <div className="text-sm font-semibold text-slate-900 dark:text-slate-200">Display</div>
+        <div className="mt-3 grid gap-4 lg:grid-cols-2">
+          <div className="flex flex-col gap-2">
+            <label className="text-sm font-semibold text-slate-900 dark:text-slate-200" htmlFor="register-address-format">
+              Register addresses
+            </label>
+            <select
+              id="register-address-format"
+              className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 outline-hidden focus:border-emerald-600/60 focus:ring-2 focus:ring-emerald-600/10 disabled:bg-slate-100 dark:border-slate-700 dark:bg-slate-950/40 dark:text-slate-100 dark:focus:border-emerald-500/60 dark:focus:ring-emerald-500/10 dark:disabled:bg-white/5"
+              value={addressFormat}
+              onChange={(e) => {
+                setAddressFormat(e.currentTarget.value === "hex" ? "hex" : "dec");
+              }}
+            >
+              <option value="dec">Dec</option>
+              <option value="hex">Hex</option>
+            </select>
+            <div className="ml-1 text-sm text-slate-600 dark:text-slate-300">
+              How register addresses are shown across the app. Applies to all workspaces on this machine.
             </div>
           </div>
         </div>

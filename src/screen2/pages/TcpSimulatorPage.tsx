@@ -22,7 +22,7 @@ import SimStatusDashboard from "../simulator/SimStatusDashboard";
 import SimTabBar, { type TabKey } from "../simulator/SimTabBar";
 import { useSimulatorData, type PageRegister, type SimDevice } from "../simulator/useSimulatorData";
 import { useValueHistory } from "../simulator/useValueHistory";
-import { readAddressFormat, writeAddressFormat, type AddressFormat } from "../utils/simulatorPrefs";
+import { useAppAddressFormat } from "../utils/addressFormatPref";
 
 const TAB_KEY = (ws: string) => `sim.tab.${ws}`;
 function readTab(ws: string): TabKey {
@@ -59,7 +59,7 @@ export default function TcpSimulatorPage() {
   const { pushToast } = useToast();
 
   const [activeTab, setActiveTab] = useState<TabKey>(() => readTab(ws));
-  const [addrFmt, setAddrFmt] = useState<AddressFormat>(() => readAddressFormat(ws));
+  const [addrFmt, changeAddrFmt] = useAppAddressFormat();
   const [selectedRegisterId, setSelectedRegisterId] = useState<number | null>(null);
   const [addRegisterOpen, setAddRegisterOpen] = useState(false);
   const [deviceModalOpen, setDeviceModalOpen] = useState(false);
@@ -74,7 +74,6 @@ export default function TcpSimulatorPage() {
   const [saveTemplateDraft, setSaveTemplateDraft] = useState<DeviceTemplate | null>(null);
 
   const changeTab = useCallback((tab: TabKey) => { setActiveTab(tab); writeTab(ws, tab); }, [ws]);
-  const changeAddrFmt = useCallback((f: AddressFormat) => { setAddrFmt(f); writeAddressFormat(ws, f); }, [ws]);
 
   const selectedRegister = useMemo<PageRegister | null>(
     () => sim.registers.find((r) => r.id === selectedRegisterId) ?? null,

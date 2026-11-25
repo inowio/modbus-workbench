@@ -40,7 +40,8 @@ import { computeSignalEvaluations, dependentsBySignalId, type LiveSignalUpdate }
 import type { BreakpointLayouts, GridLayout } from "./analyzer/layoutTypes";
 import { buildLayoutsFromSaved } from "./analyzer/layoutTypes";
 import { logEvent, type LogLevel } from "../api/logs";
-import { formatAnalyzerAddress, type AnalyzerAddressFormat } from "../utils/analyzerAddressFormat";
+import { formatAnalyzerAddress } from "../utils/analyzerAddressFormat";
+import { useAppAddressFormat } from "../utils/addressFormatPref";
 
 type AnalyzerSignalUpdate = {
   workspace: string;
@@ -101,7 +102,7 @@ export default function AnalyzerPage() {
   const [liveUpdates, setLiveUpdates] = useState<Record<string, AnalyzerSignalUpdate>>({});
   const [historyByTileId, setHistoryByTileId] = useState<Record<number, AnalyzerTrendPoint[]>>({});
   const [trendWindowMinutes, setTrendWindowMinutes] = useState<number | null>(5);
-  const [addressFormat, setAddressFormat] = useState<AnalyzerAddressFormat>("dec");
+  const [addressFormat] = useAppAddressFormat();
   const latestLiveRef = useRef<Record<string, AnalyzerSignalUpdate>>({});
   const signalsRef = useRef<AnalyzerSignal[]>([]);
   const getSignalPollIntervalMsRef = useRef<(signalId: string, seen?: Set<string>) => number>(() => 1000);
@@ -982,8 +983,6 @@ export default function AnalyzerPage() {
         onRefresh={() => void refreshAll()}
         trendWindowMinutes={trendWindowMinutes}
         onChangeTrendWindowMinutes={setTrendWindowMinutes}
-        addressFormat={addressFormat}
-        onChangeAddressFormat={setAddressFormat}
       />
 
       {error ? (
