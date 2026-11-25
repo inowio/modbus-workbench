@@ -1,3 +1,4 @@
+import { useEffect } from "react";
 import type { AnalyzerTab, AnalyzerTile } from "../../api/analyzer";
 
 export type TabStatus = "error" | "stale" | null;
@@ -87,4 +88,31 @@ export function tabStatus(
     if (state === "STALE") stale = true;
   }
   return stale ? "stale" : null;
+}
+
+function isEditableTarget(el: EventTarget | null): boolean {
+  if (!(el instanceof HTMLElement)) return false;
+  return el.isContentEditable || el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.tagName === "SELECT";
+}
+
+/**
+ * Ctrl+1..Ctrl+9 select the tab at that position (displayed order). Ignored while typing in a field
+ * or while a modal dialog is open. Listens on the window, so it works whatever UI is shown (e.g. focus view).
+ */
+export function useTabShortcuts(tabs: AnalyzerTab[], onSelect: (id: number) => void, enabled: boolean) {
+  useEffect(() => {
+    if (!enabled) return;
+    function onKeyDown(e: KeyboardEvent) {
+      if (!e.ctrlKey || e.altKey || e.shiftKey || e.metaKey) return;
+      if (!/^[1-9]$/.test(e.key)) return;
+      if (isEditableTarget(e.target) || isEditableTarget(document.activeElement)) return;
+      if (document.querySelector('[role="dialog"]')) return;
+      const tab = sortTabs(tabs)[Number(e.key) - 1];
+      if (!tab) return;
+      e.preventDefault();
+      onSelect(tab.id);
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [tabs, onSelect, enabled]);
 }

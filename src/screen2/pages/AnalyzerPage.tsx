@@ -10,6 +10,8 @@ import {
   createAnalyzerTab,
   createAnalyzerTile,
   deleteAnalyzerTab,
+  duplicateAnalyzerTile,
+  moveAnalyzerTileToTab,
   deleteAnalyzerTile,
   listAnalyzerSignals,
   listAnalyzerTabs,
@@ -44,7 +46,7 @@ import AnalyzerAddEditTileModal from "./analyzer/AnalyzerAddEditTileModal";
 import AnalyzerConfigureSignalsModal from "./analyzer/AnalyzerConfigureSignalsModal";
 import AnalyzerTabsStrip from "./analyzer/AnalyzerTabsStrip";
 import DeleteTabDialog from "./analyzer/DeleteTabDialog";
-import { readLastTabId, resolveSelectedTab, writeLastTabId } from "./analyzer/tabs";
+import { readLastTabId, resolveSelectedTab, tabStatus, useTabShortcuts, writeLastTabId, type TabStatus } from "./analyzer/tabs";
 import { getChartKind } from "./analyzer/chartKind";
 import { computeSignalEvaluations, dependentsBySignalId, type LiveSignalUpdate } from "./analyzer/signalEvaluations";
 import type { BreakpointLayouts, GridLayout } from "./analyzer/layoutTypes";
@@ -313,6 +315,8 @@ export default function AnalyzerPage() {
     setSelectedTabId(id);
     writeLastTabId(workspaceNameRef.current, id);
   }
+
+  useTabShortcuts(tabs, selectTab, true);
 
   const slavesById = useMemo(() => {
     const out = new Map<number, { pollIntervalMs: number }>();
@@ -688,6 +692,38 @@ export default function AnalyzerPage() {
     })();
   }
 
+  async function reloadTilesAfterTabChange() {
+    try {
+      await refreshTiles();
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  async function moveTile(tile: AnalyzerTile, tabId: number) {
+    try {
+      await moveAnalyzerTileToTab(workspaceName, tile.id, tabId);
+      logWorkspace("info", "Analyzer tile moved", { tileId: tile.id, tabId });
+    } catch (e) {
+      logWorkspace("error", "Analyzer tile move failed", { tileId: tile.id, error: String(e) });
+      setError(String(e));
+      return;
+    }
+    await reloadTilesAfterTabChange();
+  }
+
+  async function duplicateTile(tile: AnalyzerTile, tabId: number) {
+    try {
+      const copy = await duplicateAnalyzerTile(workspaceName, tile.id, tabId);
+      logWorkspace("info", "Analyzer tile duplicated", { tileId: tile.id, copyId: copy.id, tabId });
+    } catch (e) {
+      logWorkspace("error", "Analyzer tile duplicate failed", { tileId: tile.id, error: String(e) });
+      setError(String(e));
+      return;
+    }
+    await reloadTilesAfterTabChange();
+  }
+
   async function deleteTile(tile: AnalyzerTile) {
     setConfirmDeleteTile(tile);
   }
@@ -1036,6 +1072,16 @@ export default function AnalyzerPage() {
     return { points, state };
   }
 
+  // The dot uses the same per-tile state the tiles render (value and trend tiles share the primary signal's state).
+  const statusByTabId: Record<number, TabStatus> = {};
+  for (const tab of tabs) {
+    statusByTabId[tab.id] = tabStatus(
+      tiles.filter((t) => tabIdOfTile(t) === tab.id),
+      (t) => renderTileValue(t, Boolean(pollingWanted && t.pollingEnabled)).state,
+      pollingWanted,
+    );
+  }
+
   function getTilePollingIntervalMs(tileId: number): number | null {
     const links = tileSignals[tileId] ?? [];
     const primary = links.find((s) => s.role === "primary") ?? links[0] ?? null;
@@ -1156,7 +1202,7 @@ export default function AnalyzerPage() {
         <AnalyzerTabsStrip
           tabs={tabs}
           selectedTabId={selectedTabId}
-          statusByTabId={{}}
+          statusByTabId={statusByTabId}
           onSelect={selectTab}
           onCreate={createTab}
           onRename={renameTab}
@@ -1201,6 +1247,9 @@ export default function AnalyzerPage() {
         onToggleTilePolling={(t: AnalyzerTile) => void toggleTilePolling(t)}
         onEditTile={openEditTileModal}
         onDeleteTile={deleteTile}
+        tabs={tabs}
+        onMoveTile={(t, tabId) => void moveTile(t, tabId)}
+        onDuplicateTile={(t, tabId) => void duplicateTile(t, tabId)}
       />
 
       <AnalyzerConfigureSignalsModal

@@ -22,6 +22,8 @@ const createAnalyzerTabMock = vi.fn();
 const renameAnalyzerTabMock = vi.fn();
 const reorderAnalyzerTabsMock = vi.fn();
 const deleteAnalyzerTabMock = vi.fn();
+const moveAnalyzerTileToTabMock = vi.fn();
+const duplicateAnalyzerTileMock = vi.fn();
 let lastTilesCardProps: any = null;
 
 vi.mock("@tauri-apps/api/core", () => ({
@@ -74,6 +76,8 @@ vi.mock("../api/analyzer", () => ({
   renameAnalyzerTab: (...args: unknown[]) => renameAnalyzerTabMock(...args),
   reorderAnalyzerTabs: (...args: unknown[]) => reorderAnalyzerTabsMock(...args),
   deleteAnalyzerTab: (...args: unknown[]) => deleteAnalyzerTabMock(...args),
+  moveAnalyzerTileToTab: (...args: unknown[]) => moveAnalyzerTileToTabMock(...args),
+  duplicateAnalyzerTile: (...args: unknown[]) => duplicateAnalyzerTileMock(...args),
   updateAnalyzerTile: vi.fn(),
   listAnalyzerSignals: (...args: unknown[]) => listAnalyzerSignalsMock(...args),
 }));
@@ -237,6 +241,8 @@ function setupAnalyzerData(options?: { tiles?: any[]; tabs?: any[] }) {
   renameAnalyzerTabMock.mockResolvedValue(undefined);
   reorderAnalyzerTabsMock.mockResolvedValue(undefined);
   deleteAnalyzerTabMock.mockResolvedValue(undefined);
+  moveAnalyzerTileToTabMock.mockResolvedValue(undefined);
+  duplicateAnalyzerTileMock.mockResolvedValue({ ...tiles[0], id: 98 });
   listenMock.mockResolvedValue(() => {});
 
   invokeMock.mockImplementation((command: string) => {
@@ -708,6 +714,140 @@ describe("AnalyzerPage", () => {
         fireEvent.click(screen.getByRole("button", { name: "Delete tab" }));
         expect(await screen.findByText("Tab not found")).toBeInTheDocument();
         expect(screen.getByRole("dialog")).toBeInTheDocument();
+        expect(selectedTabName()).toBe("Boiler");
+      });
+    });
+
+    describe("move and duplicate", () => {
+      it("moving a tile reloads tiles and layouts and drops it from the grid", async () => {
+        setupAnalyzerData({ tiles: [widget(1, 1), widget(2, 1)], tabs: [MAIN, BOILER] });
+        moveAnalyzerTileToTabMock.mockImplementation(async () => {
+          listAnalyzerTilesMock.mockResolvedValue([widget(1, 1), widget(2, 2)]);
+        });
+        render(<AnalyzerPage />);
+        await screen.findByTestId("tile-2");
+        const layoutCalls = listAnalyzerTileLayoutsMock.mock.calls.length;
+
+        await act(async () => {
+          lastTilesCardProps.onMoveTile(lastTilesCardProps.tiles[1], 2);
+        });
+
+        expect(moveAnalyzerTileToTabMock).toHaveBeenCalledWith("UnitTest", 2, 2);
+        await waitFor(() => expect(screen.queryByTestId("tile-2")).not.toBeInTheDocument());
+        expect(screen.getByTestId("tile-1")).toBeInTheDocument();
+        expect(listAnalyzerTileLayoutsMock.mock.calls.length).toBeGreaterThan(layoutCalls);
+      });
+
+      it("duplicating into the current tab shows the new tile", async () => {
+        setupAnalyzerData({ tiles: [widget(1, 1)], tabs: [MAIN, BOILER] });
+        duplicateAnalyzerTileMock.mockImplementation(async () => {
+          listAnalyzerTilesMock.mockResolvedValue([widget(1, 1), widget(7, 1)]);
+          return widget(7, 1);
+        });
+        render(<AnalyzerPage />);
+        await screen.findByTestId("tile-1");
+
+        await act(async () => {
+          lastTilesCardProps.onDuplicateTile(lastTilesCardProps.tiles[0], 1);
+        });
+
+        expect(duplicateAnalyzerTileMock).toHaveBeenCalledWith("UnitTest", 1, 1);
+        await screen.findByTestId("tile-7");
+      });
+
+      it("shows the backend error when moving fails", async () => {
+        setupAnalyzerData({ tiles: [widget(1, 1)], tabs: [MAIN, BOILER] });
+        moveAnalyzerTileToTabMock.mockRejectedValue("boom");
+        render(<AnalyzerPage />);
+        await screen.findByTestId("tile-1");
+        await act(async () => {
+          lastTilesCardProps.onMoveTile(lastTilesCardProps.tiles[0], 2);
+        });
+        expect(await screen.findByText("boom")).toBeInTheDocument();
+      });
+    });
+
+    describe("status dots", () => {
+      const valueTile = (id: number, tabId: number) => ({ ...widget(id, tabId), kind: "value" });
+
+      async function setupStatus(state: string) {
+        setupAnalyzerData({ tiles: [valueTile(1, 2)], tabs: [MAIN, BOILER] });
+        listAnalyzerSignalsMock.mockResolvedValue([
+          {
+            id: "sig-1",
+            kind: "register",
+            inputSignalIds: [],
+            slaveId: 1,
+            connectionKind: "serial",
+            functionKind: "holding",
+            registerRowId: 1,
+            address: 0,
+            functionCode: 3,
+            alias: null,
+            dataType: "u16",
+            order: "ABCD",
+            displayFormat: "dec",
+            decoderJson: "{}",
+            lastValueJson: JSON.stringify({ rawWords: [1] }),
+            lastUpdatedTsMs: Date.now(),
+            state,
+          },
+        ]);
+        render(<AnalyzerPage />);
+        await screen.findByRole("tab", { name: "Boiler" });
+        await waitFor(() => expect(listAnalyzerTileSignalsMock).toHaveBeenCalled());
+      }
+
+      it("dots a tab with an errored tile while running, and clears when stopped", async () => {
+        await setupStatus("ERROR");
+        expect(screen.queryByLabelText("has errors")).not.toBeInTheDocument();
+
+        fireEvent.click(screen.getByRole("button", { name: /start polling/i }));
+        await waitFor(() => expect(startAnalyzerPollingMock).toHaveBeenCalled());
+        expect(await screen.findByLabelText("has errors")).toBeInTheDocument();
+        expect(screen.getByRole("tab", { name: /Boiler/ })).toContainElement(screen.getByLabelText("has errors"));
+
+        fireEvent.click(screen.getByRole("button", { name: /stop polling/i }));
+        await waitFor(() => expect(screen.queryByLabelText("has errors")).not.toBeInTheDocument());
+      });
+    });
+
+    describe("Ctrl+digit shortcuts", () => {
+      async function setupThree() {
+        setupAnalyzerData({ tiles: [widget(1, 1)], tabs: [MAIN, BOILER, POWER] });
+        render(<AnalyzerPage />);
+        await screen.findByRole("tab", { name: "Power" });
+      }
+      const press = (key: string, target: Element = document.body) =>
+        fireEvent.keyDown(target, { key, ctrlKey: true });
+
+      it("Ctrl+2 selects the second tab; Ctrl+9 with 3 tabs does nothing", async () => {
+        await setupThree();
+        press("2");
+        expect(selectedTabName()).toBe("Boiler");
+        press("9");
+        expect(selectedTabName()).toBe("Boiler");
+        press("1");
+        expect(selectedTabName()).toBe("Main");
+      });
+
+      it("is ignored while a tab-rename input has focus", async () => {
+        await setupThree();
+        fireEvent.doubleClick(screen.getByRole("tab", { name: "Main" }));
+        const input = screen.getByRole("textbox", { name: "Rename tab" });
+        input.focus();
+        press("2", input);
+        fireEvent.keyDown(input, { key: "Escape" });
+        expect(selectedTabName()).toBe("Main");
+      });
+
+      it("is ignored while a modal dialog is open", async () => {
+        await setupThree();
+        fireEvent.click(screen.getByRole("tab", { name: "Boiler" }));
+        fireEvent.click(screen.getByRole("button", { name: "Tab options for Boiler" }));
+        fireEvent.click(screen.getByRole("menuitem", { name: "Delete" }));
+        expect(screen.getByRole("dialog")).toBeInTheDocument();
+        press("3");
         expect(selectedTabName()).toBe("Boiler");
       });
     });

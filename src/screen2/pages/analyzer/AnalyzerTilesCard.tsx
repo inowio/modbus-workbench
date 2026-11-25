@@ -1,13 +1,14 @@
 import { Suspense, lazy, useEffect, useMemo, useState, type RefObject } from "react";
-import { FiMoreVertical, FiPlus, FiSettings, FiTrash2, FiX } from "react-icons/fi";
+import { FiCopy, FiCornerUpRight, FiMoreVertical, FiPlus, FiSettings, FiTrash2, FiX } from "react-icons/fi";
 import { Responsive } from "react-grid-layout";
 import "react-grid-layout/css/styles.css";
 import "react-resizable/css/styles.css";
-import type { AnalyzerTile } from "../../api/analyzer";
+import type { AnalyzerTab, AnalyzerTile } from "../../api/analyzer";
 import type { AnalyzerTrendPoint } from "../../components/AnalyzerTrendTile";
 import type { BreakpointLayouts, GridLayout } from "./layoutTypes";
 import { coerceBreakpointLayouts, coerceGridLayout } from "./layoutTypes";
 import { getChartKind } from "./chartKind";
+import PickTabDialog from "./PickTabDialog";
 import { MdOutlineSync, MdOutlineSyncDisabled } from "react-icons/md";
 import { RiInformation2Line, RiLayout4Line, RiStopMiniFill } from "react-icons/ri";
 
@@ -60,11 +61,16 @@ type Props = {
   onToggleTilePolling: (tile: AnalyzerTile) => void;
   onEditTile: (tile: AnalyzerTile) => void;
   onDeleteTile: (tile: AnalyzerTile) => void;
+
+  tabs: AnalyzerTab[];
+  onMoveTile: (tile: AnalyzerTile, tabId: number) => void;
+  onDuplicateTile: (tile: AnalyzerTile, tabId: number) => void;
 };
 
 export default function AnalyzerTilesCard(props: Props) {
   const [tileMenuOpenId, setTileMenuOpenId] = useState<number | null>(null);
   const [infoTileId, setInfoTileId] = useState<number | null>(null);
+  const [pickTab, setPickTab] = useState<{ mode: "move" | "duplicate"; tile: AnalyzerTile } | null>(null);
 
   const hasTiles = props.tiles.length > 0;
   const skeletonCount = Math.min(hasTiles ? props.tiles.length : 6, 6);
@@ -320,6 +326,33 @@ export default function AnalyzerTilesCard(props: Props) {
 
                       <div className="my-1 h-px bg-slate-200 dark:bg-slate-800" />
 
+                      {props.tabs.length > 1 ? (
+                      <button
+                        type="button"
+                        className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-xs text-slate-700 hover:bg-slate-100 dark:text-slate-100 dark:hover:bg-white/5"
+                        onClick={() => {
+                          setTileMenuOpenId(null);
+                          setPickTab({ mode: "move", tile: t });
+                        }}
+                      >
+                        <FiCornerUpRight className="h-4 w-4" aria-hidden="true" />
+                        Move to tab…
+                      </button>
+                      ) : null}
+
+                      <button
+                        type="button"
+                        className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-xs text-slate-700 hover:bg-slate-100 dark:text-slate-100 dark:hover:bg-white/5"
+                        onClick={() => {
+                          setTileMenuOpenId(null);
+                          setPickTab({ mode: "duplicate", tile: t });
+                        }}
+                      >
+                        <FiCopy className="h-4 w-4" aria-hidden="true" />
+                        Duplicate…
+                      </button>
+
+
                       <button
                         type="button"
                         className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-xs text-slate-700 hover:bg-slate-100 dark:text-slate-100 dark:hover:bg-white/5"
@@ -391,6 +424,22 @@ export default function AnalyzerTilesCard(props: Props) {
           )}
         </div>
       )}
+
+      {pickTab ? (
+        <PickTabDialog
+          mode={pickTab.mode}
+          tileTitle={pickTab.tile.title || `Tile ${pickTab.tile.id}`}
+          tabs={props.tabs}
+          currentTabId={pickTab.tile.tabId}
+          onCancel={() => setPickTab(null)}
+          onConfirm={(tabId) => {
+            const { mode, tile } = pickTab;
+            setPickTab(null);
+            if (mode === "move") props.onMoveTile(tile, tabId);
+            else props.onDuplicateTile(tile, tabId);
+          }}
+        />
+      ) : null}
 
       {infoTileId != null ? (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/70 p-4 backdrop-blur-sm">
