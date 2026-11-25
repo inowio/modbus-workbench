@@ -298,7 +298,10 @@ pub(crate) fn duplicate_analyzer_tile_in_conn(
 
     tx.execute(
         "INSERT INTO analyzer_tiles (kind, title, config_json, polling_enabled, created_at, updated_at, tab_id)
-         SELECT kind, title || ' (copy)', config_json, polling_enabled, ?1, ?1, ?2
+         SELECT kind,
+                CASE WHEN TRIM(COALESCE(title, '')) = '' THEN 'Tile ' || id || ' (copy)'
+                     ELSE title || ' (copy)' END,
+                config_json, polling_enabled, ?1, ?1, ?2
          FROM analyzer_tiles WHERE id = ?3;",
         params![now_iso, tab_id, tile_id],
     )
@@ -674,6 +677,76 @@ mod tests {
         assert_eq!(
             duplicate_analyzer_tile_in_conn(&mut conn, 9999, main, "x").unwrap_err(),
             "Tile not found"
+        );
+        cleanup(dir, conn);
+    }
+
+    fn layout_at(conn: &Connection, tile_id: i64, bp: &str) -> (i64, i64, i64, i64) {
+        conn.query_row(
+            "SELECT x, y, w, h FROM analyzer_tile_layouts WHERE tile_id = ?1 AND breakpoint = ?2;",
+            params![tile_id, bp],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .expect("layout row")
+    }
+
+    fn add_mobile(conn: &Connection, tile_id: i64, (x, y, w, h): (i64, i64, i64, i64)) {
+        conn.execute(
+            "INSERT INTO analyzer_tile_layouts (tile_id, breakpoint, x, y, w, h)
+             VALUES (?1, 'mobile', ?2, ?3, ?4, ?5);",
+            params![tile_id, x, y, w, h],
+        )
+        .expect("mobile layout");
+    }
+
+    #[test]
+    fn placement_is_per_breakpoint_including_mobile() {
+        let (dir, mut conn) = temp_db();
+        let main = main_tab(&conn);
+        let other = create_analyzer_tab_in_conn(&conn, "Other", "t").unwrap().id;
+        // Main: desktop side by side (bottom 5), mobile stacked (bottom 5 + 6 = 11).
+        let m1 = seed_tile(&conn, main, "m1", (0, 0, 4, 5));
+        add_mobile(&conn, m1, (0, 0, 4, 5));
+        let m2 = seed_tile(&conn, main, "m2", (4, 0, 4, 3));
+        add_mobile(&conn, m2, (0, 5, 4, 6));
+        // Other: two tiles whose desktop and mobile y differ.
+        let o1 = seed_tile(&conn, other, "o1", (0, 2, 4, 5));
+        add_mobile(&conn, o1, (0, 10, 4, 5));
+        let o2 = seed_tile(&conn, other, "o2", (4, 9, 4, 5));
+        add_mobile(&conn, o2, (0, 15, 4, 5));
+
+        move_analyzer_tile_to_tab_in_conn(&mut conn, o2, main).unwrap();
+        assert_eq!(layout_at(&conn, o2, "desktop"), (4, 5, 4, 5));
+        assert_eq!(layout_at(&conn, o2, "mobile"), (0, 11, 4, 5));
+        // Main's own tiles are untouched.
+        assert_eq!(layout_at(&conn, m1, "mobile"), (0, 0, 4, 5));
+        assert_eq!(layout_at(&conn, m2, "mobile"), (0, 5, 4, 6));
+
+        // Duplicate lands below on both breakpoints too (Main now ends at desktop 10, mobile 16).
+        let copy = duplicate_analyzer_tile_in_conn(&mut conn, o1, main, "t").unwrap();
+        assert_eq!(layout_at(&conn, copy.id, "desktop"), (0, 10, 4, 5));
+        assert_eq!(layout_at(&conn, copy.id, "mobile"), (0, 16, 4, 5));
+
+        // Deleting Other moves o1 below, keeping x/w/h on each breakpoint.
+        delete_analyzer_tab_in_conn(&mut conn, other, Some(main), false).unwrap();
+        assert_eq!(layout_at(&conn, o1, "desktop"), (0, 15, 4, 5));
+        assert_eq!(layout_at(&conn, o1, "mobile"), (0, 21, 4, 5));
+        cleanup(dir, conn);
+    }
+
+    #[test]
+    fn duplicate_of_untitled_tile_names_it_by_id() {
+        let (dir, mut conn) = temp_db();
+        let main = main_tab(&conn);
+        let blank = seed_tile(&conn, main, "", (0, 0, 4, 5));
+        let spaces = seed_tile(&conn, main, "   ", (4, 0, 4, 5));
+        assert_eq!(
+            duplicate_analyzer_tile_in_conn(&mut conn, blank, main, "t").unwrap().title,
+            format!("Tile {blank} (copy)")
+        );
+        assert_eq!(
+            duplicate_analyzer_tile_in_conn(&mut conn, spaces, main, "t").unwrap().title,
+            format!("Tile {spaces} (copy)")
         );
         cleanup(dir, conn);
     }

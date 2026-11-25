@@ -783,6 +783,125 @@ describe("AnalyzerPage", () => {
         await screen.findByTestId("tile-7");
       });
 
+      describe("pins current positions before the backend places tiles at the bottom (no saved rows)", () => {
+        // Default widget placement (no saved rows): desktop 3 per row at x 0/4/8, h 5; mobile one column, y 0/5/10.
+        const at = (desktop: [number, number], mobileY: number) => [
+          { breakpoint: "desktop", x: desktop[0], y: desktop[1], w: 4, h: 5 },
+          { breakpoint: "mobile", x: 0, y: mobileY, w: 4, h: 5 },
+        ];
+        let events: string[];
+
+        /** Call after setupAnalyzerData (it resets the save mock); a save is logged when it resolves. */
+        function trackSaves() {
+          events = [];
+          saveAnalyzerTileLayoutsMock.mockImplementation(async (_ws: string, tileId: number) => {
+            await Promise.resolve();
+            events.push(`save:${tileId}`);
+          });
+        }
+
+        const savedRows = () =>
+          Object.fromEntries(saveAnalyzerTileLayoutsMock.mock.calls.map(([, id, rows]) => [id, rows]));
+
+        it("move: saves the target tab's and the moving tile's rows, then moves", async () => {
+          setupAnalyzerData({ tiles: [widget(1, 1), widget(2, 1), widget(3, 1), widget(5, 2)], tabs: [MAIN, BOILER] });
+          trackSaves();
+          moveAnalyzerTileToTabMock.mockImplementation(async () => {
+            events.push("move");
+          });
+          render(<AnalyzerPage />);
+          await screen.findByTestId("tile-2");
+          saveAnalyzerTileLayoutsMock.mockClear();
+
+          await act(async () => {
+            await lastTilesCardProps.onMoveTile(lastTilesCardProps.tiles[1], 2);
+          });
+
+          expect(savedRows()).toEqual({ 5: at([0, 0], 0), 2: at([4, 0], 5) });
+          // Every save finished before the move was sent.
+          expect(events).toHaveLength(3);
+          expect(events[2]).toBe("move");
+        });
+
+        it("move into a tab with some saved rows pins the saved ones as saved and the rest as shown", async () => {
+          setupAnalyzerData({ tiles: [widget(1, 1), widget(2, 1), widget(5, 2), widget(6, 2)], tabs: [MAIN, BOILER] });
+          listAnalyzerTileLayoutsMock.mockResolvedValue([{ tileId: 5, breakpoint: "desktop", x: 2, y: 7, w: 6, h: 8 }]);
+          trackSaves();
+          render(<AnalyzerPage />);
+          await screen.findByTestId("tile-2");
+          saveAnalyzerTileLayoutsMock.mockClear();
+
+          await act(async () => {
+            await lastTilesCardProps.onMoveTile(lastTilesCardProps.tiles[0], 2);
+          });
+
+          expect(savedRows()).toEqual({
+            5: [
+              { breakpoint: "desktop", x: 2, y: 7, w: 6, h: 8 },
+              { breakpoint: "mobile", x: 0, y: 0, w: 4, h: 5 },
+            ],
+            6: at([4, 0], 5),
+            1: at([0, 0], 0),
+          });
+          expect(moveAnalyzerTileToTabMock).toHaveBeenCalledWith("UnitTest", 1, 2);
+        });
+
+        it("duplicate: saves the target tab's and the source tile's rows, then duplicates", async () => {
+          setupAnalyzerData({ tiles: [widget(1, 1), widget(2, 1), widget(5, 2), widget(6, 2)], tabs: [MAIN, BOILER] });
+          trackSaves();
+          duplicateAnalyzerTileMock.mockImplementation(async () => {
+            events.push("duplicate");
+            return widget(9, 2);
+          });
+          render(<AnalyzerPage />);
+          await screen.findByTestId("tile-2");
+          saveAnalyzerTileLayoutsMock.mockClear();
+
+          await act(async () => {
+            await lastTilesCardProps.onDuplicateTile(lastTilesCardProps.tiles[1], 2);
+          });
+
+          expect(savedRows()).toEqual({ 5: at([0, 0], 0), 6: at([4, 0], 5), 2: at([4, 0], 5) });
+          expect(events).toHaveLength(4);
+          expect(events[3]).toBe("duplicate");
+        });
+
+        it("delete tab with move: saves the target tab's and every moving tile's rows, then deletes", async () => {
+          setupAnalyzerData({ tiles: [widget(1, 1), widget(5, 2), widget(6, 2)], tabs: [MAIN, BOILER] });
+          trackSaves();
+          deleteAnalyzerTabMock.mockImplementation(async () => {
+            events.push("delete");
+          });
+          render(<AnalyzerPage />);
+          await screen.findByRole("tab", { name: "Boiler" });
+          fireEvent.click(screen.getByRole("tab", { name: "Boiler" }));
+          fireEvent.click(screen.getByRole("button", { name: "Tab options for Boiler" }));
+          fireEvent.click(screen.getByRole("menuitem", { name: "Delete" }));
+          saveAnalyzerTileLayoutsMock.mockClear();
+          fireEvent.click(screen.getByRole("button", { name: "Delete tab" }));
+
+          await waitFor(() => expect(deleteAnalyzerTabMock).toHaveBeenCalledWith("UnitTest", 2, { moveTilesTo: MAIN.id }));
+          expect(savedRows()).toEqual({ 1: at([0, 0], 0), 5: at([0, 0], 0), 6: at([4, 0], 5) });
+          expect(events).toHaveLength(4);
+          expect(events[3]).toBe("delete");
+        });
+
+        it("delete tab without move saves nothing", async () => {
+          setupAnalyzerData({ tiles: [widget(1, 1), widget(5, 2)], tabs: [MAIN, BOILER] });
+          render(<AnalyzerPage />);
+          await screen.findByRole("tab", { name: "Boiler" });
+          fireEvent.click(screen.getByRole("tab", { name: "Boiler" }));
+          fireEvent.click(screen.getByRole("button", { name: "Tab options for Boiler" }));
+          fireEvent.click(screen.getByRole("menuitem", { name: "Delete" }));
+          fireEvent.click(screen.getByRole("radio", { name: "Delete 1 tile" }));
+          saveAnalyzerTileLayoutsMock.mockClear();
+          fireEvent.click(screen.getByRole("button", { name: "Delete tab" }));
+
+          await waitFor(() => expect(deleteAnalyzerTabMock).toHaveBeenCalledWith("UnitTest", 2, { deleteTiles: true }));
+          expect(saveAnalyzerTileLayoutsMock).not.toHaveBeenCalled();
+        });
+      });
+
       it("shows the backend error when moving fails", async () => {
         setupAnalyzerData({ tiles: [widget(1, 1)], tabs: [MAIN, BOILER] });
         moveAnalyzerTileToTabMock.mockRejectedValue("boom");

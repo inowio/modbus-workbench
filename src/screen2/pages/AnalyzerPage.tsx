@@ -699,6 +699,10 @@ export default function AnalyzerPage() {
     setDeleteTabError(null);
     void (async () => {
       try {
+        if (opts.moveTilesTo != null) {
+          const moving = tiles.filter((t) => tabIdOfTile(t) === tab.id).map((t) => t.id);
+          if (moving.length > 0) await pinShownLayouts(opts.moveTilesTo, moving);
+        }
         await deleteAnalyzerTab(workspaceName, tab.id, opts);
       } catch (e) {
         logWorkspace("error", "Analyzer tab delete failed", { tabId: tab.id, error: String(e) });
@@ -721,6 +725,44 @@ export default function AnalyzerPage() {
     })();
   }
 
+  /**
+   * Layout rows are only written in Edit layout, so most tiles have none and sit at a per-tab default spot.
+   * The backend places moved / duplicated tiles below the target tab's rows, so first write the positions
+   * shown now (both breakpoints) for the target tab's tiles and the arriving ones; nothing visible moves.
+   */
+  async function pinShownLayouts(targetTabId: number, arrivingTileIds: number[]) {
+    const ids = new Set<number>(arrivingTileIds);
+    for (const t of tiles) {
+      if (tabIdOfTile(t) === targetTabId) ids.add(t.id);
+    }
+    const ws = workspaceNameRef.current;
+    const shown = {
+      desktop: new Map(gridLayouts.desktop.map((l) => [l.i, l])),
+      mobile: new Map(gridLayouts.mobile.map((l) => [l.i, l])),
+    };
+    await Promise.all(
+      [...ids].map((tileId) => {
+        const rows: Array<Omit<PendingLayoutSave, "tileId">> = [];
+        for (const breakpoint of ["desktop", "mobile"] as const) {
+          // A pending debounced save is the freshest position; drop it so it can't overwrite the placement.
+          const key = `${tileId}:${breakpoint}`;
+          const pending = pendingLayoutSavesRef.current.get(key);
+          pendingLayoutSavesRef.current.delete(key);
+          const l = pending ?? shown[breakpoint].get(String(tileId));
+          if (!l) continue;
+          rows.push({
+            breakpoint,
+            x: Math.max(0, Math.round(l.x)),
+            y: Math.max(0, Math.round(l.y)),
+            w: Math.max(1, Math.round(l.w)),
+            h: Math.max(1, Math.round(l.h)),
+          });
+        }
+        return rows.length > 0 ? saveAnalyzerTileLayouts(ws, tileId, rows) : Promise.resolve();
+      }),
+    );
+  }
+
   async function reloadTilesAfterTabChange() {
     try {
       await refreshTiles();
@@ -731,6 +773,7 @@ export default function AnalyzerPage() {
 
   async function moveTile(tile: AnalyzerTile, tabId: number) {
     try {
+      await pinShownLayouts(tabId, [tile.id]);
       await moveAnalyzerTileToTab(workspaceName, tile.id, tabId);
       logWorkspace("info", "Analyzer tile moved", { tileId: tile.id, tabId });
     } catch (e) {
@@ -743,6 +786,7 @@ export default function AnalyzerPage() {
 
   async function duplicateTile(tile: AnalyzerTile, tabId: number) {
     try {
+      await pinShownLayouts(tabId, [tile.id]);
       const copy = await duplicateAnalyzerTile(workspaceName, tile.id, tabId);
       logWorkspace("info", "Analyzer tile duplicated", { tileId: tile.id, copyId: copy.id, tabId });
     } catch (e) {
