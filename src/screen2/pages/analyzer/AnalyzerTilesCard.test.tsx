@@ -19,14 +19,14 @@ function renderCard(opts: { tabs?: typeof MAIN[]; focusMode?: boolean; layoutEdi
   const tabs = opts.tabs ?? [MAIN, BOILER, POWER];
   const onMoveTile = vi.fn();
   const onDuplicateTile = vi.fn();
-  render(
+  const card = (focusMode: boolean) => (
     <AnalyzerTilesCard
       tiles={[tile]}
       workspaceHasTiles
       pollingWanted={false}
       gridReady
       layoutEditMode={opts.layoutEditMode ?? false}
-      focusMode={opts.focusMode ?? false}
+      focusMode={focusMode}
       gridHostRef={{ current: null }}
       effectiveGridWidth={800}
       gridLayouts={{ desktop: [], mobile: [] }}
@@ -60,9 +60,10 @@ function renderCard(opts: { tabs?: typeof MAIN[]; focusMode?: boolean; layoutEdi
       tabs={tabs}
       onMoveTile={onMoveTile}
       onDuplicateTile={onDuplicateTile}
-    />,
+    />
   );
-  return { onMoveTile, onDuplicateTile };
+  const view = render(card(opts.focusMode ?? false));
+  return { onMoveTile, onDuplicateTile, setFocusMode: (on: boolean) => view.rerender(card(on)) };
 }
 
 function setup(tabs = [MAIN, BOILER, POWER]) {
@@ -121,6 +122,15 @@ describe("AnalyzerTilesCard Escape and focus view", () => {
     setup();
     expect(screen.getByRole("button", { name: "Information" })).toBeInTheDocument();
     expect(pressEscape()).toBe(true);
+    expect(screen.queryByRole("button", { name: "Information" })).not.toBeInTheDocument();
+  });
+
+  it("entering focus view closes an open tile menu, so the first Escape is free for the page", () => {
+    const { setFocusMode } = setup();
+    expect(screen.getByRole("button", { name: "Information" })).toBeInTheDocument();
+    setFocusMode(true);
+    expect(pressEscape()).toBe(false);
+    setFocusMode(false);
     expect(screen.queryByRole("button", { name: "Information" })).not.toBeInTheDocument();
   });
 

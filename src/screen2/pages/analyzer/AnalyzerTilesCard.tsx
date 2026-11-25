@@ -1,4 +1,4 @@
-import { Suspense, lazy, useEffect, useMemo, useState, type RefObject } from "react";
+import { Suspense, lazy, useEffect, useMemo, useRef, useState, type RefObject } from "react";
 import { FiCopy, FiCornerUpRight, FiMoreVertical, FiPlus, FiSettings, FiTrash2, FiX } from "react-icons/fi";
 import { Responsive } from "react-grid-layout";
 import "react-grid-layout/css/styles.css";
@@ -67,6 +67,8 @@ type Props = {
   tabs: AnalyzerTab[];
   onMoveTile: (tile: AnalyzerTile, tabId: number) => void;
   onDuplicateTile: (tile: AnalyzerTile, tabId: number) => void;
+  /** Reports whether a tile's Info dialog is open (focus view pauses tab cycling meanwhile). */
+  onInfoOpenChange?: (open: boolean) => void;
 };
 
 export default function AnalyzerTilesCard(props: Props) {
@@ -99,6 +101,20 @@ export default function AnalyzerTilesCard(props: Props) {
     }
     return out;
   }, [props.pollingWanted, props.tiles]);
+
+  const onInfoOpenChangeRef = useRef(props.onInfoOpenChange);
+  onInfoOpenChangeRef.current = props.onInfoOpenChange;
+  const infoOpen = infoTileId != null;
+  useEffect(() => {
+    onInfoOpenChangeRef.current?.(infoOpen);
+    if (!infoOpen) return;
+    return () => onInfoOpenChangeRef.current?.(false);
+  }, [infoOpen]);
+
+  // Focus view hides the tile menu; close it too, or its Escape handler would eat the first Escape.
+  useEffect(() => {
+    if (props.focusMode) setTileMenuOpenId(null);
+  }, [props.focusMode]);
 
   useEffect(() => {
     if (tileMenuOpenId == null) return;

@@ -339,9 +339,11 @@ export default function AnalyzerPage() {
   const focusView = useFocusView({ setFocusMode, onError: setError });
   const focusMode = focusView.focus;
   const [focusOverlayHovered, setFocusOverlayHovered] = useState(false);
+  // An open tile Info dialog pauses cycling like hovering the overlay does.
+  const [tileInfoOpen, setTileInfoOpen] = useState(false);
   const [cycleSeconds, setCycleSeconds] = useTabCycle({
     workspace: workspaceName,
-    active: focusMode && !focusOverlayHovered,
+    active: focusMode && !focusOverlayHovered && !tileInfoOpen,
     currentTabId: selectedTabId,
     advance: () => stepTab(1),
   });
@@ -1341,6 +1343,7 @@ export default function AnalyzerPage() {
         tabs={tabs}
         onMoveTile={(t, tabId) => void moveTile(t, tabId)}
         onDuplicateTile={(t, tabId) => void duplicateTile(t, tabId)}
+        onInfoOpenChange={setTileInfoOpen}
       />
 
       <AnalyzerConfigureSignalsModal
@@ -1453,10 +1456,20 @@ export default function AnalyzerPage() {
 
       {connectionModalOpen && connectionFormValue ? (
         <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/60 backdrop-blur-xs">
-          <div className="w-full max-w-2xl rounded-2xl border border-slate-200 bg-white p-6 text-slate-900 shadow-sm dark:border-slate-800 dark:bg-slate-900 dark:text-slate-100">
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="analyzer-connection-settings-title"
+            className="w-full max-w-2xl rounded-2xl border border-slate-200 bg-white p-6 text-slate-900 shadow-sm dark:border-slate-800 dark:bg-slate-900 dark:text-slate-100"
+          >
             <div className="mb-4 flex items-center justify-between">
               <div>
-                <div className="text-sm font-semibold text-emerald-700 dark:text-emerald-400">Connection settings</div>
+                <div
+                  id="analyzer-connection-settings-title"
+                  className="text-sm font-semibold text-emerald-700 dark:text-emerald-400"
+                >
+                  Connection settings
+                </div>
                 <div className="mt-1 text-xs text-slate-600 dark:text-slate-300">
                   Configure serial/TCP parameters for this workspace. Changes apply to all slaves.
                 </div>

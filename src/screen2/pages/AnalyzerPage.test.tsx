@@ -533,18 +533,23 @@ describe("AnalyzerPage", () => {
       await startPolling();
       expect(screen.queryByTestId("trend-2")).not.toBeInTheDocument();
 
-      act(() => {
-        handlers["analyzer_signal_update"](update("a"));
-      });
-      // Let the 250 ms history flush happen while the trend tile is hidden.
-      await act(async () => {
-        await new Promise((r) => setTimeout(r, 350));
-      });
+      vi.useFakeTimers();
+      try {
+        act(() => {
+          handlers["analyzer_signal_update"](update("a"));
+        });
+        // Let the 250 ms history flush happen while the trend tile is hidden.
+        act(() => {
+          vi.advanceTimersByTime(350);
+        });
 
-      fireEvent.click(screen.getByRole("tab", { name: "Boiler" }));
-      const points = JSON.parse(screen.getByTestId("trend-2").textContent ?? "[]");
-      expect(points).toHaveLength(1);
-      expect(points[0].value).toBe(0.968);
+        fireEvent.click(screen.getByRole("tab", { name: "Boiler" }));
+        const points = JSON.parse(screen.getByTestId("trend-2").textContent ?? "[]");
+        expect(points).toHaveLength(1);
+        expect(points[0].value).toBe(0.968);
+      } finally {
+        vi.useRealTimers();
+      }
     });
   });
 
@@ -997,6 +1002,14 @@ describe("AnalyzerPage", () => {
         press("3");
         expect(selectedTabName()).toBe("Boiler");
       });
+
+      it("is ignored while the connection settings modal is open", async () => {
+        await setupThree();
+        fireEvent.click(screen.getByRole("button", { name: "Open Connection" }));
+        expect(await screen.findByRole("dialog", { name: "Connection settings" })).toBeInTheDocument();
+        press("2");
+        expect(selectedTabName()).toBe("Main");
+      });
     });
   });
 
@@ -1170,6 +1183,54 @@ describe("AnalyzerPage", () => {
       expect(shownTiles()).toEqual(["tile-2"]);
 
       expect(stopAnalyzerPollingMock).not.toHaveBeenCalled();
+    });
+
+    it("cycling pauses while a tile's Info dialog is open and starts a fresh period when it closes", async () => {
+      useRealTilesCard = true;
+      const realResizeObserver = globalThis.ResizeObserver;
+      globalThis.ResizeObserver = class {
+        observe() {}
+        unobserve() {}
+        disconnect() {}
+      } as unknown as typeof ResizeObserver;
+      const rect = vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue({
+        width: 800,
+        height: 600,
+        top: 0,
+        left: 0,
+        right: 800,
+        bottom: 600,
+        x: 0,
+        y: 0,
+        toJSON: () => ({}),
+      } as DOMRect);
+      try {
+        window.localStorage.setItem("inowio.analyzer.cycle.UnitTest", "10");
+        setupAnalyzerData({ tiles: [widget(1, 1), widget(2, 2), widget(3, 3)], tabs: [MAIN, BOILER, POWER] });
+        render(<AnalyzerPage />);
+        await screen.findByTitle("Tile menu");
+        vi.useFakeTimers();
+        enterFocus();
+        const currentTab = () => {
+          fireEvent.mouseMove(window);
+          return screen.getByRole("toolbar", { name: "Focus view controls" }).textContent ?? "";
+        };
+
+        fireEvent.click(screen.getByRole("button", { name: "Tile information" }));
+        expect(screen.getByRole("dialog")).toBeInTheDocument();
+        act(() => vi.advanceTimersByTime(30_000));
+        expect(currentTab()).toContain("Main");
+
+        fireEvent.keyDown(document.body, { key: "Escape" });
+        expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+        act(() => vi.advanceTimersByTime(9_999));
+        expect(currentTab()).toContain("Main");
+        act(() => vi.advanceTimersByTime(1));
+        expect(currentTab()).toContain("Boiler");
+      } finally {
+        rect.mockRestore();
+        globalThis.ResizeObserver = realResizeObserver;
+      }
     });
 
     it("reads the remembered cycle value and does not cycle outside focus view", async () => {
