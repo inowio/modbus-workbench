@@ -31,7 +31,7 @@ import {
   PortItem as SerialPortItem,
   normalizeConnectionSettings,
 } from "../components/ConnectionSettingsForm";
-import AnalyzerHeaderCard from "./analyzer/AnalyzerHeaderCard";
+import AnalyzerControlBar from "./analyzer/AnalyzerControlBar";
 import AnalyzerTilesCard from "./analyzer/AnalyzerTilesCard";
 import AnalyzerAddEditTileModal from "./analyzer/AnalyzerAddEditTileModal";
 import AnalyzerConfigureSignalsModal from "./analyzer/AnalyzerConfigureSignalsModal";
@@ -978,11 +978,20 @@ export default function AnalyzerPage() {
 
   return (
     <div className="flex flex-1 flex-col gap-4">
-      <AnalyzerHeaderCard
+      <AnalyzerControlBar
         loading={loading}
-        onRefresh={() => void refreshAll()}
         trendWindowMinutes={trendWindowMinutes}
         onChangeTrendWindowMinutes={setTrendWindowMinutes}
+        pollingWanted={pollingWanted}
+        onRun={() => void onStartPolling()}
+        onStop={() => void onStopPolling()}
+        onConfigureSignals={() => setConfigureSignalsOpen(true)}
+        onOpenConnectionSettings={() => void openConnectionModal()}
+        onAddTile={() => openAddTileModalDefault()}
+        layoutEditMode={layoutEditMode}
+        onToggleLayoutEditMode={() => setLayoutEditMode((prev) => !prev)}
+        onRefresh={() => void refreshAll()}
+        onEnterFocus={() => {}}
       />
 
       {error ? (
@@ -994,11 +1003,8 @@ export default function AnalyzerPage() {
       <AnalyzerTilesCard
         tiles={tiles}
         pollingWanted={pollingWanted}
-        onStartPollingAll={() => void onStartPolling()}
-        onStopPollingAll={() => void onStopPolling()}
         gridReady={gridReady}
         layoutEditMode={layoutEditMode}
-        onToggleLayoutEditMode={() => setLayoutEditMode((prev) => !prev)}
         gridHostRef={gridHostRef}
         effectiveGridWidth={effectiveGridWidth}
         gridLayouts={gridLayouts}
@@ -1012,8 +1018,6 @@ export default function AnalyzerPage() {
         getTilePollingIntervalMs={getTilePollingIntervalMs}
         getTilePrimarySignalId={getTilePrimarySignalId}
         getTileInfo={getTileInfo}
-        onRefresh={() => void refreshAll()}
-        onOpenConnectionSettings={() => void openConnectionModal()}
         onConfigureSignals={() => {
           setConfigureSignalsOpen(true);
         }}

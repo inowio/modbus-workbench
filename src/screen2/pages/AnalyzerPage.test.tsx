@@ -66,12 +66,24 @@ vi.mock("../api/analyzer", () => ({
   listAnalyzerSignals: (...args: unknown[]) => listAnalyzerSignalsMock(...args),
 }));
 
-vi.mock("./analyzer/AnalyzerHeaderCard", () => ({
+vi.mock("./analyzer/AnalyzerControlBar", () => ({
   __esModule: true,
-  default: ({ onRefresh }: { onRefresh: () => void }) => (
+  default: (props: any) => (
     <div>
-      <button type="button" onClick={onRefresh}>
+      <button type="button" onClick={props.onRefresh}>
         Refresh
+      </button>
+      <button type="button" onClick={props.onRun}>
+        Start Polling
+      </button>
+      <button type="button" onClick={props.onStop}>
+        Stop Polling
+      </button>
+      <button type="button" onClick={props.onOpenConnectionSettings}>
+        Open Connection
+      </button>
+      <button type="button" onClick={props.onAddTile}>
+        Add Tile
       </button>
     </div>
   ),
@@ -99,15 +111,6 @@ vi.mock("./analyzer/AnalyzerTilesCard", () => ({
   __esModule: true,
   default: (props: any) => (
     <div>
-      <button type="button" onClick={props.onStartPollingAll}>
-        Start Polling
-      </button>
-      <button type="button" onClick={props.onStopPollingAll}>
-        Stop Polling
-      </button>
-      <button type="button" onClick={props.onOpenConnectionSettings}>
-        Open Connection
-      </button>
       <button
         type="button"
         onClick={() => props.tiles[0] && props.onToggleTilePolling(props.tiles[0])}
@@ -119,9 +122,6 @@ vi.mock("./analyzer/AnalyzerTilesCard", () => ({
         onClick={() => props.tiles[0] && props.onDeleteTile(props.tiles[0])}
       >
         Delete Tile
-      </button>
-      <button type="button" onClick={props.onAddTile}>
-        Add Tile
       </button>
       {props.tiles.map((t: any) =>
         t.kind === "trend" ? (
