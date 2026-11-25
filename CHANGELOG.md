@@ -33,8 +33,9 @@ All notable changes to this project are tracked here following [Keep a Changelog
   and quick checks. Move the mouse to show an overlay with the tab name, ◀ ▶,
   Run/Stop, **Cycle tabs** (Off / 10 s / 30 s / 60 s), Full screen and Exit.
   Esc closes a popup first, then leaves focus view.
-- **One control bar** — the Analyzer controls are now a single, tidier bar
-  with a Refresh icon and a Focus view button.
+- **One control bar** — the Analyzer controls are now a single, tidier bar:
+  Trends ▾ (trend history window), Signals, Connection, + Tile, Edit layout
+  (acts on the current tab), a Refresh icon and a Focus view button.
 
 ### Fixed
 - **Trend chart time labels** — on narrow trend tiles the time labels no longer

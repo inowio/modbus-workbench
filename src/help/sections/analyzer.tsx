@@ -64,7 +64,7 @@ const analyzerSection: HelpSectionDefinition = {
         <div className="grid gap-4 md:grid-cols-2">
           <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm shadow-black/5 dark:border-slate-800/60 dark:bg-slate-900/20 dark:shadow-black/0">
             <h3 className="text-base font-semibold text-slate-900 dark:text-white">Trends to show</h3>
-            <p>Limits the historical window (Last 1/5/10/30/60 min or All) for every trend tile. Only the on-screen history changes—the Modbus reads do not.</p>
+            <p>The <strong>Trends ▾</strong> dropdown at the start of the control bar limits the historical window (Last 1/5/10/30/60 min or All) for every trend tile. Only the on-screen history changes—the Modbus reads do not.</p>
           </div>
           <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm shadow-black/5 dark:border-slate-800/60 dark:bg-slate-900/20 dark:shadow-black/0">
             <h3 className="text-base font-semibold text-slate-900 dark:text-white">Run</h3>
@@ -72,14 +72,16 @@ const analyzerSection: HelpSectionDefinition = {
           </div>
           <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm shadow-black/5 dark:border-slate-800/60 dark:bg-slate-900/20 dark:shadow-black/0">
             <h3 className="text-base font-semibold text-slate-900 dark:text-white">Edit layout</h3>
-            <p>Drag and resize tiles to group by equipment, enlarge important trends, or prioritize alarms.</p>
+            <p>Drag and resize the current tab’s tiles to group by equipment, enlarge important trends, or prioritize alarms. Click <strong>Done</strong> when finished; other tabs keep their own layout.</p>
           </div>
           <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm shadow-black/5 dark:border-slate-800/60 dark:bg-slate-900/20 dark:shadow-black/0">
             <h3 className="text-base font-semibold text-slate-900 dark:text-white">Control bar</h3>
             <ul className="mt-2 list-disc space-y-1 pl-5">
+              <li><strong>Trends ▾</strong> – the trend history window (see Trends to show).</li>
               <li><strong>Signals</strong> – open the signal panel.</li>
               <li><strong>Connection</strong> – adjust RTU/TCP parameters without leaving Analyzer.</li>
               <li><strong>+ Tile</strong> – add value or trend tiles to the current tab.</li>
+              <li><strong>Edit layout</strong> – drag and resize the current tab’s tiles.</li>
               <li><strong>Refresh</strong> (icon) – reload layout after structural changes.</li>
               <li><strong>Focus view</strong> (⛶) – see Focus view below.</li>
             </ul>
@@ -264,7 +266,7 @@ VALUE
         </p>
         <ul className="mt-3 list-disc space-y-1 pl-5">
           <li>Click a tab to switch. Double-click it, or use ⋮ → <strong>Rename</strong>, to rename.</li>
-          <li>Drag tabs to reorder them. Click <strong>+</strong> to add a tab.</li>
+          <li>Drag tabs to reorder them. Click the <strong>Add tab</strong> button (+) at the end of the strip to add a tab.</li>
           <li>While running, a dot on a tab turns <strong>red</strong> if a tile has an error and <strong>amber</strong> if a tile is stale.</li>
           <li>Press <strong>Ctrl+1</strong> to <strong>Ctrl+9</strong> to jump to a tab. The last open tab is remembered.</li>
           <li>⋮ → <strong>Delete</strong>: if the tab has tiles, choose <strong>Move N tiles to [tab]</strong> (default) or <strong>Delete N tiles</strong>. Signals are never deleted. The last remaining tab can’t be deleted.</li>
@@ -277,7 +279,7 @@ VALUE
         <ul className="mt-3 list-disc space-y-1 pl-5">
           <li>Move the mouse to show the overlay. It hides 2 seconds after the mouse stops or leaves.</li>
           <li>The overlay has the tab name, ◀ ▶ to change tab, <strong>Run/Stop</strong>, <strong>Cycle tabs</strong>, <strong>Full screen</strong> and <strong>Exit</strong>.</li>
-          <li><strong>Cycle tabs</strong> can be Off, 10 s, 30 s or 60 s. It pauses while the mouse is over the overlay and is remembered per workspace.</li>
+          <li><strong>Cycle tabs</strong> can be Off, 10 s, 30 s or 60 s. It pauses while the mouse is over the overlay or a tile’s information is open, and is remembered per workspace.</li>
           <li><strong>Esc</strong> closes an open popup first; pressing it again exits focus view (and full screen).</li>
           <li>Tile menus and layout editing are off in focus view. Use the ⓘ button on a tile to see its information.</li>
         </ul>
