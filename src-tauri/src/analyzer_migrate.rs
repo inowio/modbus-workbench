@@ -203,10 +203,41 @@ fn tabs_in_tx(conn: &Connection) -> Result<(), String> {
     .map_err(|e| format!("failed to populate analyzer_tabs: {e}"))
 }
 
+/// Read-only check that the tabs upgrade has nothing to do: the table, column
+/// and index exist, there is at least one tab, and no tile lacks a tab. Any
+/// error reads as "not done" so the transactional path decides.
+fn tabs_already_migrated(conn: &Connection) -> bool {
+    let shape_ok = conn
+        .query_row(
+            "SELECT
+               (SELECT COUNT(*) FROM pragma_table_info('analyzer_tiles') WHERE name='tab_id') = 1
+               AND (SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='analyzer_tabs') = 1
+               AND (SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_analyzer_tiles_tab') = 1",
+            [],
+            |r| r.get::<_, bool>(0),
+        )
+        .unwrap_or(false);
+    if !shape_ok {
+        return false;
+    }
+    conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM analyzer_tabs)
+           AND NOT EXISTS (SELECT 1 FROM analyzer_tiles WHERE tab_id IS NULL)",
+        [],
+        |r| r.get::<_, bool>(0),
+    )
+    .unwrap_or(false)
+}
+
 /// Idempotent. Creates `analyzer_tabs`, adds `analyzer_tiles.tab_id`, guarantees
 /// at least one tab (`Main`), and back-fills tiles without a tab onto the first
-/// one. Does nothing when `analyzer_tiles` does not exist.
+/// one. Does nothing when `analyzer_tiles` does not exist. Runs on every
+/// workspace open, so an already-upgraded database is checked read-only and
+/// never takes the write lock.
 pub(crate) fn migrate_analyzer_tabs(conn: &Connection) -> Result<(), String> {
+    if tabs_already_migrated(conn) {
+        return Ok(());
+    }
     conn.execute_batch("BEGIN IMMEDIATE;")
         .map_err(|e| format!("failed to begin analyzer_tabs migration: {e}"))?;
     match tabs_in_tx(conn) {
@@ -581,6 +612,36 @@ mod tests {
         conn.execute("UPDATE analyzer_tiles SET tab_id = NULL WHERE id = 2", []).unwrap();
         migrate_analyzer_tabs(&conn).expect("third");
         assert_eq!(tile_tab(&conn, 2), Some(t[0].0));
+        cleanup(dir, conn);
+    }
+
+    #[test]
+    fn tabs_upgrade_fast_path_takes_no_write_lock_and_changes_nothing() {
+        let (dir, conn) = pre_tabs_db();
+        migrate_analyzer_tabs(&conn).expect("first");
+        let tabs_before = tabs(&conn);
+        let tiles_before = (tile_tab(&conn, 1), tile_tab(&conn, 2));
+        let total_changes = |c: &Connection| -> i64 {
+            c.query_row("SELECT total_changes()", [], |r| r.get(0)).unwrap()
+        };
+        let changes_before = total_changes(&conn);
+
+        // Another connection holds the write lock: the fast path must not need it.
+        let other = Connection::open(dir.join("workspace.db")).expect("open other");
+        other.execute_batch("BEGIN IMMEDIATE;").expect("lock");
+        conn.busy_timeout(std::time::Duration::from_millis(0)).unwrap();
+        migrate_analyzer_tabs(&conn).expect("already migrated: read-only");
+        other.execute_batch("ROLLBACK;").unwrap();
+        drop(other);
+
+        assert_eq!(total_changes(&conn), changes_before);
+        assert_eq!(tabs(&conn), tabs_before);
+        assert_eq!((tile_tab(&conn, 1), tile_tab(&conn, 2)), tiles_before);
+
+        // A NULL tab_id still takes the transactional path.
+        conn.execute("UPDATE analyzer_tiles SET tab_id = NULL WHERE id = 1", []).unwrap();
+        migrate_analyzer_tabs(&conn).expect("backfill");
+        assert_eq!(tile_tab(&conn, 1), Some(tabs_before[0].0));
         cleanup(dir, conn);
     }
 
