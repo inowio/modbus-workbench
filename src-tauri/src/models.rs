@@ -198,6 +198,7 @@ pub struct AnalyzerTile {
     pub polling_enabled: bool,
     pub created_at: String,
     pub updated_at: String,
+    pub tab_id: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -242,6 +243,8 @@ pub struct AnalyzerTileCreate {
     pub layouts: Vec<AnalyzerTileLayoutUpsert>,
     #[serde(default)]
     pub signal_links: Vec<AnalyzerTileSignalLink>,
+    #[serde(default)]
+    pub tab_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

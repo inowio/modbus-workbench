@@ -6,6 +6,7 @@ use tauri::Manager;
 
 mod db;
 mod analyzer_migrate;
+mod analyzer_tabs;
 mod models;
 mod settings;
 mod slaves;
@@ -73,6 +74,11 @@ use analyzer::{
     can_delete_slave_register_row, create_analyzer_tile, delete_analyzer_signal, delete_analyzer_tile,
     list_analyzer_signals, list_analyzer_tiles, list_analyzer_tile_layouts, list_analyzer_tile_signals,
     save_analyzer_tile_layouts, set_analyzer_tile_polling_enabled, update_analyzer_tile, upsert_analyzer_signal,
+};
+
+use analyzer_tabs::{
+    create_analyzer_tab, delete_analyzer_tab, duplicate_analyzer_tile, list_analyzer_tabs,
+    move_analyzer_tile_to_tab, rename_analyzer_tab, reorder_analyzer_tabs,
 };
 
 use analyzer_polling::{start_analyzer_polling, stop_analyzer_polling, AnalyzerPollingState};
@@ -171,6 +177,13 @@ pub fn run() {
             set_traffic_capture_enabled,
             list_analyzer_tiles,
             create_analyzer_tile,
+            list_analyzer_tabs,
+            create_analyzer_tab,
+            rename_analyzer_tab,
+            reorder_analyzer_tabs,
+            delete_analyzer_tab,
+            move_analyzer_tile_to_tab,
+            duplicate_analyzer_tile,
             update_analyzer_tile,
             delete_analyzer_tile,
             delete_analyzer_signal,

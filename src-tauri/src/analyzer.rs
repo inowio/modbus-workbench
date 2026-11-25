@@ -17,6 +17,22 @@ fn normalize_tile_inputs(kind: String, title: String, config_json: String) -> Re
     Ok((normalized_kind, normalized_title, normalized_config))
 }
 
+/// Maps a row of `SELECT id, kind, title, config_json, polling_enabled,
+/// created_at, updated_at, <tab_id>` into an `AnalyzerTile`.
+pub(crate) fn tile_from_row(row: &rusqlite::Row) -> rusqlite::Result<AnalyzerTile> {
+    let polling_int: i64 = row.get(4)?;
+    Ok(AnalyzerTile {
+        id: row.get(0)?,
+        kind: row.get(1)?,
+        title: row.get(2)?,
+        config_json: row.get(3)?,
+        polling_enabled: polling_int != 0,
+        created_at: row.get(5)?,
+        updated_at: row.get(6)?,
+        tab_id: row.get(7)?,
+    })
+}
+
 #[tauri::command]
 pub fn list_analyzer_tile_layouts(
     app: tauri::AppHandle,
@@ -120,20 +136,9 @@ pub fn update_analyzer_tile(
 
     let conn = open_workspace_db(&app, &name)?;
     conn.query_row(
-        "SELECT id, kind, title, config_json, polling_enabled, created_at, updated_at\n         FROM analyzer_tiles\n         WHERE id = ?1;",
+        "SELECT id, kind, title, config_json, polling_enabled, created_at, updated_at,\n                COALESCE(tab_id, (SELECT id FROM analyzer_tabs ORDER BY position, id LIMIT 1))\n         FROM analyzer_tiles\n         WHERE id = ?1;",
         (tile_id,),
-        |row| {
-            let polling_int: i64 = row.get(4)?;
-            Ok(AnalyzerTile {
-                id: row.get(0)?,
-                kind: row.get(1)?,
-                title: row.get(2)?,
-                config_json: row.get(3)?,
-                polling_enabled: polling_int != 0,
-                created_at: row.get(5)?,
-                updated_at: row.get(6)?,
-            })
-        },
+        tile_from_row,
     )
     .map_err(|e| format!("failed to read updated analyzer tile: {e}"))
 }
@@ -147,23 +152,12 @@ pub fn list_analyzer_tiles(
 
     let mut stmt = conn
         .prepare(
-            "SELECT id, kind, title, config_json, polling_enabled, created_at, updated_at\n             FROM analyzer_tiles\n             ORDER BY id ASC;",
+            "SELECT id, kind, title, config_json, polling_enabled, created_at, updated_at,\n                COALESCE(tab_id, (SELECT id FROM analyzer_tabs ORDER BY position, id LIMIT 1))\n             FROM analyzer_tiles\n             ORDER BY id ASC;",
         )
         .map_err(|e| format!("failed to prepare query: {e}"))?;
 
     let rows = stmt
-        .query_map([], |row| {
-            let polling_int: i64 = row.get(4)?;
-            Ok(AnalyzerTile {
-                id: row.get(0)?,
-                kind: row.get(1)?,
-                title: row.get(2)?,
-                config_json: row.get(3)?,
-                polling_enabled: polling_int != 0,
-                created_at: row.get(5)?,
-                updated_at: row.get(6)?,
-            })
-        })
+        .query_map([], tile_from_row)
         .map_err(|e| format!("failed to query analyzer tiles: {e}"))?;
 
     let mut out = Vec::new();
@@ -181,23 +175,48 @@ pub fn create_analyzer_tile(
     tile: AnalyzerTileCreate,
     now_iso: String,
 ) -> Result<AnalyzerTile, String> {
+    let mut conn = open_workspace_db(&app, &name)?;
+    create_analyzer_tile_in_conn(&mut conn, tile, &now_iso)
+}
+
+pub(crate) fn create_analyzer_tile_in_conn(
+    conn: &mut Connection,
+    tile: AnalyzerTileCreate,
+    now_iso: &str,
+) -> Result<AnalyzerTile, String> {
     let (kind, title, config_json) =
         normalize_tile_inputs(tile.kind, tile.title, tile.config_json)?;
 
-    let mut conn = open_workspace_db(&app, &name)?;
     let tx = conn
         .transaction()
         .map_err(|e| format!("failed to start transaction: {e}"))?;
 
+    let tab_id: i64 = match tile.tab_id {
+        Some(id) => tx
+            .query_row("SELECT id FROM analyzer_tabs WHERE id = ?1;", (id,), |r| r.get(0))
+            .optional()
+            .map_err(|e| format!("failed to look up tab: {e}"))?
+            .ok_or_else(|| "Tab not found".to_string())?,
+        None => tx
+            .query_row(
+                "SELECT id FROM analyzer_tabs ORDER BY position, id LIMIT 1;",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| format!("failed to look up first tab: {e}"))?,
+    };
+
     tx.execute(
-        "INSERT INTO analyzer_tiles (kind, title, config_json, polling_enabled, created_at, updated_at)\n         VALUES (?1, ?2, ?3, ?4, ?5, ?6);",
+        "INSERT INTO analyzer_tiles (kind, title, config_json, polling_enabled, created_at, updated_at, tab_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7);",
         params![
             kind,
             title,
             config_json,
             if tile.polling_enabled { 1 } else { 0 },
-            now_iso.clone(),
-            now_iso.clone()
+            now_iso,
+            now_iso,
+            tab_id
         ],
     )
     .map_err(|e| format!("failed to create analyzer tile: {e}"))?;
@@ -233,22 +252,10 @@ pub fn create_analyzer_tile(
     tx.commit()
         .map_err(|e| format!("failed to commit transaction: {e}"))?;
 
-    let conn = open_workspace_db(&app, &name)?;
     conn.query_row(
-        "SELECT id, kind, title, config_json, polling_enabled, created_at, updated_at\n         FROM analyzer_tiles\n         WHERE id = ?1;",
+        "SELECT id, kind, title, config_json, polling_enabled, created_at, updated_at,\n                COALESCE(tab_id, (SELECT id FROM analyzer_tabs ORDER BY position, id LIMIT 1))\n         FROM analyzer_tiles\n         WHERE id = ?1;",
         (tile_id,),
-        |row| {
-            let polling_int: i64 = row.get(4)?;
-            Ok(AnalyzerTile {
-                id: row.get(0)?,
-                kind: row.get(1)?,
-                title: row.get(2)?,
-                config_json: row.get(3)?,
-                polling_enabled: polling_int != 0,
-                created_at: row.get(5)?,
-                updated_at: row.get(6)?,
-            })
-        },
+        tile_from_row,
     )
     .map_err(|e| format!("failed to read created analyzer tile: {e}"))
 }
@@ -726,20 +733,9 @@ pub fn set_analyzer_tile_polling_enabled(
     .map_err(|e| format!("failed to update tile polling: {e}"))?;
 
     conn.query_row(
-        "SELECT id, kind, title, config_json, polling_enabled, created_at, updated_at\n         FROM analyzer_tiles\n         WHERE id = ?1;",
+        "SELECT id, kind, title, config_json, polling_enabled, created_at, updated_at,\n                COALESCE(tab_id, (SELECT id FROM analyzer_tabs ORDER BY position, id LIMIT 1))\n         FROM analyzer_tiles\n         WHERE id = ?1;",
         (tile_id,),
-        |row| {
-            let polling_int: i64 = row.get(4)?;
-            Ok(AnalyzerTile {
-                id: row.get(0)?,
-                kind: row.get(1)?,
-                title: row.get(2)?,
-                config_json: row.get(3)?,
-                polling_enabled: polling_int != 0,
-                created_at: row.get(5)?,
-                updated_at: row.get(6)?,
-            })
-        },
+        tile_from_row,
     )
     .map_err(|e| format!("failed to read updated tile: {e}"))
 }
