@@ -21,9 +21,15 @@ const analyzerSection: HelpSectionDefinition = {
     "calculated signal",
     "unit",
     "try it",
+    "tabs",
+    "focus view",
+    "full screen",
+    "cycle tabs",
+    "duplicate tile",
+    "address format",
   ],
   searchText:
-    "Analyzer pipeline Register → Signal → Tile. Learn screen controls, how to define signals, configure decoders (unit, scale, offset, bit, clamp), manage poll intervals, add tiles (value/trend), use tile menus, run/stop polling, avoid anti-patterns, and follow real-world examples. Pick a unit from the grouped dropdown, add math with variables, calculations and rules (IF / AND / OR, OTHERWISE), choose what a tile shows, create calculated signals from other signals, and test with Try it.",
+    "Analyzer pipeline Register → Signal → Tile. Learn screen controls, how to define signals, configure decoders (unit, scale, offset, bit, clamp), manage poll intervals, add tiles (value/trend), use tile menus, run/stop polling, avoid anti-patterns, and follow real-world examples. Pick a unit from the grouped dropdown, add math with variables, calculations and rules (IF / AND / OR, OTHERWISE), choose what a tile shows, create calculated signals from other signals, and test with Try it. Organize tiles into tabs, rename, reorder and delete tabs, move or duplicate tiles between tabs, switch tabs with Ctrl+1 to Ctrl+9, and use Focus view with cycle tabs and full screen. Register address format (Dec / Hex) lives in Settings.",
   anchors: [
     { id: "overview", label: "Register → Signal → Tile" },
     { id: "controls", label: "Screen controls" },
@@ -40,6 +46,8 @@ const analyzerSection: HelpSectionDefinition = {
     { id: "tile-types", label: "Tile types" },
     { id: "add-tile", label: "Add tile" },
     { id: "tile-menu", label: "Tile menu" },
+    { id: "tabs", label: "Tabs" },
+    { id: "focus-view", label: "Focus view" },
     { id: "run-stop", label: "Run / Stop" },
     { id: "examples", label: "Examples" },
     { id: "anti-patterns", label: "What not to do" },
@@ -67,13 +75,15 @@ const analyzerSection: HelpSectionDefinition = {
             <p>Drag and resize tiles to group by equipment, enlarge important trends, or prioritize alarms.</p>
           </div>
           <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm shadow-black/5 dark:border-slate-800/60 dark:bg-slate-900/20 dark:shadow-black/0">
-            <h3 className="text-base font-semibold text-slate-900 dark:text-white">Options menu</h3>
+            <h3 className="text-base font-semibold text-slate-900 dark:text-white">Control bar</h3>
             <ul className="mt-2 list-disc space-y-1 pl-5">
-              <li><strong>Configure Signals</strong> – open the signal panel.</li>
-              <li><strong>Add Tile</strong> – add value or trend tiles.</li>
-              <li><strong>Connection Settings</strong> – adjust RTU/TCP parameters without leaving Analyzer.</li>
-              <li><strong>Refresh</strong> – reload layout after structural changes.</li>
+              <li><strong>Signals</strong> – open the signal panel.</li>
+              <li><strong>Connection</strong> – adjust RTU/TCP parameters without leaving Analyzer.</li>
+              <li><strong>+ Tile</strong> – add value or trend tiles to the current tab.</li>
+              <li><strong>Refresh</strong> (icon) – reload layout after structural changes.</li>
+              <li><strong>Focus view</strong> (⛶) – see Focus view below.</li>
             </ul>
+            <p className="mt-2 text-sm text-slate-700 dark:text-slate-300">Register addresses are shown in decimal or hex. Change this in <strong>Settings → Display → Register addresses</strong>; it is app-wide, remembered, and also used by the TCP Simulator. It only changes how addresses are written, never values.</p>
           </div>
         </div>
       </SectionBlock>
@@ -100,7 +110,7 @@ Address: 0
       </SectionBlock>
       <SectionBlock section="analyzer" anchor="create-signal" title="Create / edit signal">
         <ol className="list-decimal space-y-2 pl-5">
-          <li>Options → <strong>Configure Signals</strong> → <strong>Add Signal</strong>.</li>
+          <li><strong>Signals</strong> in the control bar → <strong>Add Signal</strong>.</li>
           <li>Select the <strong>Slave</strong>, <strong>Register type</strong>, and <strong>Register address</strong>.</li>
           <li>Provide a unique <strong>Signal ID</strong> plus decoder settings (below).</li>
           <li>Save. Duplicate combinations of (Slave + Register type + Address) are blocked intentionally.</li>
@@ -232,7 +242,7 @@ VALUE
       </SectionBlock>
       <SectionBlock section="analyzer" anchor="add-tile" title="Adding a tile">
         <ol className="list-decimal space-y-2 pl-5">
-          <li>Options → <strong>Add Tile</strong>.</li>
+          <li>Click <strong>+ Tile</strong> in the control bar. The tile is added to the current tab.</li>
           <li>Choose tile type (Value or Trend).</li>
           <li>Select the <strong>Primary signal</strong> (required) and optionally override the title.</li>
           <li>Click <strong>Add</strong>; the tile appears immediately and reflects live signal state.</li>
@@ -243,7 +253,33 @@ VALUE
           <li><strong>Disable Polling</strong> – pauses only this tile’s signal binding, marking it as <em>Disabled</em>.</li>
           <li><strong>Information</strong> – quick reference for slave, register, decoder, and poll interval.</li>
           <li><strong>Edit</strong> – change the title or rebind to another signal without touching the signal itself.</li>
+          <li><strong>Move to tab…</strong> – send the tile to another tab.</li>
+          <li><strong>Duplicate…</strong> – copy the tile to a tab. The copy is named “&lt;title&gt; (copy)” and placed below that tab’s tiles.</li>
           <li><strong>Delete</strong> – removes the tile; the signal remains available.</li>
+        </ul>
+      </SectionBlock>
+      <SectionBlock section="analyzer" anchor="tabs" title="Tabs">
+        <p>
+          The tab strip under the control bar lets you group tiles, for example one tab per machine. Existing tiles start in a tab named <strong>Main</strong>. Each tile lives on exactly one tab, and <strong>+ Tile</strong> and <strong>Edit layout</strong> act on the current tab.
+        </p>
+        <ul className="mt-3 list-disc space-y-1 pl-5">
+          <li>Click a tab to switch. Double-click it, or use ⋮ → <strong>Rename</strong>, to rename.</li>
+          <li>Drag tabs to reorder them. Click <strong>+</strong> to add a tab.</li>
+          <li>While running, a dot on a tab turns <strong>red</strong> if a tile has an error and <strong>amber</strong> if a tile is stale.</li>
+          <li>Press <strong>Ctrl+1</strong> to <strong>Ctrl+9</strong> to jump to a tab. The last open tab is remembered.</li>
+          <li>⋮ → <strong>Delete</strong>: if the tab has tiles, choose <strong>Move N tiles to [tab]</strong> (default) or <strong>Delete N tiles</strong>. Signals are never deleted. The last remaining tab can’t be deleted.</li>
+        </ul>
+      </SectionBlock>
+      <SectionBlock section="analyzer" anchor="focus-view" title="Focus view">
+        <p>
+          Click <strong>Focus view</strong> (⛶) to hide the sidebar, app header, control bar and tabs so the tiles fill the window. Polling keeps running on all tabs.
+        </p>
+        <ul className="mt-3 list-disc space-y-1 pl-5">
+          <li>Move the mouse to show the overlay. It hides 2 seconds after the mouse stops or leaves.</li>
+          <li>The overlay has the tab name, ◀ ▶ to change tab, <strong>Run/Stop</strong>, <strong>Cycle tabs</strong>, <strong>Full screen</strong> and <strong>Exit</strong>.</li>
+          <li><strong>Cycle tabs</strong> can be Off, 10 s, 30 s or 60 s. It pauses while the mouse is over the overlay and is remembered per workspace.</li>
+          <li><strong>Esc</strong> closes an open popup first; pressing it again exits focus view (and full screen).</li>
+          <li>Tile menus and layout editing are off in focus view. Use the ⓘ button on a tile to see its information.</li>
         </ul>
       </SectionBlock>
       <SectionBlock section="analyzer" anchor="run-stop" title="Run / Stop Analyzer">

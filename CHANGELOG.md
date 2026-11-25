@@ -23,6 +23,18 @@ All notable changes to this project are tracked here following [Keep a Changelog
   saving, without touching the device.
 - **Larger signal editor** — a sticky header and footer give the new Data and
   Math tabs room to work.
+- **Tile tabs** — organise Analyzer tiles into named tabs (for example one per
+  machine). Click to switch, double-click to rename, drag to reorder, delete
+  with a choice to move or delete its tiles (signals are never deleted), and
+  use Ctrl+1…Ctrl+9 to jump. Tiles can be moved or duplicated between tabs from
+  the tile menu. A red or amber dot shows a problem or stale tile on a tab
+  while running. The last open tab is remembered.
+- **Focus view** — a full-window view of the Analyzer tiles for wall displays
+  and quick checks. Move the mouse to show an overlay with the tab name, ◀ ▶,
+  Run/Stop, **Cycle tabs** (Off / 10 s / 30 s / 60 s), Full screen and Exit.
+  Esc closes a popup first, then leaves focus view.
+- **One control bar** — the Analyzer controls are now a single, tidier bar
+  with a Refresh icon and a Focus view button.
 
 ### Fixed
 - **Trend chart time labels** — on narrow trend tiles the time labels no longer
@@ -33,7 +45,12 @@ All notable changes to this project are tracked here following [Keep a Changelog
 ### Changed
 - **Workspace upgrade** — when 0.6.0 starts, every workspace is upgraded as the
   workspace list loads, and upgraded workspaces can no longer be opened by
-  0.5.x. Export a backup of important workspaces before upgrading.
+  0.5.x. Existing Analyzer tiles appear in a tab named "Main". Export a backup
+  of important workspaces before upgrading.
+- **Register address format** — the Dec / Hex choice moved from the Analyzer
+  bar to Settings → Display. It is app-wide, remembered, and used by the
+  Analyzer and TCP Simulator. It only changes how addresses are written, never
+  values.
 
 ## [0.5.0] - 2026-08-10
 ### Added
