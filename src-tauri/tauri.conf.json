@@ -17,7 +17,8 @@
         "height": 720,
         "maximized": true,
         "theme": "Dark",
-        "devtools": false
+        "devtools": false,
+        "dragDropEnabled": false
       }
     ],
     "security": {
