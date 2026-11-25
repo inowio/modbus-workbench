@@ -95,7 +95,7 @@ describe("SignalEditorPanel", () => {
   it("editor is the large panel with Data and Math tabs", async () => {
     const s = signal("Temp_1", { decoderJson: JSON.stringify({ math: EXAMPLE }) });
     await renderPanel({ signal: s, signals: [s] });
-    expect(screen.getByRole("dialog").className).toContain("max-w-6xl");
+    expect(screen.getByRole("dialog").className).toContain("max-w-[1800px]");
     expect(screen.getByRole("tab", { name: /^Data/ })).toBeTruthy();
     expect(screen.getByRole("tab", { name: /Math \(3\)/ })).toBeTruthy();
   });
@@ -239,7 +239,7 @@ describe("SignalEditorPanel", () => {
 
     fireEvent.change(screen.getByLabelText("Scale"), { target: { value: "0.1" } });
     expect(preview()).toContain("—");
-    expect(preview()).toContain("Save to preview Scale/Offset/Clamp/Bit changes");
+    expect(preview()).toContain("Save to preview register or Scale/Offset/Clamp/Bit changes");
     expect(preview()).not.toContain("32.8");
     expect(preview()).not.toContain("Live value");
 
@@ -248,7 +248,7 @@ describe("SignalEditorPanel", () => {
     const useLive = screen.getByLabelText("Use live values") as HTMLInputElement;
     expect(useLive.checked).toBe(false);
     expect(useLive.disabled).toBe(true);
-    expect(screen.getByText("Live values use the saved Scale/Offset/Clamp/Bit. Save to use them, or type a value.")).toBeTruthy();
+    expect(screen.getByText("Live values use the saved register and Scale/Offset/Clamp/Bit. Save to use them, or type a value.")).toBeTruthy();
     expect((screen.getByLabelText("Try it register value") as HTMLInputElement).value).toBe("");
 
     // A typed register value (already scaled) still previews, labelled as typed.
@@ -259,6 +259,32 @@ describe("SignalEditorPanel", () => {
 
     // Undoing the change brings the live value back.
     fireEvent.change(screen.getByLabelText("Scale"), { target: { value: "" } });
+    expect(preview()).toContain("32.8 °C");
+    expect(preview()).toContain("Live value");
+  });
+
+  it("while live, re-pointing the register stops showing the old register's value", async () => {
+    listRows.mockResolvedValue([
+      ...ROWS,
+      { id: 8, slaveId: 1, functionCode: 3, address: 11, alias: "Humidity", dataType: "u16", order: "ABCD", displayFormat: "dec", updatedAt: "" },
+    ]);
+    const s = signal("Temp_1", { decoderJson: JSON.stringify({ unit: "°C", decimals: 1, show: "y", math: EXAMPLE }) });
+    const live = evaluation({ register: ok(328), formatted: "32.8 °C", shown: ok(32.8) });
+    await renderPanel({ signal: s, signals: [s], evaluations: { Temp_1: live } });
+    const preview = () => screen.getByRole("group", { name: "Tile preview" }).textContent ?? "";
+    expect(preview()).toContain("Live value");
+
+    fireEvent.change(screen.getByLabelText("Register address"), { target: { value: "8" } });
+    expect(preview()).toContain("Save to preview register or Scale/Offset/Clamp/Bit changes");
+    expect(preview()).not.toContain("32.8");
+
+    fireEvent.click(screen.getByRole("tab", { name: /Math/ }));
+    expect((screen.getByLabelText("Use live values") as HTMLInputElement).disabled).toBe(true);
+    expect(document.body.textContent).not.toContain("→ 328");
+
+    // Pointing back at the saved register brings the live value back.
+    fireEvent.click(screen.getByRole("tab", { name: /^Data/ }));
+    fireEvent.change(screen.getByLabelText("Register address"), { target: { value: "7" } });
     expect(preview()).toContain("32.8 °C");
     expect(preview()).toContain("Live value");
   });

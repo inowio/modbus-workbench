@@ -122,7 +122,7 @@ export default function MathTab(props: {
   const liveRegister = kind === "register" && selfSignalId ? evaluations[selfSignalId]?.register : null;
 
   return (
-    <div className="grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1fr)_260px]">
+    <div className="grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1fr)_280px] xl:grid-cols-[minmax(0,1fr)_340px]">
       <div className="flex min-w-0 flex-col gap-4">
         {kind === "calculated" ? (
           <div className="flex flex-col gap-1">

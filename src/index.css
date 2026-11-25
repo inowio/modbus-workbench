@@ -83,6 +83,11 @@
     color: rgb(226 232 240);
   }
 
+  /* Placeholder / unavailable options: dimmer than normal ones, but still readable (slate-400). */
+  .dark option:disabled {
+    color: rgb(148 163 184) !important;
+  }
+
   body {
     @apply m-0 min-h-screen bg-slate-50 font-sans text-slate-900 antialiased;
   }

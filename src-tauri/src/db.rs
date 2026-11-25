@@ -26,9 +26,10 @@ pub(crate) fn ensure_workspace_db(workspace_folder: &PathBuf, db_file: &str) -> 
     let conn = Connection::open(&db_path)
         .map_err(|e| format!("failed to open workspace db {:?}: {e}", db_path))?;
 
-    // Wait (briefly) for another connection's lock instead of failing the schema
-    // setup or the one-time analyzer migration with "database is locked".
-    conn.execute_batch("PRAGMA busy_timeout = 2000;")
+    // Wait for another connection's lock instead of failing the schema setup or the
+    // one-time analyzer migration with "database is locked". 5000 ms = rusqlite's own
+    // default, which this function relied on in 0.5.0 (regular connections keep 2000 ms).
+    conn.execute_batch("PRAGMA busy_timeout = 5000;")
         .map_err(|e| format!("failed to set busy_timeout: {e}"))?;
     conn.execute_batch("PRAGMA foreign_keys = ON;")
         .map_err(|e| format!("failed to enable foreign_keys: {e}"))?;

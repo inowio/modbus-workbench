@@ -34,7 +34,7 @@ const BTN_SECONDARY =
 const BTN_PRIMARY =
   "inline-flex items-center justify-center gap-2 rounded-full border border-emerald-600/60 bg-emerald-500/10 px-4 py-2 text-xs font-semibold text-emerald-800 transition hover:border-emerald-500 hover:text-emerald-900 disabled:cursor-not-allowed disabled:opacity-60 dark:border-emerald-500/60 dark:text-emerald-200 dark:hover:border-emerald-400 dark:hover:text-emerald-100";
 
-const LIVE_BLOCKED_TRANSFORMS = "Live values use the saved Scale/Offset/Clamp/Bit. Save to use them, or type a value.";
+const LIVE_BLOCKED_TRANSFORMS = "Live values use the saved register and Scale/Offset/Clamp/Bit. Save to use them, or type a value.";
 
 /**
  * Keeps Show value on a variable that was renamed in the Math tab (renames keep the index).
@@ -244,7 +244,7 @@ export default function SignalEditorPanel(props: {
         role="dialog"
         aria-modal="true"
         aria-labelledby="analyzer-signal-editor-title"
-        className="flex max-h-[90vh] w-full max-w-6xl flex-col rounded-2xl border border-slate-200 bg-white text-slate-900 shadow-2xl dark:border-slate-800 dark:bg-slate-900 dark:text-slate-100"
+        className="flex max-h-[92vh] w-[96vw] max-w-[1800px] flex-col rounded-2xl border border-slate-200 bg-white text-slate-900 shadow-2xl dark:border-slate-800 dark:bg-slate-900 dark:text-slate-100"
       >
         <header className="flex shrink-0 flex-col gap-3 border-b border-slate-200 bg-slate-50/70 px-6 py-4 dark:border-slate-800 dark:bg-slate-950/40">
           <div className="flex items-start justify-between gap-3">

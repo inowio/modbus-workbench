@@ -35,6 +35,12 @@ export default function AnalyzerTrendTile(props: {
 
   const lastWindowMsRef = useRef<number | null>(props.windowMs);
 
+  /** Tile width, bucketed to 40px so resizing doesn't rebuild the chart on every pixel. */
+  const [chartWidthPx, setChartWidthPx] = useState(480);
+  const trackWidth = (w: number) => {
+    if (Number.isFinite(w) && w > 0) setChartWidthPx(Math.max(40, Math.round(w / 40) * 40));
+  };
+
   useEffect(() => {
     if (typeof document === "undefined") return;
     const root = document.documentElement;
@@ -82,8 +88,10 @@ export default function AnalyzerTrendTile(props: {
         type: "time",
         min: minTs ?? undefined,
         max: maxTs,
+        // ~1 time label per 90px; never draw labels on top of each other (narrow tiles).
+        splitNumber: Math.max(2, Math.floor((chartWidthPx - 62) / 90)),
         axisLine: { lineStyle: { color: axisLine } },
-        axisLabel: { color: axisLabel },
+        axisLabel: { color: axisLabel, hideOverlap: true, showMinLabel: false, showMaxLabel: false },
         splitLine: { lineStyle: { color: splitLine } },
       },
       yAxis: {
@@ -114,7 +122,7 @@ export default function AnalyzerTrendTile(props: {
         },
       ],
     } satisfies EChartsOption;
-  }, [isDark, props.nowTsMs, renderPoints, props.title, props.windowMs]);
+  }, [isDark, props.nowTsMs, renderPoints, props.title, props.windowMs, chartWidthPx]);
 
   function clearResizeTimers() {
     for (const id of resizeTimeoutIdsRef.current) {
@@ -158,8 +166,10 @@ export default function AnalyzerTrendTile(props: {
     if (!host) return;
 
     scheduleResize(80);
+    trackWidth(host.getBoundingClientRect().width);
 
     const ro = new ResizeObserver(() => {
+      trackWidth(host.getBoundingClientRect().width);
       scheduleResize(24);
     });
     ro.observe(host);

@@ -229,15 +229,22 @@ export function draftFromSignal(s: AnalyzerSignal | null, kind: SignalKind): Sig
   };
 }
 
-export type DraftTransforms = Pick<SignalDraft, "bit" | "scale" | "offset" | "clampMin" | "clampMax">;
+export type DraftTransforms = Pick<
+  SignalDraft,
+  "slaveId" | "functionCode" | "registerRowId" | "bit" | "scale" | "offset" | "clampMin" | "clampMax"
+>;
 
 /**
- * True when the draft's register transforms differ from the saved signal's. Live values are
- * decoded with the SAVED transforms, so they must not be presented as the draft's values then.
+ * True when the draft reads a different register (slave, register type, address) or applies
+ * different transforms than the saved signal. Live values come from the SAVED register, decoded
+ * with the SAVED transforms, so they must not be presented as the draft's values then.
  */
 export function transformsChanged(draft: DraftTransforms, saved: DraftTransforms | null): boolean {
   if (saved == null) return false;
-  const keys: (keyof DraftTransforms)[] = ["bit", "scale", "offset", "clampMin", "clampMax"];
+  if (draft.slaveId !== saved.slaveId || draft.functionCode !== saved.functionCode || draft.registerRowId !== saved.registerRowId) {
+    return true;
+  }
+  const keys = ["bit", "scale", "offset", "clampMin", "clampMax"] as const;
   return keys.some((k) => draft[k].trim() !== saved[k].trim());
 }
 

@@ -14,10 +14,10 @@ function optionLabel(name: string, r: MathResult | undefined): string {
 
 export type SavedDisplay = Pick<
   SignalDraft,
-  "show" | "decimals" | "unit" | "math" | "bit" | "scale" | "offset" | "clampMin" | "clampMax"
+  "show" | "decimals" | "unit" | "math" | "slaveId" | "functionCode" | "registerRowId" | "bit" | "scale" | "offset" | "clampMin" | "clampMax"
 >;
 
-export const SAVE_TRANSFORMS_NOTE = "Save to preview Scale/Offset/Clamp/Bit changes";
+export const SAVE_TRANSFORMS_NOTE = "Save to preview register or Scale/Offset/Clamp/Bit changes";
 
 function sameDisplay(draft: SignalDraft, saved: SavedDisplay | null): boolean {
   return (
