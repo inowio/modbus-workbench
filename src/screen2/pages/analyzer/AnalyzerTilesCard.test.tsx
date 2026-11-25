@@ -1,9 +1,13 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import AnalyzerTilesCard from "./AnalyzerTilesCard";
 
+let lastGridProps: any = null;
 vi.mock("react-grid-layout", () => ({
-  Responsive: (props: any) => <div>{props.children}</div>,
+  Responsive: (props: any) => {
+    lastGridProps = props;
+    return <div>{props.children}</div>;
+  },
 }));
 
 const MAIN = { id: 1, name: "Main", position: 0 };
@@ -11,7 +15,8 @@ const BOILER = { id: 2, name: "Boiler", position: 1 };
 const POWER = { id: 3, name: "Power", position: 2 };
 const tile = { id: 5, kind: "value", title: "Voltage", configJson: "{}", pollingEnabled: true, createdAt: "", updatedAt: "", tabId: 2 };
 
-function setup(tabs = [MAIN, BOILER, POWER]) {
+function renderCard(opts: { tabs?: typeof MAIN[]; focusMode?: boolean; layoutEditMode?: boolean } = {}) {
+  const tabs = opts.tabs ?? [MAIN, BOILER, POWER];
   const onMoveTile = vi.fn();
   const onDuplicateTile = vi.fn();
   render(
@@ -20,7 +25,8 @@ function setup(tabs = [MAIN, BOILER, POWER]) {
       workspaceHasTiles
       pollingWanted={false}
       gridReady
-      layoutEditMode={false}
+      layoutEditMode={opts.layoutEditMode ?? false}
+      focusMode={opts.focusMode ?? false}
       gridHostRef={{ current: null }}
       effectiveGridWidth={800}
       gridLayouts={{ desktop: [], mobile: [] }}
@@ -33,7 +39,19 @@ function setup(tabs = [MAIN, BOILER, POWER]) {
       trendWindowMs={null}
       getTilePollingIntervalMs={() => null}
       getTilePrimarySignalId={() => null}
-      getTileInfo={() => null}
+      getTileInfo={() => ({
+        tileType: "Value",
+        tileName: "Voltage",
+        signalId: "sig-1",
+        connection: "SERIAL",
+        slaveId: 1,
+        unitId: 1,
+        registerAddress: 0,
+        registerAddressFormatted: "0",
+        registerType: "Holding",
+        calculatedSource: null,
+        pollIntervalMs: 1000,
+      })}
       onConfigureSignals={() => {}}
       onAddTile={() => {}}
       onToggleTilePolling={() => {}}
@@ -44,8 +62,22 @@ function setup(tabs = [MAIN, BOILER, POWER]) {
       onDuplicateTile={onDuplicateTile}
     />,
   );
-  fireEvent.click(screen.getByTitle("Tile menu"));
   return { onMoveTile, onDuplicateTile };
+}
+
+function setup(tabs = [MAIN, BOILER, POWER]) {
+  const handlers = renderCard({ tabs });
+  fireEvent.click(screen.getByTitle("Tile menu"));
+  return handlers;
+}
+
+/** Presses Escape on the body and reports whether a handler called preventDefault. */
+function pressEscape(): boolean {
+  const ev = new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true });
+  act(() => {
+    document.body.dispatchEvent(ev);
+  });
+  return ev.defaultPrevented;
 }
 
 describe("AnalyzerTilesCard move / duplicate", () => {
@@ -81,5 +113,33 @@ describe("AnalyzerTilesCard move / duplicate", () => {
     setup([BOILER]);
     expect(screen.queryByRole("button", { name: /Move to tab/ })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Duplicate/ })).toBeInTheDocument();
+  });
+});
+
+describe("AnalyzerTilesCard Escape and focus view", () => {
+  it("Escape closes an open tile menu and marks the event handled", () => {
+    setup();
+    expect(screen.getByRole("button", { name: "Information" })).toBeInTheDocument();
+    expect(pressEscape()).toBe(true);
+    expect(screen.queryByRole("button", { name: "Information" })).not.toBeInTheDocument();
+  });
+
+  it("in focus view there is no tile menu, and the grid is not editable even in layout edit mode", () => {
+    renderCard({ focusMode: true, layoutEditMode: true });
+    expect(screen.queryByTitle("Tile menu")).not.toBeInTheDocument();
+    expect(lastGridProps.isDraggable).toBe(false);
+    expect(lastGridProps.isResizable).toBe(false);
+    expect(screen.queryByText(/Drag tiles to move/)).not.toBeInTheDocument();
+  });
+
+  it("in focus view a tile's information opens read-only; Escape closes it first (Review Focus 4)", () => {
+    renderCard({ focusMode: true });
+    fireEvent.click(screen.getByRole("button", { name: "Tile information" }));
+    expect(screen.getByRole("dialog")).toHaveTextContent("sig-1");
+
+    // A page-level focus-view handler on window sees the first Escape as already handled.
+    expect(pressEscape()).toBe(true);
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(pressEscape()).toBe(false);
   });
 });

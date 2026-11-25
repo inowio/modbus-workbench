@@ -1,8 +1,8 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { MemoryRouter, Route, Routes, useOutletContext } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import Screen2Layout from "./Screen2Layout";
+import Screen2Layout, { type Screen2OutletContext } from "./Screen2Layout";
 
 const invokeMock = vi.fn();
 const listenMock = vi.fn();
@@ -123,5 +123,42 @@ describe("Screen2Layout", () => {
         }),
       ),
     );
+  });
+
+  it("focus mode hides the sidebar navigation and the app header", async () => {
+    setupInvoke();
+    function FocusChild() {
+      const { setFocusMode } = useOutletContext<Screen2OutletContext>();
+      return (
+        <>
+          <button type="button" onClick={() => setFocusMode?.(true)}>Enter focus</button>
+          <button type="button" onClick={() => setFocusMode?.(false)}>Leave focus</button>
+        </>
+      );
+    }
+    render(
+      <MemoryRouter initialEntries={["/app/UnitTest/analyzer"]}>
+        <Routes>
+          <Route path="/app/:workspaceName/*" element={<Screen2Layout />}>
+            <Route path="analyzer" element={<FocusChild />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    await screen.findByRole("button", { name: "Enter focus" });
+    expect(screen.getByRole("link", { name: "Workspace" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Analyzer" })).toBeInTheDocument();
+    expect(screen.getByRole("banner")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Enter focus" }));
+    expect(screen.queryByRole("link", { name: "Workspace" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: "Analyzer" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("banner")).not.toBeInTheDocument();
+    expect(screen.getByRole("main")).not.toHaveClass("sm:px-4");
+
+    fireEvent.click(screen.getByRole("button", { name: "Leave focus" }));
+    expect(screen.getByRole("link", { name: "Workspace" })).toBeInTheDocument();
+    expect(screen.getByRole("banner")).toBeInTheDocument();
   });
 });

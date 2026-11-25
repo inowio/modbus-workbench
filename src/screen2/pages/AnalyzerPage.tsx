@@ -45,8 +45,18 @@ import AnalyzerTilesCard from "./analyzer/AnalyzerTilesCard";
 import AnalyzerAddEditTileModal from "./analyzer/AnalyzerAddEditTileModal";
 import AnalyzerConfigureSignalsModal from "./analyzer/AnalyzerConfigureSignalsModal";
 import AnalyzerTabsStrip from "./analyzer/AnalyzerTabsStrip";
+import AnalyzerFocusOverlay from "./analyzer/AnalyzerFocusOverlay";
+import { useFocusView, useTabCycle } from "./analyzer/useFocusView";
 import DeleteTabDialog from "./analyzer/DeleteTabDialog";
-import { readLastTabId, resolveSelectedTab, tabStatus, useTabShortcuts, writeLastTabId, type TabStatus } from "./analyzer/tabs";
+import {
+  nextTabId,
+  readLastTabId,
+  resolveSelectedTab,
+  tabStatus,
+  useTabShortcuts,
+  writeLastTabId,
+  type TabStatus,
+} from "./analyzer/tabs";
 import { getChartKind } from "./analyzer/chartKind";
 import { computeSignalEvaluations, dependentsBySignalId, type LiveSignalUpdate } from "./analyzer/signalEvaluations";
 import type { BreakpointLayouts, GridLayout } from "./analyzer/layoutTypes";
@@ -92,7 +102,7 @@ function buildLayoutsPerTab(tiles: AnalyzerTile[], saved: AnalyzerTileLayout[]):
 }
 
 export default function AnalyzerPage() {
-  const { workspace } = useOutletContext<Screen2OutletContext>();
+  const { workspace, setFocusMode } = useOutletContext<Screen2OutletContext>();
   const { pushToast } = useToast();
 
   const [loading, setLoading] = useState(false);
@@ -316,7 +326,25 @@ export default function AnalyzerPage() {
     writeLastTabId(workspaceNameRef.current, id);
   }
 
+  // Stays enabled in focus view too.
   useTabShortcuts(tabs, selectTab, true);
+
+  function stepTab(dir: 1 | -1) {
+    const current = selectedTabIdRef.current;
+    if (current == null) return;
+    const id = nextTabId(tabs, current, dir);
+    if (id !== current) selectTab(id);
+  }
+
+  const focusView = useFocusView({ setFocusMode, onError: setError });
+  const focusMode = focusView.focus;
+  const [focusOverlayHovered, setFocusOverlayHovered] = useState(false);
+  const [cycleSeconds, setCycleSeconds] = useTabCycle({
+    workspace: workspaceName,
+    active: focusMode && !focusOverlayHovered,
+    currentTabId: selectedTabId,
+    advance: () => stepTab(1),
+  });
 
   const slavesById = useMemo(() => {
     const out = new Map<number, { pollIntervalMs: number }>();
@@ -416,7 +444,8 @@ export default function AnalyzerPage() {
     };
   }, []);
 
-  // The grid host only exists while the selected tab has tiles, so re-attach when that changes.
+  // The grid host only exists while the selected tab has tiles, so re-attach when that changes
+  // (and when focus view hides or shows the chrome around it).
   useEffect(() => {
     const el = gridHostRef.current;
     if (!el) return;
@@ -451,7 +480,7 @@ export default function AnalyzerPage() {
         gridWidthMeasureTimerRef.current = null;
       }
     };
-  }, [layoutEditMode, visibleTiles.length]);
+  }, [layoutEditMode, visibleTiles.length, focusMode]);
 
   useEffect(() => {
     return () => {
@@ -1183,37 +1212,54 @@ export default function AnalyzerPage() {
   }, [tileModalEditingTile, tileSignals]);
 
   return (
-    <div className="flex flex-1 flex-col gap-4">
-      <AnalyzerControlBar
-        loading={loading}
-        trendWindowMinutes={trendWindowMinutes}
-        onChangeTrendWindowMinutes={setTrendWindowMinutes}
-        pollingWanted={pollingWanted}
-        onRun={() => void onStartPolling()}
-        onStop={() => void onStopPolling()}
-        onConfigureSignals={() => setConfigureSignalsOpen(true)}
-        onOpenConnectionSettings={() => void openConnectionModal()}
-        onAddTile={() => openAddTileModalDefault()}
-        layoutEditMode={layoutEditMode}
-        onToggleLayoutEditMode={() => setLayoutEditMode((prev) => !prev)}
-        onRefresh={() => void refreshAll()}
-        onEnterFocus={() => {}}
-      >
-        <AnalyzerTabsStrip
-          tabs={tabs}
-          selectedTabId={selectedTabId}
-          statusByTabId={statusByTabId}
-          onSelect={selectTab}
-          onCreate={createTab}
-          onRename={renameTab}
-          onReorder={reorderTabs}
-          onRequestDelete={(id) => {
-            const tab = tabs.find((t) => t.id === id) ?? null;
-            setDeleteTabError(null);
-            setDeleteTabTarget(tab);
-          }}
+    <div className={`flex flex-1 flex-col gap-4 ${focusMode ? "p-3" : ""}`}>
+      {focusMode ? (
+        <AnalyzerFocusOverlay
+          tabName={tabs.find((t) => t.id === selectedTabId)?.name ?? ""}
+          pollingWanted={pollingWanted}
+          onRun={() => void onStartPolling()}
+          onStop={() => void onStopPolling()}
+          onPrev={() => stepTab(-1)}
+          onNext={() => stepTab(1)}
+          cycleSeconds={cycleSeconds}
+          onCycleChange={setCycleSeconds}
+          fullscreen={focusView.fullscreen}
+          onToggleFullscreen={focusView.toggleFullscreen}
+          onExit={focusView.exit}
+          onHoverChange={setFocusOverlayHovered}
         />
-      </AnalyzerControlBar>
+      ) : (
+        <AnalyzerControlBar
+          loading={loading}
+          trendWindowMinutes={trendWindowMinutes}
+          onChangeTrendWindowMinutes={setTrendWindowMinutes}
+          pollingWanted={pollingWanted}
+          onRun={() => void onStartPolling()}
+          onStop={() => void onStopPolling()}
+          onConfigureSignals={() => setConfigureSignalsOpen(true)}
+          onOpenConnectionSettings={() => void openConnectionModal()}
+          onAddTile={() => openAddTileModalDefault()}
+          layoutEditMode={layoutEditMode}
+          onToggleLayoutEditMode={() => setLayoutEditMode((prev) => !prev)}
+          onRefresh={() => void refreshAll()}
+          onEnterFocus={focusView.enter}
+        >
+          <AnalyzerTabsStrip
+            tabs={tabs}
+            selectedTabId={selectedTabId}
+            statusByTabId={statusByTabId}
+            onSelect={selectTab}
+            onCreate={createTab}
+            onRename={renameTab}
+            onReorder={reorderTabs}
+            onRequestDelete={(id) => {
+              const tab = tabs.find((t) => t.id === id) ?? null;
+              setDeleteTabError(null);
+              setDeleteTabTarget(tab);
+            }}
+          />
+        </AnalyzerControlBar>
+      )}
 
       {error ? (
         <div className="rounded-xl border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-800 dark:text-rose-200">
@@ -1227,6 +1273,7 @@ export default function AnalyzerPage() {
         pollingWanted={pollingWanted}
         gridReady={gridReady}
         layoutEditMode={layoutEditMode}
+        focusMode={focusMode}
         gridHostRef={gridHostRef}
         effectiveGridWidth={effectiveGridWidth}
         gridLayouts={visibleGridLayouts}

@@ -25,6 +25,8 @@ type Props = {
 
   gridReady: boolean;
   layoutEditMode: boolean;
+  /** Focus view: no tile menus (only read-only tile information) and no layout editing. */
+  focusMode: boolean;
 
   gridHostRef: RefObject<HTMLDivElement | null>;
   effectiveGridWidth: number;
@@ -72,11 +74,12 @@ export default function AnalyzerTilesCard(props: Props) {
   const [infoTileId, setInfoTileId] = useState<number | null>(null);
   const [pickTab, setPickTab] = useState<{ mode: "move" | "duplicate"; tile: AnalyzerTile } | null>(null);
 
+  const editingLayout = props.layoutEditMode && !props.focusMode;
   const hasTiles = props.tiles.length > 0;
   const skeletonCount = Math.min(hasTiles ? props.tiles.length : 6, 6);
 
   const effectiveLayouts = useMemo(() => {
-    const makeStatic = !props.layoutEditMode;
+    const makeStatic = !editingLayout;
     const mapLayout = (items: GridLayout): GridLayout =>
       items.map((it) => ({
         ...it,
@@ -87,7 +90,7 @@ export default function AnalyzerTilesCard(props: Props) {
       desktop: mapLayout(props.gridLayouts.desktop ?? []),
       mobile: mapLayout(props.gridLayouts.mobile ?? []),
     } satisfies BreakpointLayouts;
-  }, [props.gridLayouts, props.layoutEditMode]);
+  }, [props.gridLayouts, editingLayout]);
 
   const runningByTileId = useMemo(() => {
     const out = new Map<number, boolean>();
@@ -119,6 +122,8 @@ export default function AnalyzerTilesCard(props: Props) {
 
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key !== "Escape") return;
+      // Handled: the page's focus-view Escape (on window) skips prevented events.
+      e.preventDefault();
       setTileMenuOpenId(null);
     };
 
@@ -144,7 +149,7 @@ export default function AnalyzerTilesCard(props: Props) {
 
   return (
     <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm dark:border-slate-800/70 dark:bg-slate-900/60">
-      {props.layoutEditMode ? (
+      {editingLayout ? (
         <div className="text-xs text-amber-800 dark:text-amber-200">Drag tiles to move. Resize from the bottom-right corner.</div>
       ) : null}
 
@@ -169,26 +174,28 @@ export default function AnalyzerTilesCard(props: Props) {
               </div>
             </>
           )}
-          <div className="mt-1 flex flex-wrap items-center justify-center gap-2">
-            {props.workspaceHasTiles ? null : (
+          {props.focusMode ? null : (
+            <div className="mt-1 flex flex-wrap items-center justify-center gap-2">
+              {props.workspaceHasTiles ? null : (
+                <button
+                  type="button"
+                  className="inline-flex items-center gap-2 rounded-full border border-emerald-600/60 bg-emerald-500/10 px-4 py-2 text-xs font-semibold text-emerald-800 transition hover:border-emerald-500 hover:text-emerald-900 dark:border-emerald-500/60 dark:text-emerald-200 dark:hover:border-emerald-400 dark:hover:text-emerald-100"
+                  onClick={props.onConfigureSignals}
+                >
+                  <FiSettings className="h-4 w-4" aria-hidden="true" />
+                  Configure Signals
+                </button>
+              )}
               <button
                 type="button"
-                className="inline-flex items-center gap-2 rounded-full border border-emerald-600/60 bg-emerald-500/10 px-4 py-2 text-xs font-semibold text-emerald-800 transition hover:border-emerald-500 hover:text-emerald-900 dark:border-emerald-500/60 dark:text-emerald-200 dark:hover:border-emerald-400 dark:hover:text-emerald-100"
-                onClick={props.onConfigureSignals}
+                className="inline-flex items-center gap-2 rounded-full border border-slate-300 bg-slate-100 px-4 py-2 text-xs font-semibold text-slate-700 transition hover:border-slate-400 dark:border-slate-700 dark:bg-white/5 dark:text-slate-100 dark:hover:border-slate-600"
+                onClick={props.onAddTile}
               >
-                <FiSettings className="h-4 w-4" aria-hidden="true" />
-                Configure Signals
+                <FiPlus className="h-4 w-4" aria-hidden="true" />
+                Add a tile
               </button>
-            )}
-            <button
-              type="button"
-              className="inline-flex items-center gap-2 rounded-full border border-slate-300 bg-slate-100 px-4 py-2 text-xs font-semibold text-slate-700 transition hover:border-slate-400 dark:border-slate-700 dark:bg-white/5 dark:text-slate-100 dark:hover:border-slate-600"
-              onClick={props.onAddTile}
-            >
-              <FiPlus className="h-4 w-4" aria-hidden="true" />
-              Add a tile
-            </button>
-          </div>
+            </div>
+          )}
         </div>
       ) : (
         <div
@@ -205,12 +212,12 @@ export default function AnalyzerTilesCard(props: Props) {
               rowHeight={22}
               margin={[12, 12]}
               containerPadding={[0, 0]}
-              isDraggable={props.layoutEditMode}
-              isResizable={props.layoutEditMode}
+              isDraggable={editingLayout}
+              isResizable={editingLayout}
               draggableHandle=".tile-drag-handle"
-              resizeHandles={props.layoutEditMode ? ["se"] : []}
+              resizeHandles={editingLayout ? ["se"] : []}
               onLayoutChange={(current: unknown, all: unknown) => {
-                if (!props.layoutEditMode) return;
+                if (!editingLayout) return;
                 const nextAll = coerceBreakpointLayouts(all);
                 props.onGridLayoutsChange(nextAll);
                 props.schedulePersistLayouts(props.derivedBreakpoint, coerceGridLayout(current));
@@ -243,7 +250,7 @@ export default function AnalyzerTilesCard(props: Props) {
                   className={`relative flex h-full flex-col overflow-visible rounded-2xl border border-slate-200 bg-slate-50/70 p-4 dark:border-slate-800 dark:bg-slate-950/30 ${tileMenuOpenId === t.id ? "z-10" : ""}`}
                 >
                   <div
-                    className={`tile-drag-handle flex items-start justify-between gap-3 ${props.layoutEditMode ? "cursor-move" : "cursor-default"}`}
+                    className={`tile-drag-handle flex items-start justify-between gap-3 ${editingLayout ? "cursor-move" : "cursor-default"}`}
                   >
                     <div className="min-w-0">
                       <div
@@ -266,22 +273,34 @@ export default function AnalyzerTilesCard(props: Props) {
                     </div>
 
                     <div className="flex shrink-0 items-center gap-2">
-                      <button
-                        type="button"
-                        data-tile-menu-btn
-                        className="rounded-xl border border-slate-300 bg-slate-100 p-2 text-slate-700 transition hover:border-slate-400 dark:border-slate-700 dark:bg-white/5 dark:text-slate-200 dark:hover:border-slate-600"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          setTileMenuOpenId((prev) => (prev === t.id ? null : t.id));
-                        }}
-                        title="Tile menu"
-                      >
-                        <FiMoreVertical className="h-4 w-4" />
-                      </button>
+                      {props.focusMode ? (
+                        <button
+                          type="button"
+                          className="rounded-xl border border-slate-300 bg-slate-100 p-2 text-slate-700 transition hover:border-slate-400 dark:border-slate-700 dark:bg-white/5 dark:text-slate-200 dark:hover:border-slate-600"
+                          onClick={() => setInfoTileId(t.id)}
+                          aria-label="Tile information"
+                          title="Tile information"
+                        >
+                          <RiInformation2Line className="h-4 w-4" aria-hidden="true" />
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          data-tile-menu-btn
+                          className="rounded-xl border border-slate-300 bg-slate-100 p-2 text-slate-700 transition hover:border-slate-400 dark:border-slate-700 dark:bg-white/5 dark:text-slate-200 dark:hover:border-slate-600"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setTileMenuOpenId((prev) => (prev === t.id ? null : t.id));
+                          }}
+                          title="Tile menu"
+                        >
+                          <FiMoreVertical className="h-4 w-4" />
+                        </button>
+                      )}
                     </div>
                   </div>
 
-                  {tileMenuOpenId === t.id ? (
+                  {tileMenuOpenId === t.id && !props.focusMode ? (
                     <div
                       data-tile-menu-root
                       className="absolute right-3 top-12 z-50 w-44 rounded-xl border border-slate-200 bg-white p-1 shadow-sm dark:border-slate-700 dark:bg-slate-950/95"
@@ -399,7 +418,7 @@ export default function AnalyzerTilesCard(props: Props) {
                     </div>
                   )}
 
-                  {props.layoutEditMode ? (
+                  {editingLayout ? (
                     <div className="pointer-events-none absolute bottom-1 right-1 text-slate-400/80 dark:text-slate-500/80">
                       <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
                         <path d="M6 14L14 6" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" />

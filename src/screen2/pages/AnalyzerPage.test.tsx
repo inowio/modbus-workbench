@@ -1,5 +1,5 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import AnalyzerPage from "./AnalyzerPage";
 
 const invokeMock = vi.fn();
@@ -24,7 +24,13 @@ const reorderAnalyzerTabsMock = vi.fn();
 const deleteAnalyzerTabMock = vi.fn();
 const moveAnalyzerTileToTabMock = vi.fn();
 const duplicateAnalyzerTileMock = vi.fn();
+const setFocusModeMock = vi.fn();
+const setWindowFullscreenMock = vi.fn();
+const isWindowFullscreenMock = vi.fn();
+const onWindowResizedMock = vi.fn();
 let lastTilesCardProps: any = null;
+/** Render the real AnalyzerTilesCard instead of the light mock below (Review Focus 4). */
+let useRealTilesCard = false;
 
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: (...args: unknown[]) => invokeMock(...args),
@@ -40,9 +46,20 @@ vi.mock("react-router-dom", async () => {
     ...actual,
     useOutletContext: () => ({
       workspace: { name: "UnitTest", created_at: "", updated_at: "" },
+      setFocusMode: setFocusModeMock,
     }),
   };
 });
+
+vi.mock("../utils/windowFullscreen", () => ({
+  setWindowFullscreen: (...args: unknown[]) => setWindowFullscreenMock(...args),
+  isWindowFullscreen: (...args: unknown[]) => isWindowFullscreenMock(...args),
+  onWindowResized: (...args: unknown[]) => onWindowResizedMock(...args),
+}));
+
+vi.mock("react-grid-layout", () => ({
+  Responsive: (props: any) => <div>{props.children}</div>,
+}));
 
 vi.mock("../../components/ToastProvider", () => ({
   useToast: () => ({ pushToast: pushToastMock }),
@@ -101,6 +118,9 @@ vi.mock("./analyzer/AnalyzerControlBar", () => ({
       <button type="button" onClick={props.onAddTile}>
         Add Tile
       </button>
+      <button type="button" onClick={props.onEnterFocus}>
+        Focus view
+      </button>
       {props.children}
     </div>
   ),
@@ -129,10 +149,13 @@ vi.mock("../components/ConnectionSettingsForm", async () => {
   };
 });
 
-vi.mock("./analyzer/AnalyzerTilesCard", () => ({
+vi.mock("./analyzer/AnalyzerTilesCard", async () => {
+  const actual = await vi.importActual<typeof import("./analyzer/AnalyzerTilesCard")>("./analyzer/AnalyzerTilesCard");
+  return {
   __esModule: true,
   default: (props: any) => {
     lastTilesCardProps = props;
+    if (useRealTilesCard) return <actual.default {...props} />;
     return (
     <div>
       {props.tiles.map((t: any) => (
@@ -165,7 +188,8 @@ vi.mock("./analyzer/AnalyzerTilesCard", () => ({
     </div>
     );
   },
-}));
+  };
+});
 
 const MAIN = { id: 1, name: "Main", position: 0 };
 const BOILER = { id: 2, name: "Boiler", position: 1 };
@@ -266,6 +290,10 @@ describe("AnalyzerPage", () => {
     vi.clearAllMocks();
     window.localStorage.clear();
     lastTilesCardProps = null;
+    useRealTilesCard = false;
+    setWindowFullscreenMock.mockResolvedValue(undefined);
+    isWindowFullscreenMock.mockResolvedValue(false);
+    onWindowResizedMock.mockResolvedValue(() => {});
     setupAnalyzerData();
   });
 
@@ -850,6 +878,234 @@ describe("AnalyzerPage", () => {
         press("3");
         expect(selectedTabName()).toBe("Boiler");
       });
+    });
+  });
+
+  describe("focus view", () => {
+    const widget = (id: number, tabId: number) => ({
+      id,
+      kind: "widget",
+      title: `W${id}`,
+      configJson: "{}",
+      pollingEnabled: true,
+      createdAt: "",
+      updatedAt: "",
+      tabId,
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    async function renderThreeTabs() {
+      setupAnalyzerData({ tiles: [widget(1, 1), widget(2, 2), widget(3, 3)], tabs: [MAIN, BOILER, POWER] });
+      const view = render(<AnalyzerPage />);
+      await screen.findByTestId("tile-1");
+      return view;
+    }
+
+    function enterFocus() {
+      fireEvent.click(screen.getByRole("button", { name: "Focus view" }));
+    }
+
+    /** The overlay hides after 2 s idle; a mouse move brings it back. */
+    function overlayButton(name: string) {
+      fireEvent.mouseMove(window);
+      return screen.getByRole("button", { name });
+    }
+
+    const shownTiles = () => screen.queryAllByTestId(/^tile-/).map((el) => el.getAttribute("data-testid"));
+    const chromeShown = () =>
+      screen.queryByRole("tablist") != null && screen.queryByRole("button", { name: "Refresh" }) != null;
+    const pressEscape = () => fireEvent.keyDown(document.body, { key: "Escape" });
+
+    it("enters from the control bar, hides the control bar and tabs strip, and Exit restores them", async () => {
+      await renderThreeTabs();
+      expect(chromeShown()).toBe(true);
+
+      enterFocus();
+      expect(setFocusModeMock).toHaveBeenLastCalledWith(true);
+      expect(screen.queryByRole("tablist")).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Refresh" })).not.toBeInTheDocument();
+      expect(lastTilesCardProps.focusMode).toBe(true);
+      expect(shownTiles()).toEqual(["tile-1"]);
+
+      fireEvent.click(overlayButton("Exit focus view"));
+      expect(setFocusModeMock).toHaveBeenLastCalledWith(false);
+      expect(chromeShown()).toBe(true);
+      expect(lastTilesCardProps.focusMode).toBe(false);
+      expect(screen.queryByRole("button", { name: "Exit focus view" })).not.toBeInTheDocument();
+    });
+
+    it("Esc exits focus view; without full screen the window is left alone", async () => {
+      await renderThreeTabs();
+      enterFocus();
+      pressEscape();
+      expect(setFocusModeMock).toHaveBeenLastCalledWith(false);
+      expect(chromeShown()).toBe(true);
+      expect(setWindowFullscreenMock).not.toHaveBeenCalled();
+    });
+
+    it("full screen toggles the window, and exiting focus view with Esc leaves full screen", async () => {
+      await renderThreeTabs();
+      enterFocus();
+      fireEvent.click(overlayButton("Full screen"));
+      expect(setWindowFullscreenMock).toHaveBeenLastCalledWith(true);
+      await waitFor(() => expect(overlayButton("Full screen")).toHaveAttribute("aria-pressed", "true"));
+
+      pressEscape();
+      expect(setWindowFullscreenMock).toHaveBeenLastCalledWith(false);
+      expect(setFocusModeMock).toHaveBeenLastCalledWith(false);
+      expect(chromeShown()).toBe(true);
+    });
+
+    it("when the OS leaves full screen by itself, the toggle turns off and focus view stays", async () => {
+      let resized: (() => void) | null = null;
+      onWindowResizedMock.mockImplementation(async (cb: () => void) => {
+        resized = cb;
+        return () => {};
+      });
+      await renderThreeTabs();
+      enterFocus();
+      fireEvent.click(overlayButton("Full screen"));
+      await waitFor(() => expect(overlayButton("Full screen")).toHaveAttribute("aria-pressed", "true"));
+      await waitFor(() => expect(resized).not.toBeNull());
+
+      isWindowFullscreenMock.mockResolvedValue(false);
+      await act(async () => {
+        resized!();
+      });
+      await waitFor(() => expect(overlayButton("Full screen")).toHaveAttribute("aria-pressed", "false"));
+      expect(setFocusModeMock).not.toHaveBeenCalledWith(false);
+      expect(screen.queryByRole("tablist")).not.toBeInTheDocument();
+
+      // Exiting now has no full screen to leave.
+      setWindowFullscreenMock.mockClear();
+      pressEscape();
+      expect(setFocusModeMock).toHaveBeenLastCalledWith(false);
+      expect(setWindowFullscreenMock).not.toHaveBeenCalled();
+    });
+
+    it("leaving the page while in focus view resets focus mode and full screen", async () => {
+      const { unmount } = await renderThreeTabs();
+      enterFocus();
+      fireEvent.click(overlayButton("Full screen"));
+      await waitFor(() => expect(overlayButton("Full screen")).toHaveAttribute("aria-pressed", "true"));
+
+      unmount();
+      expect(setFocusModeMock).toHaveBeenLastCalledWith(false);
+      expect(setWindowFullscreenMock).toHaveBeenLastCalledWith(false);
+    });
+
+    it("previous / next switch tabs with wrap-around, and Ctrl+digit still works", async () => {
+      await renderThreeTabs();
+      enterFocus();
+      fireEvent.click(overlayButton("Previous tab"));
+      expect(shownTiles()).toEqual(["tile-3"]);
+      expect(screen.getByRole("toolbar", { name: "Focus view controls" })).toHaveTextContent("Power");
+      fireEvent.click(overlayButton("Next tab"));
+      expect(shownTiles()).toEqual(["tile-1"]);
+
+      fireEvent.keyDown(document.body, { key: "2", ctrlKey: true });
+      expect(shownTiles()).toEqual(["tile-2"]);
+      expect(screen.queryByRole("tablist")).not.toBeInTheDocument();
+    });
+
+    it("Run / Stop in the overlay start and stop polling", async () => {
+      await renderThreeTabs();
+      enterFocus();
+      fireEvent.click(overlayButton("Run"));
+      await waitFor(() => expect(startAnalyzerPollingMock).toHaveBeenCalledWith("UnitTest"));
+      fireEvent.click(overlayButton("Stop"));
+      await waitFor(() => expect(stopAnalyzerPollingMock).toHaveBeenCalledWith("UnitTest"));
+    });
+
+    it("cycles tabs every 10 s with wrap-around, pauses while hovered, persists the choice, and keeps polling", async () => {
+      await renderThreeTabs();
+      fireEvent.click(screen.getByRole("button", { name: /start polling/i }));
+      await waitFor(() => expect(startAnalyzerPollingMock).toHaveBeenCalled());
+      enterFocus();
+
+      vi.useFakeTimers();
+      fireEvent.mouseMove(window);
+      fireEvent.change(screen.getByRole("combobox", { name: "Cycle tabs" }), { target: { value: "10" } });
+      expect(window.localStorage.getItem("inowio.analyzer.cycle.UnitTest")).toBe("10");
+
+      act(() => vi.advanceTimersByTime(9999));
+      expect(shownTiles()).toEqual(["tile-1"]);
+      act(() => vi.advanceTimersByTime(1));
+      expect(shownTiles()).toEqual(["tile-2"]);
+      act(() => vi.advanceTimersByTime(10_000));
+      expect(shownTiles()).toEqual(["tile-3"]);
+      act(() => vi.advanceTimersByTime(10_000));
+      expect(shownTiles()).toEqual(["tile-1"]);
+
+      // Hovering the overlay pauses cycling; leaving it starts a fresh period.
+      fireEvent.mouseMove(window);
+      const bar = screen.getByRole("toolbar", { name: "Focus view controls" });
+      fireEvent.mouseEnter(bar);
+      act(() => vi.advanceTimersByTime(30_000));
+      expect(shownTiles()).toEqual(["tile-1"]);
+      fireEvent.mouseLeave(bar);
+      act(() => vi.advanceTimersByTime(10_000));
+      expect(shownTiles()).toEqual(["tile-2"]);
+
+      expect(stopAnalyzerPollingMock).not.toHaveBeenCalled();
+    });
+
+    it("reads the remembered cycle value and does not cycle outside focus view", async () => {
+      window.localStorage.setItem("inowio.analyzer.cycle.UnitTest", "30");
+      await renderThreeTabs();
+      enterFocus();
+      fireEvent.mouseMove(window);
+      expect(screen.getByRole("combobox", { name: "Cycle tabs" })).toHaveValue("30");
+      fireEvent.click(overlayButton("Exit focus view"));
+
+      vi.useFakeTimers();
+      act(() => vi.advanceTimersByTime(60_000));
+      expect(shownTiles()).toEqual(["tile-1"]);
+    });
+
+    it("Esc closes a tile's Info popover first and keeps focus view; the next Esc exits (Review Focus 4)", async () => {
+      useRealTilesCard = true;
+      const realResizeObserver = globalThis.ResizeObserver;
+      globalThis.ResizeObserver = class {
+        observe() {}
+        unobserve() {}
+        disconnect() {}
+      } as unknown as typeof ResizeObserver;
+      const rect = vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue({
+        width: 800,
+        height: 600,
+        top: 0,
+        left: 0,
+        right: 800,
+        bottom: 600,
+        x: 0,
+        y: 0,
+        toJSON: () => ({}),
+      } as DOMRect);
+      try {
+        render(<AnalyzerPage />);
+        await screen.findByTitle("Tile menu");
+        enterFocus();
+        expect(screen.queryByTitle("Tile menu")).not.toBeInTheDocument();
+
+        fireEvent.click(screen.getByRole("button", { name: "Tile information" }));
+        expect(screen.getByRole("dialog")).toBeInTheDocument();
+
+        pressEscape();
+        await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+        expect(setFocusModeMock).not.toHaveBeenCalledWith(false);
+        expect(screen.queryByRole("tablist")).not.toBeInTheDocument();
+
+        pressEscape();
+        expect(setFocusModeMock).toHaveBeenLastCalledWith(false);
+        expect(chromeShown()).toBe(true);
+      } finally {
+        rect.mockRestore();
+        globalThis.ResizeObserver = realResizeObserver;
+      }
     });
   });
 });

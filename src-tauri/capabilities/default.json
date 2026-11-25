@@ -9,6 +9,8 @@
     "fs:default",
     "fs:write-all",
     "core:window:allow-set-title",
+    "core:window:allow-set-fullscreen",
+    "core:window:allow-is-fullscreen",
     "updater:default",
     "process:allow-restart",
     "opener:default",
