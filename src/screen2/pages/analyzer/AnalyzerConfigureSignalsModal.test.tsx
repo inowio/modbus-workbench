@@ -66,10 +66,34 @@ describe("AnalyzerConfigureSignalsModal list", () => {
     expect(screen.queryByText(/Slave #null/)).toBeNull();
   });
 
-  it("shows the backend delete error as-is", async () => {
+  it("a signal used by a calculated signal says so up front and offers to edit it, with no Delete", async () => {
+    renderModal([signal("A"), CALC]);
+    fireEvent.click(screen.getByRole("button", { name: "Delete A" }));
+    expect(screen.getByText("Can't delete this signal yet")).toBeTruthy();
+    expect(screen.getByText("Calc_1", { selector: "li" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Delete" })).toBeNull();
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Edit Calc_1" }));
+    });
+    expect(deleteSignal).not.toHaveBeenCalled();
+    expect(screen.getByText("Edit signal · Calc_1")).toBeTruthy();
+  });
+
+  it("an unused signal still gets the normal Delete confirmation", async () => {
+    deleteSignal.mockResolvedValueOnce(undefined);
+    renderModal([signal("A"), signal("B"), CALC]);
+    fireEvent.click(screen.getByRole("button", { name: "Delete Calc_1" }));
+    expect(screen.getByText("Delete signal")).toBeTruthy();
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+    });
+    expect(deleteSignal).toHaveBeenCalledWith("ws", "Calc_1");
+  });
+
+  it("shows the backend delete error as-is (list out of date)", async () => {
     const message = 'Signal "A" is used by calculated signal(s): Calc_1. Remove it from their inputs first.';
     deleteSignal.mockRejectedValueOnce(message);
-    renderModal([signal("A"), CALC]);
+    renderModal([signal("A")]);
     fireEvent.click(screen.getByRole("button", { name: "Delete A" }));
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Delete" }));

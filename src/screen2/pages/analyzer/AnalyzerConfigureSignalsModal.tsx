@@ -11,6 +11,7 @@ import type { SlaveItem } from "../../api/slaves";
 import type { SignalEvaluation } from "../../utils/analyzerSignalEval";
 import { formatAnalyzerAddress, type AnalyzerAddressFormat } from "../../utils/analyzerAddressFormat";
 import SignalEditorPanel from "./signalEditor/SignalEditorPanel";
+import { dependentsBySignalId } from "./signalEvaluations";
 
 type Props = {
   open: boolean;
@@ -54,6 +55,12 @@ export default function AnalyzerConfigureSignalsModal(props: Props) {
     if (!sid) return null;
     return props.signals.find((s) => s.id === sid) ?? null;
   }, [props.signals, signalIdToDelete]);
+
+  /** Calculated signals that use the signal about to be deleted (the backend refuses the delete then). */
+  const blockingDependents = useMemo(() => {
+    if (!signalToDelete) return [];
+    return dependentsBySignalId(props.signals)[signalToDelete.id] ?? [];
+  }, [props.signals, signalToDelete]);
 
   const slaveById = useMemo(() => {
     const out = new Map<number, SlaveItem>();
@@ -290,27 +297,63 @@ export default function AnalyzerConfigureSignalsModal(props: Props) {
         </div>
       </div>
 
-      <ConfirmDialog
-        open={signalIdToDelete != null}
-        title="Delete signal"
-        description={
-          <div className="text-xs">
-            Delete <span className="font-semibold text-slate-900 dark:text-slate-100">{signalToDelete?.id}</span>?
-            <div className="mt-2 text-slate-600 dark:text-slate-300">This will also unlink it from any tiles that reference it.</div>
-          </div>
-        }
-        confirmText={deleting ? "Deleting..." : "Delete"}
-        cancelText="Cancel"
-        tone="danger"
-        busy={deleting}
-        error={deleteError}
-        onClose={() => {
-          if (deleting) return;
-          setDeleteError(null);
-          setSignalIdToDelete(null);
-        }}
-        onConfirm={() => void confirmDelete()}
-      />
+      {blockingDependents.length > 0 ? (
+        // Known up front: say why it can't be deleted and offer the fix, instead of a Delete that always fails.
+        <ConfirmDialog
+          open={signalIdToDelete != null}
+          title="Can't delete this signal yet"
+          description={
+            <div className="text-xs">
+              <span className="font-semibold text-slate-900 dark:text-slate-100">{signalToDelete?.id}</span> is an input of{" "}
+              {blockingDependents.length === 1 ? "this calculated signal" : "these calculated signals"}:
+              <ul className="mt-2 list-disc pl-5 font-semibold text-slate-900 dark:text-slate-100">
+                {blockingDependents.map((id) => (
+                  <li key={id}>{id}</li>
+                ))}
+              </ul>
+              <div className="mt-2 text-slate-600 dark:text-slate-300">
+                Remove it from {blockingDependents.length === 1 ? "that signal's" : "their"} inputs (Math tab), or delete{" "}
+                {blockingDependents.length === 1 ? "that signal" : "them"} first.
+              </div>
+            </div>
+          }
+          confirmText={`Edit ${blockingDependents[0]}`}
+          cancelText="Close"
+          onClose={() => {
+            setDeleteError(null);
+            setSignalIdToDelete(null);
+          }}
+          onConfirm={() => {
+            const target = blockingDependents[0];
+            setDeleteError(null);
+            setSignalIdToDelete(null);
+            setSelectedSignalId(target);
+            setMode("edit");
+          }}
+        />
+      ) : (
+        <ConfirmDialog
+          open={signalIdToDelete != null}
+          title="Delete signal"
+          description={
+            <div className="text-xs">
+              Delete <span className="font-semibold text-slate-900 dark:text-slate-100">{signalToDelete?.id}</span>?
+              <div className="mt-2 text-slate-600 dark:text-slate-300">This will also unlink it from any tiles that reference it.</div>
+            </div>
+          }
+          confirmText={deleting ? "Deleting..." : "Delete"}
+          cancelText="Cancel"
+          tone="danger"
+          busy={deleting}
+          error={deleteError}
+          onClose={() => {
+            if (deleting) return;
+            setDeleteError(null);
+            setSignalIdToDelete(null);
+          }}
+          onConfirm={() => void confirmDelete()}
+        />
+      )}
     </div>
   );
 }
