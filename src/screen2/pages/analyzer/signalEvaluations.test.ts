@@ -114,6 +114,7 @@ describe("signalEvaluations", () => {
       pollingEnabled: true,
       createdAt: "",
       updatedAt: "",
+      tabId: 1,
     });
     const link = (tileId: number, signalId: string, role = "primary"): AnalyzerTileSignalInfo =>
       ({ tileId, signalId, role }) as AnalyzerTileSignalInfo;

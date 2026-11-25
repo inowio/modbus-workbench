@@ -7,19 +7,26 @@ import ConfirmDialog from "../../components/ConfirmDialog";
 import { useErrorToast, useToast } from "../../components/ToastProvider";
 import { FiActivity, FiSave } from "react-icons/fi";
 import {
+  createAnalyzerTab,
   createAnalyzerTile,
+  deleteAnalyzerTab,
   deleteAnalyzerTile,
   listAnalyzerSignals,
+  listAnalyzerTabs,
   listAnalyzerTileLayouts,
   listAnalyzerTileSignals,
   listAnalyzerTiles,
+  renameAnalyzerTab,
+  reorderAnalyzerTabs,
   saveAnalyzerTileLayouts,
   setAnalyzerTilePollingEnabled,
   startAnalyzerPolling,
   stopAnalyzerPolling,
   updateAnalyzerTile,
   type AnalyzerSignal,
+  type AnalyzerTab,
   type AnalyzerTile,
+  type AnalyzerTileLayout,
   type AnalyzerTileSignalInfo,
 } from "../api/analyzer";
 import type { SignalEvaluation } from "../utils/analyzerSignalEval";
@@ -35,6 +42,9 @@ import AnalyzerControlBar from "./analyzer/AnalyzerControlBar";
 import AnalyzerTilesCard from "./analyzer/AnalyzerTilesCard";
 import AnalyzerAddEditTileModal from "./analyzer/AnalyzerAddEditTileModal";
 import AnalyzerConfigureSignalsModal from "./analyzer/AnalyzerConfigureSignalsModal";
+import AnalyzerTabsStrip from "./analyzer/AnalyzerTabsStrip";
+import DeleteTabDialog from "./analyzer/DeleteTabDialog";
+import { readLastTabId, resolveSelectedTab, writeLastTabId } from "./analyzer/tabs";
 import { getChartKind } from "./analyzer/chartKind";
 import { computeSignalEvaluations, dependentsBySignalId, type LiveSignalUpdate } from "./analyzer/signalEvaluations";
 import type { BreakpointLayouts, GridLayout } from "./analyzer/layoutTypes";
@@ -60,6 +70,25 @@ type AnalyzerPollingBackoffEvent = {
   attempt: number;
 };
 
+type PendingLayoutSave = { tileId: number; breakpoint: "desktop" | "mobile"; x: number; y: number; w: number; h: number };
+
+/** Default placement is per tab (each tab's grid starts at the top), saved rows override it. */
+function buildLayoutsPerTab(tiles: AnalyzerTile[], saved: AnalyzerTileLayout[]): BreakpointLayouts {
+  const byTab = new Map<number, AnalyzerTile[]>();
+  for (const t of tiles) {
+    const group = byTab.get(t.tabId) ?? [];
+    group.push(t);
+    byTab.set(t.tabId, group);
+  }
+  const out: BreakpointLayouts = { desktop: [], mobile: [] };
+  for (const group of byTab.values()) {
+    const layouts = buildLayoutsFromSaved(group, saved);
+    out.desktop.push(...layouts.desktop);
+    out.mobile.push(...layouts.mobile);
+  }
+  return out;
+}
+
 export default function AnalyzerPage() {
   const { workspace } = useOutletContext<Screen2OutletContext>();
   const { pushToast } = useToast();
@@ -78,9 +107,18 @@ export default function AnalyzerPage() {
   const [tileSignals, setTileSignals] = useState<Record<number, AnalyzerTileSignalInfo[]>>({});
   const tileSignalsRef = useRef(tileSignals);
 
+  const [tabs, setTabs] = useState<AnalyzerTab[]>([]);
+  const [selectedTabId, setSelectedTabId] = useState<number | null>(null);
+  const selectedTabIdRef = useRef<number | null>(null);
+  const [deleteTabTarget, setDeleteTabTarget] = useState<AnalyzerTab | null>(null);
+  const [deleteTabBusy, setDeleteTabBusy] = useState(false);
+  const [deleteTabError, setDeleteTabError] = useState<string | null>(null);
+
   const [layoutEditMode, setLayoutEditMode] = useState(false);
+  // Layouts of every tile on every tab; the grid only gets the selected tab's.
   const [gridLayouts, setGridLayouts] = useState<BreakpointLayouts>({ desktop: [], mobile: [] });
   const layoutSaveTimerRef = useRef<number | null>(null);
+  const pendingLayoutSavesRef = useRef<Map<string, PendingLayoutSave>>(new Map());
   const gridHostRef = useRef<HTMLDivElement | null>(null);
   const [gridWidth, setGridWidth] = useState<number>(0);
   const gridWidthMeasureTimerRef = useRef<number | null>(null);
@@ -237,6 +275,45 @@ export default function AnalyzerPage() {
     tilesRef.current = tiles;
   }, [tiles]);
 
+  // A tile whose tab is unknown (never expected: the backend reads NULL as the first tab) shows on the first tab.
+  const tabIdOfTile = useMemo(() => {
+    const known = new Set(tabs.map((t) => t.id));
+    const firstTabId = resolveSelectedTab(tabs, null);
+    return (tile: AnalyzerTile) => (known.has(tile.tabId) ? tile.tabId : firstTabId);
+  }, [tabs]);
+
+  // Only rendering is filtered by tab: live values and trend history stay page-wide for all tiles.
+  const visibleTiles = useMemo(
+    () => (selectedTabId == null ? [] : tiles.filter((t) => tabIdOfTile(t) === selectedTabId)),
+    [tiles, selectedTabId, tabIdOfTile],
+  );
+
+  const visibleGridLayouts = useMemo<BreakpointLayouts>(() => {
+    const ids = new Set(visibleTiles.map((t) => String(t.id)));
+    return {
+      desktop: gridLayouts.desktop.filter((l) => ids.has(l.i)),
+      mobile: gridLayouts.mobile.filter((l) => ids.has(l.i)),
+    };
+  }, [gridLayouts, visibleTiles]);
+
+  // The grid reports only the selected tab's tiles: replace those and keep every other tab's layouts.
+  function onVisibleGridLayoutsChange(next: BreakpointLayouts) {
+    const merge = (prev: GridLayout, incoming: GridLayout): GridLayout => {
+      const ids = new Set(incoming.map((l) => l.i));
+      return [...prev.filter((l) => !ids.has(l.i)), ...incoming];
+    };
+    setGridLayouts((prev) => ({
+      desktop: merge(prev.desktop, next.desktop),
+      mobile: merge(prev.mobile, next.mobile),
+    }));
+  }
+
+  function selectTab(id: number) {
+    selectedTabIdRef.current = id;
+    setSelectedTabId(id);
+    writeLastTabId(workspaceNameRef.current, id);
+  }
+
   const slavesById = useMemo(() => {
     const out = new Map<number, { pollIntervalMs: number }>();
     for (const s of slaves) {
@@ -335,6 +412,7 @@ export default function AnalyzerPage() {
     };
   }, []);
 
+  // The grid host only exists while the selected tab has tiles, so re-attach when that changes.
   useEffect(() => {
     const el = gridHostRef.current;
     if (!el) return;
@@ -369,7 +447,7 @@ export default function AnalyzerPage() {
         gridWidthMeasureTimerRef.current = null;
       }
     };
-  }, [layoutEditMode, tiles.length]);
+  }, [layoutEditMode, visibleTiles.length]);
 
   useEffect(() => {
     return () => {
@@ -532,17 +610,105 @@ export default function AnalyzerPage() {
     }
     setTileSignals(next);
 
-    setGridLayouts(buildLayoutsFromSaved(rows, savedLayouts));
+    setGridLayouts(buildLayoutsPerTab(rows, savedLayouts));
 
     return rows;
+  }
+
+  /** Loads tabs and selects `wanted` (default: the current or remembered tab), falling back to the first tab. */
+  async function refreshTabs(wanted?: number | null): Promise<AnalyzerTab[]> {
+    const ws = workspaceName;
+    const rows = await listAnalyzerTabs(ws);
+    setTabs(rows);
+    const want = wanted !== undefined ? wanted : (selectedTabIdRef.current ?? readLastTabId(ws));
+    const id = resolveSelectedTab(rows, want);
+    if (id > 0) selectTab(id);
+    return rows;
+  }
+
+  async function createTab(name: string) {
+    const tab = await createAnalyzerTab(workspaceName, name);
+    setTabs((prev) => [...prev, tab]);
+    selectTab(tab.id);
+    logWorkspace("info", "Analyzer tab created", { tabId: tab.id, name: tab.name });
+  }
+
+  async function renameTab(id: number, name: string) {
+    const updated = await renameAnalyzerTab(workspaceName, id, name);
+    setTabs((prev) => prev.map((t) => (t.id === updated.id ? updated : t)));
+    logWorkspace("info", "Analyzer tab renamed", { tabId: updated.id, name: updated.name });
+  }
+
+  async function reorderTabs(ids: number[]) {
+    setTabs((prev) =>
+      prev.map((t) => {
+        const position = ids.indexOf(t.id);
+        return position >= 0 ? { ...t, position } : t;
+      }),
+    );
+    try {
+      await reorderAnalyzerTabs(workspaceName, ids);
+    } catch (e) {
+      logWorkspace("error", "Analyzer tab reorder failed", { error: String(e) });
+      setError(String(e));
+      try {
+        await refreshTabs();
+      } catch {
+        /* the reorder error is already shown */
+      }
+    }
+  }
+
+  function confirmDeleteTab(opts: { moveTilesTo?: number; deleteTiles?: boolean }) {
+    const tab = deleteTabTarget;
+    if (!tab) return;
+    setDeleteTabBusy(true);
+    setDeleteTabError(null);
+    void (async () => {
+      try {
+        await deleteAnalyzerTab(workspaceName, tab.id, opts);
+      } catch (e) {
+        logWorkspace("error", "Analyzer tab delete failed", { tabId: tab.id, error: String(e) });
+        setDeleteTabError(String(e));
+        setDeleteTabBusy(false);
+        return;
+      }
+      logWorkspace("info", "Analyzer tab deleted", { tabId: tab.id, ...opts });
+      setDeleteTabTarget(null);
+      setDeleteTabBusy(false);
+      pushToast("Tab deleted", "info");
+      // Deleting the selected tab lands on the move target, or the first tab when its tiles were deleted.
+      const current = selectedTabIdRef.current;
+      const wanted = current === tab.id ? (opts.moveTilesTo ?? null) : current;
+      try {
+        await Promise.all([refreshTabs(wanted), refreshTiles()]);
+      } catch (e) {
+        setError(String(e));
+      }
+    })();
   }
 
   async function deleteTile(tile: AnalyzerTile) {
     setConfirmDeleteTile(tile);
   }
 
+  // Saves upsert one (tile, breakpoint) row each, so only the tiles the grid shows (the selected tab's) are written.
+  // Pending rows are keyed per tile+breakpoint so switching tabs within the debounce doesn't drop the previous tab's.
   function schedulePersistLayouts(breakpoint: "desktop" | "mobile", layout: GridLayout) {
     if (!layoutEditMode) return;
+
+    for (const item of layout) {
+      const tileId = Number(item.i);
+      if (!Number.isFinite(tileId) || tileId <= 0) continue;
+      pendingLayoutSavesRef.current.set(`${tileId}:${breakpoint}`, {
+        tileId,
+        breakpoint,
+        x: Math.max(0, Math.round(item.x)),
+        y: Math.max(0, Math.round(item.y)),
+        w: Math.max(1, Math.round(item.w)),
+        h: Math.max(1, Math.round(item.h)),
+      });
+    }
 
     if (layoutSaveTimerRef.current != null) {
       window.clearTimeout(layoutSaveTimerRef.current);
@@ -550,23 +716,14 @@ export default function AnalyzerPage() {
     }
 
     layoutSaveTimerRef.current = window.setTimeout(() => {
+      layoutSaveTimerRef.current = null;
       const ws = workspaceNameRef.current;
+      const rows = [...pendingLayoutSavesRef.current.values()];
+      pendingLayoutSavesRef.current.clear();
       void (async () => {
         try {
           await Promise.all(
-            layout.map(async (item) => {
-              const tileId = Number(item.i);
-              if (!Number.isFinite(tileId) || tileId <= 0) return;
-              await saveAnalyzerTileLayouts(ws, tileId, [
-                {
-                  breakpoint,
-                  x: Math.max(0, Math.round(item.x)),
-                  y: Math.max(0, Math.round(item.y)),
-                  w: Math.max(1, Math.round(item.w)),
-                  h: Math.max(1, Math.round(item.h)),
-                },
-              ]);
-            }),
+            rows.map(({ tileId, ...row }) => saveAnalyzerTileLayouts(ws, tileId, [row])),
           );
         } catch (e) {
           setError(String(e));
@@ -579,7 +736,7 @@ export default function AnalyzerPage() {
     setLoading(true);
     setError(null);
     try {
-      const [, , nextTiles] = await Promise.all([refreshSignals(), refreshSlaves(), refreshTiles()]);
+      const [, , nextTiles] = await Promise.all([refreshSignals(), refreshSlaves(), refreshTiles(), refreshTabs()]);
 
       if (pollingWantedRef.current && nextTiles.length > 0) {
         await startAnalyzerPolling(workspaceName);
@@ -641,6 +798,9 @@ export default function AnalyzerPage() {
 
   useEffect(() => {
     latestLiveRef.current = {};
+    // Tab ids belong to a workspace: forget the selection so the new workspace's remembered tab applies.
+    selectedTabIdRef.current = null;
+    setSelectedTabId(null);
     void refreshAll();
   }, [workspaceName]);
 
@@ -992,7 +1152,22 @@ export default function AnalyzerPage() {
         onToggleLayoutEditMode={() => setLayoutEditMode((prev) => !prev)}
         onRefresh={() => void refreshAll()}
         onEnterFocus={() => {}}
-      />
+      >
+        <AnalyzerTabsStrip
+          tabs={tabs}
+          selectedTabId={selectedTabId}
+          statusByTabId={{}}
+          onSelect={selectTab}
+          onCreate={createTab}
+          onRename={renameTab}
+          onReorder={reorderTabs}
+          onRequestDelete={(id) => {
+            const tab = tabs.find((t) => t.id === id) ?? null;
+            setDeleteTabError(null);
+            setDeleteTabTarget(tab);
+          }}
+        />
+      </AnalyzerControlBar>
 
       {error ? (
         <div className="rounded-xl border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-800 dark:text-rose-200">
@@ -1001,14 +1176,15 @@ export default function AnalyzerPage() {
       ) : null}
 
       <AnalyzerTilesCard
-        tiles={tiles}
+        tiles={visibleTiles}
+        workspaceHasTiles={tiles.length > 0}
         pollingWanted={pollingWanted}
         gridReady={gridReady}
         layoutEditMode={layoutEditMode}
         gridHostRef={gridHostRef}
         effectiveGridWidth={effectiveGridWidth}
-        gridLayouts={gridLayouts}
-        onGridLayoutsChange={setGridLayouts}
+        gridLayouts={visibleGridLayouts}
+        onGridLayoutsChange={onVisibleGridLayoutsChange}
         derivedBreakpoint={derivedBreakpoint}
         schedulePersistLayouts={schedulePersistLayouts}
         renderTileValue={renderTileValue}
@@ -1072,11 +1248,14 @@ export default function AnalyzerPage() {
               const configJson = input.kind === "trend" ? JSON.stringify({ chartKind: "trend" }) : "{}";
 
               if (tileModalMode === "add") {
+                const tabId = selectedTabIdRef.current;
+                if (tabId == null) throw new Error("Tabs are still loading");
                 await createAnalyzerTile(workspaceName, {
                   kind,
                   title: input.title,
                   configJson,
                   pollingEnabled: true,
+                  tabId,
                   layouts: [],
                   signalLinks: [
                     {
@@ -1205,6 +1384,22 @@ export default function AnalyzerPage() {
             </div>
           </div>
         </div>
+      ) : null}
+
+      {deleteTabTarget ? (
+        <DeleteTabDialog
+          tab={deleteTabTarget}
+          tileCount={tiles.filter((t) => tabIdOfTile(t) === deleteTabTarget.id).length}
+          otherTabs={tabs.filter((t) => t.id !== deleteTabTarget.id)}
+          busy={deleteTabBusy}
+          error={deleteTabError}
+          onCancel={() => {
+            if (deleteTabBusy) return;
+            setDeleteTabError(null);
+            setDeleteTabTarget(null);
+          }}
+          onConfirm={confirmDeleteTab}
+        />
       ) : null}
 
       <ConfirmDialog

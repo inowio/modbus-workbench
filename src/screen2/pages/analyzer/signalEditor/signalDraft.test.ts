@@ -12,7 +12,7 @@ function signal(id: string, over: Partial<AnalyzerSignal> = {}): AnalyzerSignal 
 }
 
 function tile(id: number, title: string, kind = "chart"): AnalyzerTile {
-  return { id, kind, title, configJson: "{}", pollingEnabled: true, createdAt: "", updatedAt: "" };
+  return { id, kind, title, configJson: "{}", pollingEnabled: true, createdAt: "", updatedAt: "", tabId: 1 };
 }
 
 /** A realistic pre-0.6 decoder: every register-value key set. */

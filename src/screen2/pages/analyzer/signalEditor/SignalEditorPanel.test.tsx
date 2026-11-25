@@ -131,7 +131,7 @@ describe("SignalEditorPanel", () => {
 
   it("save is blocked when a chart tile would get text", async () => {
     const s = signal("Temp_1", { decoderJson: JSON.stringify({ show: "z", math: EXAMPLE }) });
-    const tiles: AnalyzerTile[] = [{ id: 5, kind: "chart", title: "Boiler temp", configJson: "{}", pollingEnabled: true, createdAt: "", updatedAt: "" }];
+    const tiles: AnalyzerTile[] = [{ id: 5, kind: "chart", title: "Boiler temp", configJson: "{}", pollingEnabled: true, createdAt: "", updatedAt: "", tabId: 1 }];
     const tileSignals: Record<number, AnalyzerTileSignalInfo[]> = {
       5: [{ tileId: 5, signalId: "Temp_1", role: "primary" } as AnalyzerTileSignalInfo],
     };
