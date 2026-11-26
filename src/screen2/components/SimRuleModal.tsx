@@ -1,6 +1,9 @@
 import { useEffect, useState } from "react";
 import { RiCloseLine } from "react-icons/ri";
 
+import { bankName, findTargetRegister } from "../simulator/ruleTargets";
+import type { PageRegister } from "../simulator/useSimulatorData";
+
 export type SimRule = {
   id: number;
   name: string;
@@ -181,6 +184,10 @@ function buildActionJson(a: ActionRow): Record<string, unknown> {
   }
 }
 
+function Warn({ text }: { text: string }) {
+  return <div className="col-span-full text-[11px] text-amber-700 dark:text-amber-300">{text}</div>;
+}
+
 const inputCls =
   "rounded-lg border border-slate-300 bg-white px-2 py-1 dark:border-slate-700 dark:bg-slate-900";
 
@@ -189,6 +196,8 @@ export default function SimRuleModal(props: {
   initial: SimRule | null;
   onClose: () => void;
   onSubmit: (rule: SimRule) => void | Promise<void>;
+  /** Workspace registers, used to warn about targets that don't exist. Omit to skip the check. */
+  registers?: readonly PageRegister[];
   /** Save error to show inside the dialog (it stays open on failure). */
   error?: string | null;
 }) {
@@ -226,7 +235,18 @@ export default function SimRuleModal(props: {
   const updateAction = (idx: number, patch: Partial<ActionRow>) =>
     setActions((rows) => rows.map((row, i) => (i === idx ? { ...row, ...patch } : row)));
 
+  const missingText = (unit: number, bank: number, address: number): string | null => {
+    if (!props.registers) return null;
+    if (findTargetRegister(props.registers, unit, bank, address)) return null;
+    return `No register at ${bankName(bank)} ${address} on unit ${unit} — this does nothing until you add one.`;
+  };
+  const triggerWarn = trigger.type === "interval" ? null : missingText(trigger.unit, trigger.bank, trigger.address);
+  const nameMissing = rule.name.trim() === "";
+  const noActions = actions.length === 0;
+  const saveBlock = nameMissing ? "Enter a rule name." : noActions ? "Add at least one action." : null;
+
   const handleSubmit = () => {
+    if (saveBlock) return;
     const triggerJson = buildTriggerJson(trigger);
     const actionsJson = JSON.stringify(actions.map(buildActionJson));
     void props.onSubmit({ ...rule, trigger: triggerJson, actions: actionsJson });
@@ -279,9 +299,9 @@ export default function SimRuleModal(props: {
               onChange={(e) => setTriggerField({ type: e.target.value })}
               className={inputCls}
             >
-              <option value="interval">interval</option>
-              <option value="condition">condition</option>
-              <option value="onWrite">onWrite</option>
+              <option value="interval">Every N ms</option>
+              <option value="condition">When a condition is met</option>
+              <option value="onWrite">When a client writes</option>
             </select>
           </label>
 
@@ -374,6 +394,7 @@ export default function SimRuleModal(props: {
               </label>
             </>
           )}
+          {triggerWarn ? <div className="col-span-2"><Warn text={triggerWarn} /></div> : null}
         </div>
 
         <div className="mt-6">
@@ -389,6 +410,12 @@ export default function SimRuleModal(props: {
             </button>
           </div>
 
+          {noActions ? (
+            <div className="rounded-lg border border-dashed border-slate-300 p-3 text-xs text-slate-500 dark:border-slate-700 dark:text-slate-400">
+              No actions yet — add one, or the rule does nothing.
+            </div>
+          ) : null}
+
           <div className="flex flex-col gap-2">
             {actions.map((action, idx) => (
               <div
@@ -403,12 +430,12 @@ export default function SimRuleModal(props: {
                     onChange={(e) => updateAction(idx, { type: e.target.value })}
                     className={inputCls}
                   >
-                    <option value="set">set</option>
-                    <option value="inc">inc</option>
-                    <option value="dec">dec</option>
-                    <option value="toggle">toggle</option>
-                    <option value="copy">copy</option>
-                    <option value="randomize">randomize</option>
+                    <option value="set">Set</option>
+                    <option value="inc">Increment</option>
+                    <option value="dec">Decrement</option>
+                    <option value="toggle">Toggle</option>
+                    <option value="copy">Copy from</option>
+                    <option value="randomize">Randomize</option>
                   </select>
                 </label>
                 <label className="flex flex-col gap-1">
@@ -610,6 +637,17 @@ export default function SimRuleModal(props: {
                   </label>
                 )}
 
+                {(() => {
+                  const w = missingText(action.unit, action.bank, action.address);
+                  const ws = action.type === "copy" ? missingText(action.srcUnit, action.srcBank, action.srcAddr) : null;
+                  return (
+                    <>
+                      {w ? <Warn text={w} /> : null}
+                      {ws ? <Warn text={ws.replace("No register at", "No source register at")} /> : null}
+                    </>
+                  );
+                })()}
+
                 <button
                   type="button"
                   aria-label={`Remove action ${idx}`}
@@ -635,10 +673,12 @@ export default function SimRuleModal(props: {
           >
             Cancel
           </button>
+          {saveBlock ? <span className="self-center text-xs text-slate-500 dark:text-slate-400">{saveBlock}</span> : null}
           <button
             type="button"
             onClick={handleSubmit}
-            className="rounded-full border border-emerald-600/60 bg-emerald-500/10 px-4 py-2 text-sm font-semibold text-emerald-800 dark:border-emerald-500/60 dark:text-emerald-200"
+            disabled={saveBlock !== null}
+            className="rounded-full border border-emerald-600/60 bg-emerald-500/10 px-4 py-2 text-sm font-semibold text-emerald-800 disabled:opacity-50 dark:border-emerald-500/60 dark:text-emerald-200"
           >
             Save
           </button>
