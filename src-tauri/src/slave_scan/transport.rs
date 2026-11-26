@@ -230,6 +230,43 @@ fn serial_builder(port: &str, params: &SerialParams) -> Result<tokio_serial::Ser
         .flow_control(parse_serial_flow_control(Some(params.flow_control.clone()))?))
 }
 
+/// Pauses before each new try when Windows says a port is still in use.
+/// Closing a COM port finishes asynchronously, so reopening it straight away
+/// (next sweep setting, or right after the shared session let it go) can be
+/// refused for a moment with "Access is denied".
+const BUSY_PORT_RETRY: [Duration; 5] = [
+    Duration::from_millis(50),
+    Duration::from_millis(100),
+    Duration::from_millis(200),
+    Duration::from_millis(400),
+    Duration::from_millis(800),
+];
+
+/// "Access is denied" — the port is still held, by us (closing) or by someone else.
+fn port_busy(e: &tokio_serial::Error) -> bool {
+    e.kind() == tokio_serial::ErrorKind::Io(io::ErrorKind::PermissionDenied)
+}
+
+/// Runs `attempt`, and while it fails because the port is busy, tries again
+/// after each pause in `pauses`. Any other result is returned at once.
+async fn retry_while_busy<T, F, Fut>(mut attempt: F, pauses: &[Duration]) -> Result<T, OpenError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<Result<T, tokio_serial::Error>, OpenError>>,
+{
+    let mut pauses = pauses.iter();
+    loop {
+        match attempt().await? {
+            Ok(v) => return Ok(v),
+            Err(e) if port_busy(&e) => match pauses.next() {
+                Some(pause) => tokio::time::sleep(*pause).await,
+                None => return Err(OpenError::Failed(e.to_string())),
+            },
+            Err(e) => return Err(OpenError::Failed(e.to_string())),
+        }
+    }
+}
+
 /// Opens serial ports for the scan, one per settings combination.
 pub struct SerialOpener;
 
@@ -245,16 +282,25 @@ impl Opener for SerialOpener {
         let params = params.clone();
         async move {
             let builder = serial_builder(&port, &params).map_err(OpenError::Failed)?;
-            // If the wait runs out, the blocking open still finishes on its
-            // own and the stream it returns is dropped, closing the port.
-            let opened = timeout(
-                OPEN_TIMEOUT,
-                tokio::task::spawn_blocking(move || builder.open_native_async()),
+            let stream = retry_while_busy(
+                || {
+                    let builder = builder.clone();
+                    let port = port.clone();
+                    async move {
+                        // If the wait runs out, the blocking open still finishes on
+                        // its own and the stream it returns is dropped, closing the port.
+                        timeout(
+                            OPEN_TIMEOUT,
+                            tokio::task::spawn_blocking(move || builder.open_native_async()),
+                        )
+                        .await
+                        .map_err(|_| OpenError::TimedOut(format!("timed out opening {port}")))?
+                        .map_err(|e| OpenError::Failed(format!("port open task failed: {e}")))
+                    }
+                },
+                &BUSY_PORT_RETRY,
             )
-            .await
-            .map_err(|_| OpenError::TimedOut(format!("timed out opening {port}")))?
-            .map_err(|e| OpenError::Failed(format!("port open task failed: {e}")))?;
-            let stream = opened.map_err(|e| OpenError::Failed(e.to_string()))?;
+            .await?;
             Ok(SerialProber::attach(stream))
         }
     }
@@ -448,6 +494,68 @@ mod tests {
     use tokio_modbus::prelude::*;
     use tokio_modbus::server::tcp::{accept_tcp_connection, Server};
     use tokio_modbus::server::Service;
+
+    fn busy() -> tokio_serial::Error {
+        tokio_serial::Error::new(
+            tokio_serial::ErrorKind::Io(io::ErrorKind::PermissionDenied),
+            "Access is denied.",
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn busy_port_is_retried_until_it_opens() {
+        // The second sweep setting reopens the port while Windows is still closing it.
+        let tries = Arc::new(AtomicU64::new(0));
+        let t = tries.clone();
+        let opened = retry_while_busy(
+            move || {
+                let n = t.fetch_add(1, Ordering::SeqCst);
+                async move { Ok(if n < 2 { Err(busy()) } else { Ok("port") }) }
+            },
+            &BUSY_PORT_RETRY,
+        )
+        .await;
+        assert_eq!(opened.ok(), Some("port"));
+        assert_eq!(tries.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn other_open_errors_are_not_retried() {
+        let tries = Arc::new(AtomicU64::new(0));
+        let t = tries.clone();
+        let opened: Result<&str, OpenError> = retry_while_busy(
+            move || {
+                t.fetch_add(1, Ordering::SeqCst);
+                async {
+                    Ok(Err(tokio_serial::Error::new(
+                        tokio_serial::ErrorKind::NoDevice,
+                        "The system cannot find the file specified.",
+                    )))
+                }
+            },
+            &BUSY_PORT_RETRY,
+        )
+        .await;
+        assert!(matches!(opened, Err(OpenError::Failed(ref m)) if m.contains("cannot find")));
+        assert_eq!(tries.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_port_that_stays_busy_fails_after_the_last_pause() {
+        // Held by another program: give up with the OS message after the pauses run out.
+        let tries = Arc::new(AtomicU64::new(0));
+        let t = tries.clone();
+        let opened: Result<&str, OpenError> = retry_while_busy(
+            move || {
+                t.fetch_add(1, Ordering::SeqCst);
+                async { Ok(Err(busy())) }
+            },
+            &BUSY_PORT_RETRY,
+        )
+        .await;
+        assert!(matches!(opened, Err(OpenError::Failed(ref m)) if m.contains("Access is denied")));
+        assert_eq!(tries.load(Ordering::SeqCst), 1 + BUSY_PORT_RETRY.len() as u64);
+    }
 
     const WAIT: Duration = Duration::from_millis(100);
 

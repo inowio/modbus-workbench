@@ -87,6 +87,8 @@ export default function SlaveScannerModal({ open, workspaceName, existingSlaves,
   const [progress, setProgress] = useState<ScanProgressEvent | null>(null);
   const [notices, setNotices] = useState<string[]>([]);
   const [summary, setSummary] = useState<string | null>(null);
+  /** Addresses checked by the last finished scan (progress is cleared when it ends). */
+  const [finalChecked, setFinalChecked] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const phaseRef = useRef<Phase>("idle");
@@ -132,6 +134,7 @@ export default function SlaveScannerModal({ open, workspaceName, existingSlaves,
     setNotices([]);
     setProgress(null);
     setSummary(null);
+    setFinalChecked(null);
     void (async () => {
       const [settingsRes, portsRes] = await Promise.allSettled([
         invoke<ConnectionSettings>("get_connection_settings", { name: workspaceName }),
@@ -176,6 +179,7 @@ export default function SlaveScannerModal({ open, workspaceName, existingSlaves,
       listen<ScanDoneEvent>(SLAVE_SCAN_EVENTS.done, ({ payload }) => {
         if (!accept(payload)) return;
         lastDoneScanIdRef.current = payload.scanId;
+        setFinalChecked(payload.checked);
         currentScanIdRef.current = null;
         phaseRef.current = "idle";
         setPhaseState("idle");
@@ -260,6 +264,7 @@ export default function SlaveScannerModal({ open, workspaceName, existingSlaves,
     setNotices([]);
     setProgress(null);
     setSummary(null);
+    setFinalChecked(null);
     setError(null);
 
     const ready = (await listenersReadyRef.current) ?? false;
@@ -476,7 +481,7 @@ export default function SlaveScannerModal({ open, workspaceName, existingSlaves,
                 <div className="grid grid-cols-2 gap-2 @lg:grid-cols-4">
                   {stat(
                     "Checked",
-                    progress ? `${progress.checked}` : busy ? "0" : "—",
+                    progress ? `${progress.checked}` : finalChecked !== null ? `${finalChecked}` : busy ? "0" : "—",
                     "text-slate-900 dark:text-slate-100",
                   )}
                   {stat("Found", String(counts.found), "text-emerald-700 dark:text-emerald-300")}

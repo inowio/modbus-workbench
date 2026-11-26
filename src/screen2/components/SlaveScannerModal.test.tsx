@@ -448,6 +448,8 @@ describe("SlaveScannerModal", () => {
     });
     fire("slave_scan_done", { workspace: WS, scanId, reason: "completed", error: null, checked: 247, found: 0 });
     expect(screen.getByText(/Scan complete/)).toBeInTheDocument();
+    // The Checked counter keeps the final count once the scan has ended.
+    expect(screen.getByText("Checked").parentElement).toHaveTextContent("247");
     expect(cancelCalls()).toHaveLength(0);
   });
 
