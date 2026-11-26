@@ -122,4 +122,22 @@ describe("useSimulatorData", () => {
     act(() => result.current.setError("boom"));
     expect(result.current.error).toBe("boom");
   });
+
+  it("addRegister/addRule/addDevice resolve true on success and false (setting error) on failure", async () => {
+    const { result } = renderHook(() => useSimulatorData("ws"));
+    await waitFor(() => expect(result.current.lastUpdated).not.toBeNull());
+    let ok: boolean | undefined;
+    await act(async () => { ok = await result.current.addRegister({} as never); });
+    expect(ok).toBe(true);
+    invokeMock.mockImplementation((cmd: string) =>
+      cmd === "simulator_add_register" || cmd === "simulator_add_rule" || cmd === "simulator_add_device"
+        ? Promise.reject("nope") : Promise.resolve(null));
+    await act(async () => { ok = await result.current.addRegister({} as never); });
+    expect(ok).toBe(false);
+    expect(result.current.error).toContain("nope");
+    await act(async () => { ok = await result.current.addRule({} as never); });
+    expect(ok).toBe(false);
+    await act(async () => { ok = await result.current.addDevice({ templateKey: "t", deviceName: "d", unitId: 1, baseAddress: 0 }); });
+    expect(ok).toBe(false);
+  });
 });

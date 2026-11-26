@@ -70,6 +70,8 @@ export default function SimRegisterModal(props: {
   initial: SimRegister | null;
   onClose: () => void;
   onSubmit: (reg: SimRegister) => void | Promise<void>;
+  /** Save error to show inside the dialog (it stays open on failure). */
+  error?: string | null;
 }) {
   const [reg, setReg] = useState<SimRegister>(EMPTY);
   const [kind, setKind] = useState(GENERATOR_KINDS[0]);
@@ -351,6 +353,10 @@ export default function SimRegisterModal(props: {
               className="rounded-lg border border-slate-300 bg-white px-2 py-1 dark:border-slate-700 dark:bg-slate-900" />
           </label>
         </div>
+
+        {props.error ? (
+          <div role="alert" className="mt-4 rounded-lg border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-xs text-rose-800 dark:text-rose-200">{props.error}</div>
+        ) : null}
 
         <div className="mt-6 flex justify-end gap-2">
           <button type="button" onClick={props.onClose}

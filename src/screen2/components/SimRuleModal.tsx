@@ -189,6 +189,8 @@ export default function SimRuleModal(props: {
   initial: SimRule | null;
   onClose: () => void;
   onSubmit: (rule: SimRule) => void | Promise<void>;
+  /** Save error to show inside the dialog (it stays open on failure). */
+  error?: string | null;
 }) {
   const [rule, setRule] = useState<SimRule>(EMPTY_RULE);
   const [trigger, setTrigger] = useState<TriggerForm>(DEFAULT_TRIGGER);
@@ -620,6 +622,10 @@ export default function SimRuleModal(props: {
             ))}
           </div>
         </div>
+
+        {props.error ? (
+          <div role="alert" className="mt-4 rounded-lg border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-xs text-rose-800 dark:text-rose-200">{props.error}</div>
+        ) : null}
 
         <div className="mt-6 flex justify-end gap-2">
           <button

@@ -1,4 +1,4 @@
-import { render, screen, waitFor, fireEvent } from "@testing-library/react";
+import { render, screen, waitFor, fireEvent, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const invokeMock = vi.fn();
@@ -73,5 +73,65 @@ describe("TcpSimulatorPage (tabbed shell)", () => {
     fireEvent.click(row);
     // Inspector shows the alias as a heading and a Save button
     expect(await screen.findByRole("button", { name: /save/i })).toBeTruthy();
+  });
+});
+
+describe("TcpSimulatorPage dialogs keep open on failed saves", () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+    listenMock.mockReset();
+    window.localStorage.clear();
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "simulator_get_config") return Promise.resolve({ enabled: false, host: "0.0.0.0", port: 502, tickMs: 100 });
+      if (cmd === "simulator_list_registers") return Promise.resolve([reg]);
+      if (cmd === "simulator_list_devices") return Promise.resolve([device]);
+      if (cmd === "simulator_list_rules") return Promise.resolve([]);
+      if (cmd === "simulator_list_device_templates") return Promise.resolve([]);
+      if (cmd === "simulator_status") return Promise.resolve({ running: false, listen: null, clientCount: 0 });
+      if (cmd === "simulator_add_register") return Promise.reject("UNIQUE constraint failed: sim_registers");
+      if (cmd === "simulator_add_rule") return Promise.reject("rule is invalid");
+      return Promise.resolve(null);
+    });
+    listenMock.mockResolvedValue(() => {});
+  });
+
+  it("keeps the register dialog open and shows the error when the save fails", async () => {
+    renderPage();
+    fireEvent.click(await screen.findByRole("button", { name: /add register/i }));
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.click(within(dialog).getByRole("button", { name: /^save$/i }));
+    const alert = await within(dialog).findByRole("alert");
+    expect(alert.textContent).toMatch(/already exists/i);
+    expect(screen.getByRole("dialog")).toBeTruthy();
+  });
+
+  it("closes the register dialog when the save succeeds", async () => {
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "simulator_get_config") return Promise.resolve({ enabled: false, host: "0.0.0.0", port: 502, tickMs: 100 });
+      if (cmd === "simulator_list_registers") return Promise.resolve([reg]);
+      if (cmd === "simulator_list_devices") return Promise.resolve([device]);
+      if (cmd === "simulator_list_rules") return Promise.resolve([]);
+      if (cmd === "simulator_status") return Promise.resolve({ running: false, listen: null, clientCount: 0 });
+      return Promise.resolve(null);
+    });
+    renderPage();
+    fireEvent.click(await screen.findByRole("button", { name: /add register/i }));
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.click(within(dialog).getByRole("button", { name: /^save$/i }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  });
+
+  it("keeps the rule dialog open and shows the error when the save fails", async () => {
+    renderPage();
+    await screen.findByText("temp");
+    fireEvent.click(screen.getByRole("tab", { name: /rules/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /add rule/i }));
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.change(within(dialog).getByLabelText(/rule name/i), { target: { value: "r1" } });
+    fireEvent.click(within(dialog).getByRole("button", { name: /add action/i }));
+    fireEvent.click(within(dialog).getByRole("button", { name: /^save$/i }));
+    const alert = await within(dialog).findByRole("alert");
+    expect(alert.textContent).toMatch(/rule is invalid/i);
+    expect(screen.getByRole("dialog")).toBeTruthy();
   });
 });

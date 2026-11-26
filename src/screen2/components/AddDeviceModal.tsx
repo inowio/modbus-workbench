@@ -45,6 +45,8 @@ export default function AddDeviceModal(props: {
   existingRegisters?: ExistingRegister[];
   onClose: () => void;
   onSubmit: (payload: AddDeviceSubmit) => void | Promise<void>;
+  /** Save error to show inside the dialog (it stays open on failure). */
+  error?: string | null;
 }) {
   const [step, setStep] = useState<Step>("select");
   const [selected, setSelected] = useState<DeviceTemplate | null>(null);
@@ -322,6 +324,10 @@ export default function AddDeviceModal(props: {
         )}
 
         </div>
+
+        {props.error ? (
+          <div role="alert" className="mt-3 shrink-0 rounded-lg border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-xs text-rose-800 dark:text-rose-200">{props.error}</div>
+        ) : null}
 
         <div className="mt-4 flex shrink-0 items-center justify-between border-t border-slate-200 pt-4 dark:border-slate-800">
           <div className="text-[10px] uppercase tracking-wide text-slate-400 dark:text-slate-500">

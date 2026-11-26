@@ -150,14 +150,14 @@ export function useSimulatorData(ws: string) {
     finally { setBusy(false); }
   }, [ws]);
 
-  const addRegister = useCallback(async (reg: SimRegister) => {
-    try { await invoke("simulator_add_register", { name: ws, register: reg }); await reload(); }
-    catch (e) { setError(String(e)); }
+  const addRegister = useCallback(async (reg: SimRegister): Promise<boolean> => {
+    try { await invoke("simulator_add_register", { name: ws, register: reg }); await reload(); return true; }
+    catch (e) { setError(String(e)); return false; }
   }, [ws, reload]);
 
-  const updateRegister = useCallback(async (reg: SimRegister) => {
-    try { await invoke("simulator_update_register", { name: ws, register: reg }); await reload(); }
-    catch (e) { setError(String(e)); }
+  const updateRegister = useCallback(async (reg: SimRegister): Promise<boolean> => {
+    try { await invoke("simulator_update_register", { name: ws, register: reg }); await reload(); return true; }
+    catch (e) { setError(String(e)); return false; }
   }, [ws, reload]);
 
   const deleteRegister = useCallback(async (id: number) => {
@@ -199,7 +199,7 @@ export function useSimulatorData(ws: string) {
     catch (e) { setError(String(e)); }
   }, [ws, reload, registers]);
 
-  const addDevice = useCallback(async (payload: AddDevicePayload) => {
+  const addDevice = useCallback(async (payload: AddDevicePayload): Promise<boolean> => {
     try {
       await invoke("simulator_add_device", {
         name: ws,
@@ -209,12 +209,13 @@ export function useSimulatorData(ws: string) {
         baseAddress: payload.baseAddress,
       });
       await reload();
-    } catch (e) { setError(String(e)); }
+      return true;
+    } catch (e) { setError(String(e)); return false; }
   }, [ws, reload]);
 
   // Instantiate a device from an inline template (a "Workspace" slave device
   // whose route map is built on the fly, not in the shared catalog).
-  const addSlaveDevice = useCallback(async (template: DeviceTemplate, payload: AddDevicePayload) => {
+  const addSlaveDevice = useCallback(async (template: DeviceTemplate, payload: AddDevicePayload): Promise<boolean> => {
     try {
       await invoke("simulator_add_inline_device", {
         name: ws,
@@ -224,7 +225,8 @@ export function useSimulatorData(ws: string) {
         baseAddress: payload.baseAddress,
       });
       await reload();
-    } catch (e) { setError(String(e)); }
+      return true;
+    } catch (e) { setError(String(e)); return false; }
   }, [ws, reload]);
 
   const updateDevice = useCallback(async (device: SimDevice) => {
@@ -247,14 +249,14 @@ export function useSimulatorData(ws: string) {
     catch (e) { setError(String(e)); }
   }, [ws, reload]);
 
-  const addRule = useCallback(async (rule: SimRule) => {
-    try { await invoke("simulator_add_rule", { name: ws, rule }); await reload(); }
-    catch (e) { setError(String(e)); }
+  const addRule = useCallback(async (rule: SimRule): Promise<boolean> => {
+    try { await invoke("simulator_add_rule", { name: ws, rule }); await reload(); return true; }
+    catch (e) { setError(String(e)); return false; }
   }, [ws, reload]);
 
-  const updateRule = useCallback(async (rule: SimRule) => {
-    try { await invoke("simulator_update_rule", { name: ws, rule }); await reload(); }
-    catch (e) { setError(String(e)); }
+  const updateRule = useCallback(async (rule: SimRule): Promise<boolean> => {
+    try { await invoke("simulator_update_rule", { name: ws, rule }); await reload(); return true; }
+    catch (e) { setError(String(e)); return false; }
   }, [ws, reload]);
 
   const deleteRule = useCallback(async (id: number) => {

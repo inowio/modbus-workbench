@@ -73,6 +73,13 @@ export default function TcpSimulatorPage() {
   // template editor so the layout is visible and the key is clash-guarded.
   const [saveTemplateDraft, setSaveTemplateDraft] = useState<DeviceTemplate | null>(null);
 
+  // While a save dialog is open its own error shows inside it, not in the page banner.
+  const dialogOpen = addRegisterOpen || deviceModalOpen || ruleModalOpen;
+  const dialogError = sim.error ? humanizeError(sim.error) : null;
+  const { setError: setSimError } = sim;
+  const openDialog = useCallback((open: () => void) => { setSimError(null); open(); }, [setSimError]);
+  const closeDialog = useCallback((close: () => void) => { setSimError(null); close(); }, [setSimError]);
+
   const changeTab = useCallback((tab: TabKey) => { setActiveTab(tab); writeTab(ws, tab); }, [ws]);
 
   const selectedRegister = useMemo<PageRegister | null>(
@@ -146,7 +153,7 @@ export default function TcpSimulatorPage() {
         </div>
       </div>
 
-      {sim.error ? (
+      {sim.error && !dialogOpen ? (
         <div className="flex items-start justify-between gap-3 rounded-xl border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-800 dark:text-rose-200">
           <span>{humanizeError(sim.error)}</span>
           <button
@@ -192,8 +199,8 @@ export default function TcpSimulatorPage() {
               onAddrFmt={changeAddrFmt}
               onSelectRegister={(r) => setSelectedRegisterId(r.id)}
               onDelete={(id) => setConfirmDeleteRegister(sim.registers.find((r) => r.id === id) ?? null)}
-              onAddRegister={() => setAddRegisterOpen(true)}
-              onAddDevice={() => setDeviceModalOpen(true)}
+              onAddRegister={() => openDialog(() => setAddRegisterOpen(true))}
+              onAddDevice={() => openDialog(() => setDeviceModalOpen(true))}
             />
           ) : null}
 
@@ -201,7 +208,7 @@ export default function TcpSimulatorPage() {
             <DevicesTab
               devices={sim.devices}
               registers={sim.registers}
-              onAddDevice={() => setDeviceModalOpen(true)}
+              onAddDevice={() => openDialog(() => setDeviceModalOpen(true))}
               onRename={handleRename}
               onRebase={handleRebase}
               onDelete={(device) => setConfirmDeleteDevice(device)}
@@ -213,8 +220,8 @@ export default function TcpSimulatorPage() {
             <RulesTab
               rules={sim.rules}
               devices={sim.devices}
-              onAdd={() => { setModalRule(null); setRuleModalOpen(true); }}
-              onEdit={(rule) => { setModalRule(rule); setRuleModalOpen(true); }}
+              onAdd={() => openDialog(() => { setModalRule(null); setRuleModalOpen(true); })}
+              onEdit={(rule) => openDialog(() => { setModalRule(rule); setRuleModalOpen(true); })}
               onToggle={(rule, enabled) => void sim.updateRule({ ...rule, enabled })}
               onDelete={(id) => setConfirmDeleteRule(sim.rules.find((r) => r.id === id) ?? null)}
             />
@@ -253,36 +260,36 @@ export default function TcpSimulatorPage() {
       <SimRegisterModal
         open={addRegisterOpen}
         initial={null}
-        onClose={() => setAddRegisterOpen(false)}
-        onSubmit={async (reg: SimRegister) => { await sim.addRegister(reg); setAddRegisterOpen(false); }}
+        error={dialogError}
+        onClose={() => closeDialog(() => setAddRegisterOpen(false))}
+        onSubmit={async (reg: SimRegister) => { if (await sim.addRegister(reg)) setAddRegisterOpen(false); }}
       />
 
       <AddDeviceModal
         open={deviceModalOpen}
         templates={sim.deviceTemplates}
         existingRegisters={sim.registers}
-        onClose={() => setDeviceModalOpen(false)}
+        error={dialogError}
+        onClose={() => closeDialog(() => setDeviceModalOpen(false))}
         onSubmit={async (payload) => {
           // "Workspace" slave devices aren't in the shared catalog — their route
           // map is inline on the selected template, so add them via the inline path.
           const tpl = sim.deviceTemplates.find((t) => t.templateKey === payload.templateKey);
-          if (tpl && payload.templateKey.startsWith("ws-slave:")) {
-            await sim.addSlaveDevice(tpl, payload);
-          } else {
-            await sim.addDevice(payload);
-          }
-          setDeviceModalOpen(false);
+          const ok = tpl && payload.templateKey.startsWith("ws-slave:")
+            ? await sim.addSlaveDevice(tpl, payload)
+            : await sim.addDevice(payload);
+          if (ok) setDeviceModalOpen(false);
         }}
       />
 
       <SimRuleModal
         open={ruleModalOpen}
         initial={modalRule}
-        onClose={() => setRuleModalOpen(false)}
+        error={dialogError}
+        onClose={() => closeDialog(() => setRuleModalOpen(false))}
         onSubmit={async (rule: SimRule) => {
-          if (rule.id) await sim.updateRule(rule);
-          else await sim.addRule(rule);
-          setRuleModalOpen(false);
+          const ok = rule.id ? await sim.updateRule(rule) : await sim.addRule(rule);
+          if (ok) setRuleModalOpen(false);
         }}
       />
 
