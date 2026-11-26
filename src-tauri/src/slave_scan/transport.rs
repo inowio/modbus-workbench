@@ -95,7 +95,7 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for CountingStream<T> {
 // ---------- shared request/reply handling ----------
 
 /// Maps a tokio-modbus reply to a probe outcome (timeouts are handled by
-/// the caller).
+/// the caller; `TcpProber` handles a mismatched reply itself).
 fn outcome_of(reply: tokio_modbus::Result<()>) -> ProbeOutcome {
     match reply {
         Ok(Ok(())) => ProbeOutcome::Value,
@@ -290,27 +290,51 @@ pub struct TcpConnector {
     pub connect_timeout: Duration,
 }
 
+async fn open_tcp_session(addr: SocketAddr, limit: Duration) -> Result<Session, String> {
+    let stream = timeout(limit, TcpStream::connect(addr))
+        .await
+        .map_err(|_| format!("timed out after {} ms", limit.as_millis()))?
+        .map_err(|e| e.to_string())?;
+    let shared = SharedStream::new(stream);
+    let attach = move || client::tcp::attach_slave(shared.clone(), Slave(1));
+    Ok(Session::new(Box::new(attach)))
+}
+
 impl Connector for TcpConnector {
     type P = TcpProber;
 
     fn connect(&self) -> impl Future<Output = Result<TcpProber, String>> + Send {
         let addr = self.addr;
-        let limit = self.connect_timeout;
+        let connect_timeout = self.connect_timeout;
         async move {
-            let stream = timeout(limit, TcpStream::connect(addr))
-                .await
-                .map_err(|_| format!("timed out after {} ms", limit.as_millis()))?
-                .map_err(|e| e.to_string())?;
-            let shared = SharedStream::new(stream);
-            let attach = move || client::tcp::attach_slave(shared.clone(), Slave(1));
-            Ok(TcpProber { session: Session::new(Box::new(attach)) })
+            let session = open_tcp_session(addr, connect_timeout).await?;
+            Ok(TcpProber { addr, connect_timeout, session: Some(session) })
         }
     }
 }
 
-/// One TCP connection, reused for many unit IDs.
+/// One TCP worker's connection, reused for many unit IDs.
+///
+/// After a timeout or a reply that does not match the request, a reply may
+/// still be on its way (gateways answer only after their own serial
+/// timeout), and it would be read as the answer to the next request. So the
+/// connection is dropped and a fresh one opened before the next check.
 pub struct TcpProber {
-    session: Session,
+    addr: SocketAddr,
+    connect_timeout: Duration,
+    /// `None` only between dropping a dirty connection and reconnecting.
+    session: Option<Session>,
+}
+
+impl TcpProber {
+    async fn reconnect(&mut self) -> Result<(), String> {
+        self.session = None;
+        let session = open_tcp_session(self.addr, self.connect_timeout)
+            .await
+            .map_err(|e| format!("reconnect failed: {e}"))?;
+        self.session = Some(session);
+        Ok(())
+    }
 }
 
 impl Prober for TcpProber {
@@ -321,9 +345,24 @@ impl Prober for TcpProber {
         wait: Duration,
     ) -> impl Future<Output = ProbeOutcome> + Send {
         async move {
-            match timeout(wait, self.session.request(unit, function_code)).await {
-                Ok(reply) => outcome_of(reply),
-                Err(_) => ProbeOutcome::NoReply,
+            if self.session.is_none() {
+                if let Err(e) = self.reconnect().await {
+                    return ProbeOutcome::LinkError(e);
+                }
+            }
+            let Some(session) = self.session.as_mut() else {
+                return ProbeOutcome::LinkError("not connected".to_string());
+            };
+            match timeout(wait, session.request(unit, function_code)).await {
+                // A mismatched reply is a stale answer to an earlier request.
+                Ok(Err(Error::Protocol(_))) | Err(_) => {}
+                Ok(reply) => return outcome_of(reply),
+            }
+            // Reconnect now rather than on the next read, so the next check's
+            // response time does not include the connect.
+            match self.reconnect().await {
+                Ok(()) => ProbeOutcome::NoReply,
+                Err(e) => ProbeOutcome::LinkError(e),
             }
         }
     }
@@ -347,27 +386,37 @@ mod tests {
 
     const WAIT: Duration = Duration::from_millis(100);
 
-    /// Unit 3 holds a value, unit 4 has no such register, unit 200 never
-    /// answers, and every other unit gets a gateway "no device" exception.
+    /// Unit 3 holds a value, unit 4 has no such register, unit 150 answers
+    /// like a gateway only after 150 ms, unit 200 never answers, and every
+    /// other unit gets a gateway "no device" exception.
     #[derive(Clone)]
     struct TestService;
+
+    type Reply = Result<Option<Response>, ExceptionCode>;
 
     impl Service for TestService {
         type Request = SlaveRequest<'static>;
         type Response = Option<Response>;
         type Exception = ExceptionCode;
-        type Future = future::Ready<Result<Option<Response>, ExceptionCode>>;
+        type Future = Pin<Box<dyn Future<Output = Reply> + Send>>;
 
         fn call(&self, req: SlaveRequest<'static>) -> Self::Future {
-            future::ready(match (req.slave, req.request) {
+            let reply: Reply = match (req.slave, req.request) {
                 (3, Request::ReadHoldingRegisters(_, n)) => {
                     Ok(Some(Response::ReadHoldingRegisters(vec![42; usize::from(n)])))
                 }
                 (3, _) => Err(ExceptionCode::IllegalFunction),
                 (4, _) => Err(ExceptionCode::IllegalDataAddress),
+                (150, Request::ReadHoldingRegisters(_, n)) => {
+                    return Box::pin(async move {
+                        tokio::time::sleep(Duration::from_millis(150)).await;
+                        Ok(Some(Response::ReadHoldingRegisters(vec![7; usize::from(n)])))
+                    });
+                }
                 (200, _) => Ok(None),
                 _ => Err(ExceptionCode::GatewayTargetDevice),
-            })
+            };
+            Box::pin(future::ready(reply))
         }
     }
 
@@ -406,6 +455,78 @@ mod tests {
         let mut p = connector(addr).connect().await.expect("connect");
         assert_eq!(p.read(200, 3, Duration::from_millis(30)).await, ProbeOutcome::NoReply);
         assert_eq!(p.read(3, 3, WAIT).await, ProbeOutcome::Value, "connection still usable");
+    }
+
+    #[tokio::test]
+    async fn tcp_late_reply_is_not_read_as_the_next_units_answer() {
+        let addr = start_server().await;
+        let mut p = connector(addr).connect().await.expect("connect");
+        // Unit 150 answers after 150 ms, well past the wait.
+        assert_eq!(p.read(150, 3, Duration::from_millis(40)).await, ProbeOutcome::NoReply);
+        // On the old connection unit 150's late reply would arrive first and
+        // be taken for unit 3's (or block it); the prober reconnected instead.
+        assert_eq!(p.read(3, 3, WAIT).await, ProbeOutcome::Value);
+        assert_eq!(p.read(4, 3, WAIT).await, ProbeOutcome::Exception(2));
+    }
+
+    /// A raw server that answers unit 1 with the wrong transaction id and
+    /// every other unit correctly; counts the connections it accepts.
+    async fn start_mismatch_server() -> (SocketAddr, Arc<AtomicU64>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicU64::new(0));
+        let count = accepted.clone();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                count.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut req = [0u8; 12];
+                    while s.read_exact(&mut req).await.is_ok() {
+                        let tid = if req[6] == 1 { req[1].wrapping_add(5) } else { req[1] };
+                        let reply = [req[0], tid, 0, 0, 0, 5, req[6], 3, 2, 0, 42];
+                        if s.write_all(&reply).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (addr, accepted)
+    }
+
+    #[tokio::test]
+    async fn tcp_mismatched_reply_is_no_reply_and_reconnects() {
+        let (addr, accepted) = start_mismatch_server().await;
+        let mut p = connector(addr).connect().await.expect("connect");
+        assert_eq!(p.read(1, 3, WAIT).await, ProbeOutcome::NoReply);
+        assert_eq!(p.read(2, 3, WAIT).await, ProbeOutcome::Value);
+        assert_eq!(p.read(3, 3, WAIT).await, ProbeOutcome::Value);
+        // The server may count an accept a moment after the client connected.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            2,
+            "the dirty connection was replaced once; clean replies keep it"
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_reconnect_failure_is_a_link_error() {
+        // Accepts one connection that never answers, then stops listening.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (s, _) = listener.accept().await.unwrap();
+            drop(listener);
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            drop(s);
+        });
+        let c = TcpConnector { addr, connect_timeout: Duration::from_millis(300) };
+        let mut p = c.connect().await.expect("connect");
+        match p.read(1, 3, Duration::from_millis(30)).await {
+            ProbeOutcome::LinkError(e) => assert!(e.starts_with("reconnect failed"), "{e}"),
+            other => panic!("expected LinkError, got {other:?}"),
+        }
     }
 
     #[tokio::test]

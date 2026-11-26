@@ -18,15 +18,15 @@ use tokio::sync::watch;
 use crate::analyzer_polling::AnalyzerPollingState;
 use crate::modbus::{
     begin_scan, clamp_timeout_ms, release_rtu_for_scan, release_tcp_for_scan, ModbusState,
-    SCAN_ALREADY_RUNNING,
+    ScanFlagGuard, SessionKind, SCAN_ALREADY_RUNNING,
 };
 use crate::settings::get_client_settings;
 use crate::workspace::validate_workspace_name;
 use engine::{
-    cancel_pair, run_scan, ScanDone, ScanFound, ScanNotice, ScanProgress, ScanSink,
+    cancel_pair, run_scan, Cancel, ScanDone, ScanFound, ScanNotice, ScanProgress, ScanSink,
 };
 use transport::{SerialOpener, TcpConnector};
-use types::{validate, ScanKind, ScanRequest};
+use types::{validate, ScanKind, ScanRequest, ValidScan};
 
 const POLLING_ACTIVE: &str = "Stop Analyzer polling before scanning — it is using the connection.";
 const PORT_RELEASE_WAIT: Duration = Duration::from_secs(3);
@@ -133,22 +133,20 @@ impl ScanSink for AppSink {
 
 // ---------- commands ----------
 
-/// Builds the TCP connector: the workspace connect timeout (read on the
-/// blocking pool) and the target resolved under that same timeout.
-async fn tcp_connector(
-    app: &tauri::AppHandle,
-    ws: &str,
-    host: &str,
-    port: u16,
-) -> Result<TcpConnector, String> {
+/// Reads the workspace connect timeout on the blocking pool.
+async fn connect_timeout_of(app: &tauri::AppHandle, ws: &str) -> Result<Duration, String> {
     let (app2, ws2) = (app.clone(), ws.to_string());
     let settings = tauri::async_runtime::spawn_blocking(move || get_client_settings(app2, ws2))
         .await
         .map_err(|e| format!("reading client settings failed: {e}"))??;
-    let connect_timeout = Duration::from_millis(clamp_timeout_ms(
+    Ok(Duration::from_millis(clamp_timeout_ms(
         settings.connect_timeout_ms,
         DEFAULT_CONNECT_TIMEOUT_MS,
-    ));
+    )))
+}
+
+/// Resolves the TCP target under the connect timeout.
+async fn tcp_connector(host: &str, port: u16, connect_timeout: Duration) -> Result<TcpConnector, String> {
     let host = host.trim();
     let addr: SocketAddr = tokio::time::timeout(connect_timeout, tokio::net::lookup_host((host, port)))
         .await
@@ -157,6 +155,75 @@ async fn tcp_connector(
         .next()
         .ok_or_else(|| format!("could not resolve {host}"))?;
     Ok(TcpConnector { addr, connect_timeout })
+}
+
+/// Everything the scan task owns. Dropping it clears the scanning flag and
+/// the scan's entry.
+struct Prepared {
+    flag: ScanFlagGuard,
+    entry: ScanEntryGuard,
+    cancel: Cancel,
+    connector: Option<Arc<TcpConnector>>,
+}
+
+/// Steps 2–6 of `start_slave_scan`, free of `AppHandle`. The scan is
+/// registered (so it can be cancelled) before the slow steps: resolving the
+/// TCP host and waiting for the shared session to close. `Ok(None)` means it
+/// was cancelled meanwhile; `done(cancelled)` has been sent and nothing was
+/// opened.
+#[allow(clippy::too_many_arguments)]
+async fn prepare<S: ScanSink>(
+    scan_state: &SlaveScanState,
+    modbus: &ModbusState,
+    polling: &AnalyzerPollingState,
+    ws: &str,
+    scan: &ValidScan,
+    connect_timeout: Duration,
+    release_wait: Duration,
+    sink: &S,
+) -> Result<Option<Prepared>, String> {
+    // 2. One scan per workspace.
+    check_free(scan_state, ws)?;
+    // 3. Analyzer polling uses the same port or connection.
+    if polling.is_running(ws) {
+        return Err(POLLING_ACTIVE.to_string());
+    }
+    // 4. From here on the shared session of this kind refuses to (re)open.
+    let session_kind = match scan.kind {
+        ScanKind::Serial => SessionKind::Rtu,
+        ScanKind::Tcp => SessionKind::Tcp,
+    };
+    let flag = begin_scan(modbus, ws, session_kind)?;
+    // Register the scan now so a cancel during the waits below is kept.
+    // On any error below, `flag` and `entry` drop and clear themselves.
+    let (tx, cancel) = cancel_pair();
+    reserve(scan_state, ws, &scan.scan_id, tx)?;
+    let entry = ScanEntryGuard::new(scan_state, ws, &scan.scan_id);
+    let connector = match (scan.kind, &scan.tcp) {
+        (ScanKind::Tcp, Some(t)) => Some(Arc::new(tcp_connector(&t.host, t.port, connect_timeout).await?)),
+        _ => None,
+    };
+    // 5. Close the shared session.
+    match scan.kind {
+        ScanKind::Serial => release_rtu_for_scan(modbus, ws, release_wait).await?,
+        ScanKind::Tcp => release_tcp_for_scan(modbus, ws, release_wait).await?,
+    }
+    if cancel.is_cancelled() {
+        // Free the workspace before telling the UI, so it can start again.
+        drop(entry);
+        drop(flag);
+        sink.done(ScanDone {
+            workspace: ws.to_string(),
+            scan_id: scan.scan_id.clone(),
+            reason: "cancelled".to_string(),
+            error: None,
+            checked: 0,
+            found: 0,
+        });
+        return Ok(None);
+    }
+    // 6. Ready to run.
+    Ok(Some(Prepared { flag, entry, cancel, connector }))
 }
 
 #[tauri::command]
@@ -169,31 +236,29 @@ pub async fn start_slave_scan(
     request: ScanRequest,
 ) -> Result<String, String> {
     let ws = validate_workspace_name(&name)?;
-    // 1. Validate (including the TCP target, before anything is touched).
+    // 1. Validate.
     let scan = validate(&request)?;
-    let connector = match (&scan.kind, &scan.tcp) {
-        (ScanKind::Tcp, Some(t)) => Some(Arc::new(tcp_connector(&app, &ws, &t.host, t.port).await?)),
-        _ => None,
+    let connect_timeout = match scan.kind {
+        ScanKind::Tcp => connect_timeout_of(&app, &ws).await?,
+        ScanKind::Serial => Duration::ZERO, // only TCP scans connect
     };
-    // 2. One scan per workspace.
-    check_free(&scan_state, &ws)?;
-    // 3. Analyzer polling uses the same port or connection.
-    if polling.is_running(&ws) {
-        return Err(POLLING_ACTIVE.to_string());
-    }
-    // 4. From here on the shared sessions refuse to (re)open.
-    let flag = begin_scan(&modbus, &ws)?;
-    // 5. Close the shared session; `flag` drops (clearing it) on error.
-    match scan.kind {
-        ScanKind::Serial => release_rtu_for_scan(&modbus, &ws, PORT_RELEASE_WAIT).await?,
-        ScanKind::Tcp => release_tcp_for_scan(&modbus, &ws, PORT_RELEASE_WAIT).await?,
-    }
-    // 6. Register the scan and run it; the task owns both guards.
-    let scan_id = scan.scan_id.clone();
-    let (tx, cancel) = cancel_pair();
-    reserve(&scan_state, &ws, &scan_id, tx)?;
-    let entry = ScanEntryGuard::new(&scan_state, &ws, &scan_id);
     let sink = Arc::new(AppSink(app.clone()));
+    let scan_id = scan.scan_id.clone();
+    let prepared = prepare(
+        &scan_state,
+        &modbus,
+        &polling,
+        &ws,
+        &scan,
+        connect_timeout,
+        PORT_RELEASE_WAIT,
+        &*sink,
+    )
+    .await?;
+    let Some(Prepared { flag, entry, cancel, connector }) = prepared else {
+        return Ok(scan_id);
+    };
+    // 6. Run it; the task owns both guards.
     let task_ws = ws.clone();
     tauri::async_runtime::spawn(async move {
         let _flag = flag;
@@ -287,5 +352,148 @@ mod tests {
         reserve(&state, "ws", "s2", tx2).unwrap();
         drop(ScanEntryGuard::new(&state, "ws", "s1"));
         assert!(check_free(&state, "ws").is_err());
+    }
+
+    // ---------- prepare ----------
+
+    use crate::modbus::scan_block_error;
+    use engine::{ScanFound, ScanNotice, ScanProgress};
+    use tokio::sync::Mutex as AsyncMutex;
+    use tokio_modbus::client;
+    use tokio_modbus::Slave;
+    use types::{ProbeKind, SerialParams};
+
+    #[derive(Default)]
+    struct DoneSink(Mutex<Vec<ScanDone>>);
+
+    impl ScanSink for DoneSink {
+        fn found(&self, _e: ScanFound) {}
+        fn progress(&self, _e: ScanProgress) {}
+        fn notice(&self, _e: ScanNotice) {}
+        fn done(&self, e: ScanDone) {
+            self.0.lock().unwrap().push(e);
+        }
+    }
+
+    fn serial_scan(id: &str) -> ValidScan {
+        ValidScan {
+            scan_id: id.into(),
+            kind: ScanKind::Serial,
+            units: vec![1, 2],
+            probe: ProbeKind::Holding,
+            wait: Duration::from_millis(50),
+            retries: 0,
+            ports: vec!["COM_TEST".into()],
+            combos: vec![SerialParams {
+                baud: 9600,
+                parity: "none".into(),
+                data_bits: 8,
+                stop_bits: 1,
+                flow_control: "none".into(),
+            }],
+            tcp: None,
+            concurrency: 1,
+        }
+    }
+
+    /// Puts a shared RTU session for `ws` in place and keeps it busy (locked)
+    /// for `ms`, like an in-flight request.
+    fn busy_rtu_session(modbus: &ModbusState, ws: &str, ms: u64) -> tokio::task::JoinHandle<()> {
+        let (ours, _theirs) = tokio::io::duplex(64);
+        let session = Arc::new(AsyncMutex::new(client::rtu::attach_slave(ours, Slave(1))));
+        modbus.rtu_sessions.lock().unwrap().insert(ws.into(), session.clone());
+        let in_flight = session.try_lock_owned().expect("fresh session is unlocked");
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+            drop(in_flight);
+        })
+    }
+
+    fn assert_released(scan_state: &SlaveScanState, modbus: &ModbusState) {
+        assert_eq!(scan_block_error(modbus, "ws", SessionKind::Rtu), None, "flag cleared");
+        check_free(scan_state, "ws").expect("entry cleared");
+    }
+
+    #[tokio::test]
+    async fn cancel_during_port_release_ends_the_scan_unopened() {
+        let (scan_state, modbus, polling) =
+            (SlaveScanState::default(), ModbusState::default(), AnalyzerPollingState::default());
+        let sink = DoneSink::default();
+        let holder = busy_rtu_session(&modbus, "ws", 100);
+        let scan = serial_scan("s1");
+
+        let cancel_meanwhile = async {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            // The scan is registered and owns the port flag while it waits.
+            assert!(check_free(&scan_state, "ws").is_err());
+            assert!(scan_block_error(&modbus, "ws", SessionKind::Rtu).is_some());
+            cancel_scan(&scan_state, "ws", "s1").expect("cancel");
+        };
+        let (prepared, ()) = tokio::join!(
+            prepare(&scan_state, &modbus, &polling, "ws", &scan, Duration::ZERO, Duration::from_secs(1), &sink),
+            cancel_meanwhile,
+        );
+
+        assert!(prepared.expect("not an error").is_none(), "nothing to run, nothing opened");
+        let done = sink.0.lock().unwrap();
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].reason, "cancelled");
+        assert_eq!(done[0].scan_id, "s1");
+        assert_released(&scan_state, &modbus);
+        holder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn release_timeout_clears_flag_and_entry() {
+        let (scan_state, modbus, polling) =
+            (SlaveScanState::default(), ModbusState::default(), AnalyzerPollingState::default());
+        let sink = DoneSink::default();
+        let holder = busy_rtu_session(&modbus, "ws", 500);
+        let scan = serial_scan("s1");
+
+        let res = prepare(&scan_state, &modbus, &polling, "ws", &scan, Duration::ZERO, Duration::from_millis(20), &sink).await;
+
+        assert_eq!(res.err().as_deref(), Some("Port busy, try again"));
+        assert_released(&scan_state, &modbus);
+        assert!(sink.0.lock().unwrap().is_empty(), "start failed, so no done event");
+        holder.abort();
+    }
+
+    #[tokio::test]
+    async fn polling_running_is_refused_and_nothing_reserved() {
+        let (scan_state, modbus, polling) =
+            (SlaveScanState::default(), ModbusState::default(), AnalyzerPollingState::default());
+        let worker = tokio::spawn(std::future::pending::<()>());
+        polling.insert_worker_for_test("ws", tauri::async_runtime::JoinHandle::Tokio(worker));
+        let sink = DoneSink::default();
+
+        let res = prepare(&scan_state, &modbus, &polling, "ws", &serial_scan("s1"), Duration::ZERO, Duration::from_millis(20), &sink).await;
+
+        assert_eq!(
+            res.err().as_deref(),
+            Some("Stop Analyzer polling before scanning — it is using the connection.")
+        );
+        assert_released(&scan_state, &modbus);
+        assert!(sink.0.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn prepared_scan_holds_flag_and_entry_until_dropped() {
+        let (scan_state, modbus, polling) =
+            (SlaveScanState::default(), ModbusState::default(), AnalyzerPollingState::default());
+        let sink = DoneSink::default();
+
+        let prepared = prepare(&scan_state, &modbus, &polling, "ws", &serial_scan("s1"), Duration::ZERO, Duration::from_millis(20), &sink)
+            .await
+            .expect("prepared")
+            .expect("not cancelled");
+
+        assert!(scan_block_error(&modbus, "ws", SessionKind::Rtu).is_some());
+        assert_eq!(scan_block_error(&modbus, "ws", SessionKind::Tcp), None, "serial scan only");
+        assert!(check_free(&scan_state, "ws").is_err());
+        assert!(!prepared.cancel.is_cancelled());
+        drop(prepared);
+        assert_released(&scan_state, &modbus);
+        assert!(sink.0.lock().unwrap().is_empty());
     }
 }

@@ -33,6 +33,14 @@ impl AnalyzerPollingState {
         let workers = self.workers.lock().unwrap_or_else(|e| e.into_inner());
         workers.get(ws.trim()).is_some_and(|h| !h.inner().is_finished())
     }
+
+    /// Registers a worker as if polling had started for `ws`.
+    #[cfg(test)]
+    pub(crate) fn insert_worker_for_test(&self, ws: &str, handle: JoinHandle<()>) {
+        if let Ok(mut workers) = self.workers.lock() {
+            workers.insert(ws.to_string(), handle);
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -26,10 +26,12 @@ pub type SessionMap = Arc<Mutex<HashMap<String, Arc<AsyncMutex<client::Context>>
 pub struct ModbusState {
     pub(crate) tcp_sessions: SessionMap,
     pub(crate) rtu_sessions: SessionMap,
-    /// Workspaces with a running slave scan. While a workspace is here the
-    /// scanner owns its serial port and TCP connection.
-    pub(crate) scanning: Arc<Mutex<HashSet<String>>>,
+    /// Workspaces with a running slave scan, and which session kind it
+    /// owns: a serial scan owns the serial port, a TCP scan the connection.
+    pub(crate) scanning: ScanFlags,
 }
+
+pub(crate) type ScanFlags = Arc<Mutex<HashMap<String, SessionKind>>>;
 
 const SCANNER_HAS_SERIAL: &str = "Serial port is in use by the slave scanner";
 const SCANNER_HAS_TCP: &str = "Connection is in use by the slave scanner";
@@ -42,16 +44,18 @@ pub(crate) enum SessionKind {
     Tcp,
 }
 
-/// Locks the scanning set. Recovers from poisoning: a set of names cannot be
+/// Locks the scanning flags. Recovers from poisoning: the map cannot be
 /// left half-updated, and the flag must still clear after a panic.
-fn lock_scanning(scanning: &Mutex<HashSet<String>>) -> std::sync::MutexGuard<'_, HashSet<String>> {
+fn lock_scanning(
+    scanning: &Mutex<HashMap<String, SessionKind>>,
+) -> std::sync::MutexGuard<'_, HashMap<String, SessionKind>> {
     scanning.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// The error a shared-session command returns while the scanner owns the
-/// workspace's port, or `None` when no scan is running.
+/// The error a shared-session command of `kind` returns while a scan owns
+/// that session kind in the workspace, or `None` otherwise.
 pub(crate) fn scan_block_error(state: &ModbusState, ws: &str, kind: SessionKind) -> Option<&'static str> {
-    if !lock_scanning(&state.scanning).contains(ws) {
+    if lock_scanning(&state.scanning).get(ws) != Some(&kind) {
         return None;
     }
     Some(match kind {
@@ -63,7 +67,7 @@ pub(crate) fn scan_block_error(state: &ModbusState, ws: &str, kind: SessionKind)
 /// Clears the workspace's scanning flag when dropped, on every exit path of
 /// the scan task (completion, failure, cancel, panic unwind).
 pub(crate) struct ScanFlagGuard {
-    scanning: Arc<Mutex<HashSet<String>>>,
+    scanning: ScanFlags,
     ws: String,
 }
 
@@ -73,17 +77,29 @@ impl Drop for ScanFlagGuard {
     }
 }
 
-/// Marks `ws` as scanning. Fails if a scan already holds the flag.
-pub(crate) fn begin_scan(state: &ModbusState, ws: &str) -> Result<ScanFlagGuard, String> {
-    if !lock_scanning(&state.scanning).insert(ws.to_string()) {
-        return Err(SCAN_ALREADY_RUNNING.to_string());
+/// Marks `ws` as scanning over `kind`. Fails if any scan already holds the
+/// workspace's flag (one scan per workspace).
+pub(crate) fn begin_scan(
+    state: &ModbusState,
+    ws: &str,
+    kind: SessionKind,
+) -> Result<ScanFlagGuard, String> {
+    {
+        let mut flags = lock_scanning(&state.scanning);
+        if flags.contains_key(ws) {
+            return Err(SCAN_ALREADY_RUNNING.to_string());
+        }
+        flags.insert(ws.to_string(), kind);
     }
     Ok(ScanFlagGuard { scanning: state.scanning.clone(), ws: ws.to_string() })
 }
 
-/// Removes the workspace's session from `map`, then waits up to `max_wait`
-/// for any in-flight request on it to finish before dropping it, which
-/// closes the port or connection (unless a request still holds a clone).
+const RELEASE_POLL: Duration = Duration::from_millis(10);
+
+/// Removes the workspace's session from `map`, then waits, all within
+/// `max_wait`, for any in-flight request on it to finish and for every other
+/// holder of the session (a caller that cloned it before the removal) to let
+/// go. Dropping the last reference closes the port or connection.
 async fn release_session<T>(
     map: &Mutex<HashMap<String, Arc<AsyncMutex<T>>>>,
     ws: &str,
@@ -93,11 +109,19 @@ async fn release_session<T>(
         .lock()
         .map_err(|_| "modbus session lock poisoned".to_string())?
         .remove(ws);
-    if let Some(session) = session {
-        let in_flight_done = timeout(max_wait, session.lock())
-            .await
-            .map_err(|_| PORT_BUSY.to_string())?;
-        drop(in_flight_done);
+    let Some(session) = session else {
+        return Ok(());
+    };
+    let deadline = tokio::time::Instant::now() + max_wait;
+    let in_flight_done = tokio::time::timeout_at(deadline, session.lock())
+        .await
+        .map_err(|_| PORT_BUSY.to_string())?;
+    drop(in_flight_done);
+    while Arc::strong_count(&session) > 1 {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(PORT_BUSY.to_string());
+        }
+        tokio::time::sleep(RELEASE_POLL).await;
     }
     Ok(())
 }
@@ -268,71 +292,144 @@ mod tests {
     fn ensure_rtu_session_refuses_while_scanning() {
         let state = ModbusState::default();
         assert_eq!(scan_block_error(&state, "ws", SessionKind::Rtu), None);
-        let guard = begin_scan(&state, "ws").expect("begin scan");
+        let guard = begin_scan(&state, "ws", SessionKind::Rtu).expect("begin scan");
         assert_eq!(
             scan_block_error(&state, "ws", SessionKind::Rtu),
             Some("Serial port is in use by the slave scanner")
         );
         assert_eq!(
             scan_block_error(&state, "ws", SessionKind::Tcp),
-            Some("Connection is in use by the slave scanner")
+            None,
+            "a serial scan leaves the TCP session alone"
         );
         assert_eq!(scan_block_error(&state, "other", SessionKind::Rtu), None);
         drop(guard);
         assert_eq!(scan_block_error(&state, "ws", SessionKind::Rtu), None);
+    }
+
+    #[test]
+    fn ensure_tcp_session_refuses_while_tcp_scanning() {
+        let state = ModbusState::default();
+        let guard = begin_scan(&state, "ws", SessionKind::Tcp).expect("begin scan");
+        assert_eq!(
+            scan_block_error(&state, "ws", SessionKind::Tcp),
+            Some("Connection is in use by the slave scanner")
+        );
+        assert_eq!(
+            scan_block_error(&state, "ws", SessionKind::Rtu),
+            None,
+            "a TCP scan leaves the serial session alone"
+        );
+        drop(guard);
         assert_eq!(scan_block_error(&state, "ws", SessionKind::Tcp), None);
     }
 
     #[test]
     fn begin_scan_twice_fails() {
         let state = ModbusState::default();
-        let first = begin_scan(&state, "ws").expect("first begin");
-        assert_eq!(
-            begin_scan(&state, "ws").err().as_deref(),
-            Some("A scan is already running in this workspace")
-        );
-        let other = begin_scan(&state, "other").expect("other workspace is independent");
+        let first = begin_scan(&state, "ws", SessionKind::Rtu).expect("first begin");
+        for kind in [SessionKind::Rtu, SessionKind::Tcp] {
+            assert_eq!(
+                begin_scan(&state, "ws", kind).err().as_deref(),
+                Some("A scan is already running in this workspace"),
+                "one scan per workspace, whatever its kind"
+            );
+        }
+        let other = begin_scan(&state, "other", SessionKind::Rtu).expect("other workspace");
         drop(first);
-        let again = begin_scan(&state, "ws").expect("flag cleared on drop");
+        let again = begin_scan(&state, "ws", SessionKind::Tcp).expect("flag cleared on drop");
         drop((other, again));
+    }
+
+    fn unit_map(ws: &str) -> (Arc<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>>, std::sync::Weak<AsyncMutex<()>>) {
+        let map: Arc<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>> = Arc::default();
+        let session = Arc::new(AsyncMutex::new(()));
+        let weak = Arc::downgrade(&session);
+        map.lock().unwrap().insert(ws.into(), session);
+        (map, weak)
+    }
+
+    fn held_for(session: Arc<AsyncMutex<()>>, ms: u64) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let _in_flight = session.lock().await;
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+        })
     }
 
     #[tokio::test]
     async fn release_rtu_waits_for_in_flight() {
-        let map: Arc<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>> = Arc::default();
-        let session = Arc::new(AsyncMutex::new(()));
-        map.lock().unwrap().insert("ws".into(), session.clone());
-
-        // An in-flight request holds the session for 50 ms.
-        let held = session.clone().lock_owned().await;
-        let holder = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            drop(held);
-        });
+        // An in-flight request holds the session lock for 50 ms.
+        let (map, weak) = unit_map("ws");
+        let holder = held_for(weak.upgrade().unwrap(), 50);
+        tokio::task::yield_now().await;
         release_session(&map, "ws", Duration::from_secs(1))
             .await
             .expect("released once the in-flight request ends");
         assert!(!map.lock().unwrap().contains_key("ws"));
+        assert!(weak.upgrade().is_none(), "the session is closed when release returns");
         holder.await.unwrap();
 
         // Held longer than the wait: busy.
-        map.lock().unwrap().insert("ws".into(), session.clone());
-        let _held = session.clone().lock_owned().await;
+        let (map, weak) = unit_map("ws");
+        let holder = held_for(weak.upgrade().unwrap(), 200);
+        tokio::task::yield_now().await;
         assert_eq!(
             release_session(&map, "ws", Duration::from_millis(10)).await.err().as_deref(),
             Some("Port busy, try again")
         );
         assert!(!map.lock().unwrap().contains_key("ws"), "entry is gone even when busy");
+        holder.abort();
 
         // Nothing to release is fine.
         release_session(&map, "none", Duration::from_millis(10)).await.expect("no session");
     }
 
     #[tokio::test]
+    async fn release_waits_for_unlocked_clones() {
+        // A caller cloned the session (e.g. a simulator route read) but has
+        // not locked it yet.
+        let (map, weak) = unit_map("ws");
+        let clone = weak.upgrade().unwrap();
+        let holder = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            drop(clone);
+        });
+        release_session(&map, "ws", Duration::from_secs(1))
+            .await
+            .expect("released once the clone is dropped");
+        assert!(weak.upgrade().is_none(), "the session is closed when release returns");
+        holder.await.unwrap();
+
+        // A clone kept past the wait: busy.
+        let (map, weak) = unit_map("ws");
+        let _kept = weak.upgrade().unwrap();
+        assert_eq!(
+            release_session(&map, "ws", Duration::from_millis(30)).await.err().as_deref(),
+            Some("Port busy, try again")
+        );
+    }
+
+    fn dummy_session() -> Arc<AsyncMutex<client::Context>> {
+        let (ours, _theirs) = tokio::io::duplex(64);
+        Arc::new(AsyncMutex::new(client::rtu::attach_slave(ours, Slave(1))))
+    }
+
+    #[tokio::test]
     async fn release_for_scan_drops_the_workspace_entry_only() {
         let state = ModbusState::default();
-        assert!(release_rtu_for_scan(&state, "ws", Duration::from_millis(10)).await.is_ok());
-        assert!(release_tcp_for_scan(&state, "ws", Duration::from_millis(10)).await.is_ok());
+        for map in [&state.rtu_sessions, &state.tcp_sessions] {
+            let mut m = map.lock().unwrap();
+            m.insert("ws".into(), dummy_session());
+            m.insert("other".into(), dummy_session());
+        }
+        release_rtu_for_scan(&state, "ws", Duration::from_millis(100)).await.expect("rtu");
+        assert!(!state.rtu_sessions.lock().unwrap().contains_key("ws"));
+        assert!(state.rtu_sessions.lock().unwrap().contains_key("other"));
+        assert!(state.tcp_sessions.lock().unwrap().contains_key("ws"), "RTU release keeps TCP");
+
+        release_tcp_for_scan(&state, "ws", Duration::from_millis(100)).await.expect("tcp");
+        assert!(!state.tcp_sessions.lock().unwrap().contains_key("ws"));
+        assert!(state.tcp_sessions.lock().unwrap().contains_key("other"));
     }
 }
 
