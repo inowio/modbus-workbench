@@ -674,6 +674,158 @@ impl<R: tauri::Runtime> ValuesSink for tauri::AppHandle<R> {
 /// animate at each register's own interval; this only caps the display refresh.
 const EMIT_INTERVAL_MS: f64 = 100.0;
 
+/// Upper bound on one route-from-slave read, INCLUDING the wait for the shared
+/// client session lock. A read that exceeds it marks the register "stale".
+const ROUTE_READ_TIMEOUT_MS: u64 = 1000;
+
+/// Key of a configured register in the banks: (unit, bank/function code, address).
+type RegKey = (u8, u8, u16);
+
+/// Next-due time of a periodic register update, plus the period it was
+/// scheduled with (so a changed interval is detected and re-timed).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Due {
+    pub at: f64,
+    pub period: f64,
+}
+
+/// Next due time after a fire that was due at `due`: stays on the
+/// `due + period` grid (no cumulative drift from tick jitter), but if that is
+/// still not in the future (more than one period behind) it resyncs to
+/// `elapsed + period` instead of bursting to catch up.
+pub fn advance_due(due: f64, period: f64, elapsed: f64) -> f64 {
+    let next = due + period;
+    if next <= elapsed { elapsed + period } else { next }
+}
+
+/// Whether the register `d` is due at `elapsed`; if so, reschedules it in
+/// `next_due`. A register seen for the first time (or whose interval changed)
+/// is due immediately.
+fn take_due(next_due: &mut HashMap<RegKey, Due>, d: &DynReg, elapsed: f64) -> bool {
+    let key = (d.unit, d.bank, d.address);
+    let at = match next_due.get(&key) {
+        Some(due) if due.period == d.interval_ms => {
+            if elapsed < due.at {
+                return false;
+            }
+            advance_due(due.at, d.interval_ms, elapsed)
+        }
+        _ => elapsed + d.interval_ms,
+    };
+    next_due.insert(key, Due { at, period: d.interval_ms });
+    true
+}
+
+/// Drop scheduling state for registers no longer in `dynamics` (deleted or
+/// moved) or whose interval changed, so the live list's edits take effect
+/// cleanly; unchanged registers keep their schedule.
+pub fn prune_next_due(next_due: &mut HashMap<RegKey, Due>, dynamics: &[DynReg]) {
+    let live: HashMap<RegKey, f64> = dynamics
+        .iter()
+        .map(|d| ((d.unit, d.bank, d.address), d.interval_ms))
+        .collect();
+    next_due.retain(|k, due| live.get(k) == Some(&due.period));
+}
+
+/// A rule action whose rule fired but whose per-action delay hasn't elapsed.
+#[derive(Debug, Clone)]
+pub struct PendingAction {
+    pub due: f64,
+    pub rule_id: i64,
+    pub action: TimedAction,
+    pub seed: u64,
+}
+
+/// Bring per-rule runtime state in line with a hot-applied rule list: a rule
+/// that was removed, disabled, or changed in any way loses its `RuleState`
+/// (interval due time, last condition/value) and its queued delayed actions;
+/// an identical rule keeps both.
+pub fn reconcile_rules(
+    prev: &[RuleDef],
+    next: &[RuleDef],
+    states: &mut HashMap<i64, RuleState>,
+    pending: &mut Vec<PendingAction>,
+) {
+    let unchanged = |id: i64| {
+        let before = prev.iter().find(|r| r.id == id);
+        let after = next.iter().find(|r| r.id == id);
+        matches!((before, after), (Some(a), Some(b)) if a == b && b.enabled)
+    };
+    states.retain(|id, _| unchanged(*id));
+    pending.retain(|p| unchanged(p.rule_id));
+}
+
+/// Route connection kinds: `"serial"` and `"rtu"` both mean the workspace's
+/// RTU session (matches `modbus::ensure_route_session`); anything else is TCP.
+fn is_serial_kind(kind: &str) -> bool {
+    matches!(kind, "serial" | "rtu")
+}
+
+/// The `slaves.connection_kind` spelling for a route connection kind (the
+/// slaves table stores `"serial"`, never `"rtu"`).
+fn slave_table_kind(kind: &str) -> &str {
+    if is_serial_kind(kind) { "serial" } else { kind }
+}
+
+/// Route-from-slave reader, run as its own task so a slow or hung source
+/// never stalls the tick (generators, rules, delayed actions, emits). Reads
+/// each due route register through the workspace's shared client session and
+/// writes the result through `update_existing_words` (a register deleted
+/// mid-read is not resurrected). Status per register: "ok", "stale" (read
+/// failed/timed out — last-good value kept) or "missing" (no session).
+async fn route_loop(
+    banks: Banks,
+    statuses: StatusMap,
+    dynamics: Arc<Mutex<Vec<DynReg>>>,
+    tcp_sessions: crate::modbus::SessionMap,
+    rtu_sessions: crate::modbus::SessionMap,
+    workspace: String,
+    tick_ms: u64,
+    start: std::time::Instant,
+) {
+    let mut ticker = tokio::time::interval(Duration::from_millis(tick_ms.max(10)));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut next_due: HashMap<RegKey, Due> = HashMap::new();
+    loop {
+        ticker.tick().await;
+        let routes: Vec<DynReg> = dynamics
+            .lock()
+            .map(|g| g.iter().filter(|d| matches!(d.kind, DynKind::Route { .. })).cloned().collect())
+            .unwrap_or_default();
+        prune_next_due(&mut next_due, &routes);
+        if let Ok(mut s) = statuses.lock() {
+            s.retain(|k, _| routes.iter().any(|d| (d.unit, d.bank, d.address) == *k));
+        }
+        for d in routes.iter() {
+            let elapsed = start.elapsed().as_millis() as f64;
+            if !take_due(&mut next_due, d, elapsed) {
+                continue;
+            }
+            let DynKind::Route { slave_unit, connection_kind, src_fc, src_addr, count, scale, offset, src_byte_order } = &d.kind else {
+                continue;
+            };
+            let map = if is_serial_kind(connection_kind) { &rtu_sessions } else { &tcp_sessions };
+            let session = map.lock().ok().and_then(|g| g.get(&workspace).cloned());
+            let status = match session {
+                None => "missing",
+                Some(sess) => match route_read_words(sess, *slave_unit, *src_fc, *src_addr, *count, ROUTE_READ_TIMEOUT_MS).await {
+                    Ok(words) => {
+                        let out = transform_route_words(d, &words, *scale, *offset, src_byte_order);
+                        if let Ok(mut guard) = banks.write() {
+                            update_existing_words(&mut guard, d.unit, d.bank, d.address, &out);
+                        }
+                        "ok"
+                    }
+                    Err(_) => "stale",
+                },
+            };
+            if let Ok(mut s) = statuses.lock() {
+                s.insert((d.unit, d.bank, d.address), status);
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct SimEngine {
     banks: Option<Banks>,
@@ -682,6 +834,7 @@ pub struct SimEngine {
     handle: Option<JoinHandle<()>>,
     tick_shutdown: Option<oneshot::Sender<()>>,
     tick_handle: Option<JoinHandle<()>>,
+    route_handle: Option<JoinHandle<()>>,
     statuses: StatusMap,
     // Live generator/route + rule lists the tick reads each iteration. Held
     // behind a shared lock so mutations (add/edit/delete register, rule, or
@@ -817,7 +970,7 @@ impl SimEngine {
         dynamics: Vec<DynReg>,
         tcp_sessions: crate::modbus::SessionMap,
         rtu_sessions: crate::modbus::SessionMap,
-        rules: Vec<RuleDef>,
+        mut rules: Vec<RuleDef>,
     ) -> Result<ListenInfo, String> {
         if self.is_running() {
             return Err("simulator already running".to_string());
@@ -871,9 +1024,9 @@ impl SimEngine {
         self.shutdown = Some(tx);
         self.handle = Some(handle);
 
-        // Interval tick task: recomputes device/generator registers and pushes
-        // live values via the `simulator_values` event. Never holds the banks
-        // write lock across an `.await`.
+        // Route-from-slave reads run in their own task (see `route_loop`), so
+        // the tick below never awaits the network. Both tasks share the banks,
+        // statuses and live generator/route list.
         let statuses: StatusMap = Arc::new(Mutex::new(HashMap::new()));
         self.statuses = statuses.clone();
 
@@ -881,9 +1034,27 @@ impl SimEngine {
         // running take effect on the next tick (no Stop/Start).
         let dynamics_arc: Arc<Mutex<Vec<DynReg>>> = Arc::new(Mutex::new(dynamics));
         self.dynamics = dynamics_arc.clone();
-        let rules_arc: Arc<Mutex<Vec<RuleDef>>> = Arc::new(Mutex::new(rules));
+        rules.sort_by_key(|r| r.sort_order);
+        let rules_arc: Arc<Mutex<Vec<RuleDef>>> = Arc::new(Mutex::new(rules.clone()));
         self.rules = rules_arc.clone();
 
+        let start = std::time::Instant::now();
+        self.route_handle = Some(tokio::spawn(route_loop(
+            banks.clone(),
+            statuses.clone(),
+            dynamics_arc.clone(),
+            tcp_sessions,
+            rtu_sessions,
+            workspace.clone(),
+            tick_ms,
+            start,
+        )));
+
+        // Interval tick task: recomputes generator/device registers, runs
+        // rules and their delayed actions, and pushes live values via the
+        // `simulator_values` event. Fully synchronous per tick — it never
+        // awaits anything but the ticker, and never holds the banks write lock
+        // across an `.await`.
         let (tick_tx, mut tick_rx) = oneshot::channel::<()>();
         let tick_banks = banks.clone();
         let tick_statuses = statuses.clone();
@@ -892,62 +1063,41 @@ impl SimEngine {
         let tick_rules = rules_arc.clone();
         let tick_handle = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_millis(tick_ms.max(10)));
-            let start = std::time::Instant::now();
+            // A late tick (busy runtime, suspended laptop) runs once, not as a
+            // burst of catch-up ticks.
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             // Per-register next-due time keyed by (unit, bank, address) so the
             // list can change under us (add/remove) without misaligning timing.
-            let mut next_due: HashMap<(u8, u8, u16), f64> = HashMap::new();
+            let mut next_due: HashMap<RegKey, Due> = HashMap::new();
             let mut last_emit = 0.0f64;
             let mut rule_states: HashMap<i64, RuleState> = HashMap::new();
+            // The rule list the states/pending actions below belong to; when
+            // a hot-apply changes it, `reconcile_rules` drops what's stale.
+            let mut prev_rules: Vec<RuleDef> = rules;
             // Actions whose rule fired but whose per-action delay hasn't elapsed
-            // yet: (due_ms, action, rng_seed). Drained each tick when due.
-            let mut pending_actions: Vec<(f64, TimedAction, u64)> = Vec::new();
+            // yet. Drained each tick when due.
+            let mut pending_actions: Vec<PendingAction> = Vec::new();
             loop {
                 tokio::select! {
                     _ = &mut tick_rx => break,
                     _ = ticker.tick() => {
                         let elapsed = start.elapsed().as_millis() as f64;
-                        // Read the live config under a short lock, cloned so the
-                        // lock is never held across the route-read `.await` below.
+                        // Read the live config under a short lock, cloned.
                         let dynamics: Vec<DynReg> = tick_dynamics.lock().map(|g| g.clone()).unwrap_or_default();
                         let rules: Vec<RuleDef> = tick_rules.lock().map(|g| g.clone()).unwrap_or_default();
-                        // Collect updates WITHOUT holding the banks lock: route
-                        // reads await the network, generator/preset values are
-                        // computed synchronously. The std write lock is taken
-                        // once below, after every `.await` has resolved.
+                        if rules != prev_rules {
+                            reconcile_rules(&prev_rules, &rules, &mut rule_states, &mut pending_actions);
+                            prev_rules = rules.clone();
+                        }
+                        prune_next_due(&mut next_due, &dynamics);
+                        // Compute generator/preset values before taking the
+                        // write lock (route registers are `route_loop`'s job).
                         let mut updates: Vec<(u8, u8, u16, Vec<u16>)> = Vec::new();
                         for d in dynamics.iter() {
-                            let key = (d.unit, d.bank, d.address);
-                            if elapsed < *next_due.get(&key).unwrap_or(&0.0) { continue; }
-                            next_due.insert(key, elapsed + d.interval_ms);
-                            match &d.kind {
-                                DynKind::Generator { .. } | DynKind::Preset { .. } => {
-                                    if let Ok(words) = encode_value(&d.data_type, &d.byte_order, dyn_value(d, elapsed)) {
-                                        updates.push((d.unit, d.bank, d.address, words));
-                                    }
-                                }
-                                DynKind::Route { slave_unit, connection_kind, src_fc, src_addr, count, scale, offset, src_byte_order } => {
-                                    let map = if connection_kind == "serial" { &rtu_sessions } else { &tcp_sessions };
-                                    let session = map.lock().ok().and_then(|g| g.get(&workspace).cloned());
-                                    // "missing" = no client session for this workspace (client not
-                                    // connected). "stale" = a session exists but the source read
-                                    // errored/timed out. Last-good value is kept in both cases; a
-                                    // finer "dangling config / deleted slave" distinction is a
-                                    // possible future refinement.
-                                    let status = match session {
-                                        None => "missing", // no session yet → keep last-good
-                                        Some(sess) => match route_read_words(sess, *slave_unit, *src_fc, *src_addr, *count, 1000).await {
-                                            Ok(words) => {
-                                                let out = transform_route_words(d, &words, *scale, *offset, src_byte_order);
-                                                updates.push((d.unit, d.bank, d.address, out));
-                                                "ok"
-                                            }
-                                            Err(_) => "stale", // read error/timeout → keep last-good
-                                        },
-                                    };
-                                    if let Ok(mut s) = tick_statuses.lock() {
-                                        s.insert((d.unit, d.bank, d.address), status);
-                                    }
-                                }
+                            if matches!(d.kind, DynKind::Route { .. }) { continue; }
+                            if !take_due(&mut next_due, d, elapsed) { continue; }
+                            if let Ok(words) = encode_value(&d.data_type, &d.byte_order, dyn_value(d, elapsed)) {
+                                updates.push((d.unit, d.bank, d.address, words));
                             }
                         }
                         {
@@ -956,7 +1106,7 @@ impl SimEngine {
                                 update_existing_words(&mut guard, *u, *b, *a, w);
                             }
                             // Rules run last, synchronously, under the same
-                            // write lock: they see this tick's generator/route
+                            // write lock: they see this tick's generator
                             // updates and their own actions apply before serve.
                             let drained: Vec<(u8, u8, u16)> = tick_writes
                                 .lock()
@@ -964,9 +1114,9 @@ impl SimEngine {
                                 .unwrap_or_default();
                             // First apply any previously-scheduled delayed actions
                             // that have come due, then evaluate rules for this tick.
-                            pending_actions.retain(|(due, ta, seed)| {
-                                if *due <= elapsed {
-                                    apply_timed_action(&mut guard, ta, *seed);
+                            pending_actions.retain(|p| {
+                                if p.due <= elapsed {
+                                    apply_timed_action(&mut guard, &p.action, p.seed);
                                     false
                                 } else {
                                     true
@@ -978,10 +1128,10 @@ impl SimEngine {
                                 if ta.delay_ms <= 0.0 {
                                     apply_timed_action(&mut guard, &ta, seed);
                                 } else {
-                                    pending_actions.push((elapsed + ta.delay_ms, ta, seed));
+                                    pending_actions.push(PendingAction { due: elapsed + ta.delay_ms, rule_id: id, action: ta, seed });
                                 }
                             }
-                        } // lock dropped before any await/emit
+                        } // lock dropped before emit
                         if elapsed - last_emit >= EMIT_INTERVAL_MS {
                             last_emit = elapsed;
                             let rows = snapshot_rows(&tick_banks, &tick_statuses);
@@ -1016,6 +1166,10 @@ impl SimEngine {
             let _ = handle.await;
         }
         if let Some(handle) = self.tick_handle.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+        if let Some(handle) = self.route_handle.take() {
             handle.abort();
             let _ = handle.await;
         }
@@ -2263,7 +2417,7 @@ pub struct TimedAction {
 }
 
 /// A fully-parsed rule, ready for evaluation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RuleDef {
     pub id: i64,
     pub enabled: bool,
@@ -2506,8 +2660,8 @@ fn compare(cur: i64, op: &str, value: i64, last_value: Option<i64>) -> bool {
 /// rules pre-sorted by `sort_order`). Rules with no existing `RuleState` get a
 /// default one inserted (Interval `next_due: 0.0` fires at t=0).
 ///
-/// - `Interval`: fires when `elapsed_ms >= next_due`, then reschedules
-///   `next_due = elapsed_ms + ms`.
+/// - `Interval`: fires when `elapsed_ms >= next_due`, then reschedules on the
+///   `next_due + ms` grid (no drift; resyncs via `advance_due` when far behind).
 /// - `Condition`: edge-fired — reads the current word/bit, compares it, and
 ///   fires only on the false→true transition; `last_condition`/`last_value`
 ///   are updated every call (fired or not). A missing register is "not met".
@@ -2526,7 +2680,7 @@ pub fn eval_rules(
         let fired = match &r.trigger {
             Trigger::Interval { ms } => {
                 if elapsed_ms >= state.next_due {
-                    state.next_due = elapsed_ms + ms;
+                    state.next_due = advance_due(state.next_due, *ms, elapsed_ms);
                     true
                 } else {
                     false
@@ -2993,7 +3147,7 @@ fn refresh_running_config(
         for d in dynamics.iter_mut() {
             if let DynKind::Route { slave_unit, connection_kind, src_addr, .. } = &mut d.kind {
                 let (_id, offset) = crate::modbus::lookup_slave_id_and_address_offset(
-                    app, ws, *slave_unit as i64, connection_kind,
+                    app, ws, *slave_unit as i64, slave_table_kind(connection_kind),
                 );
                 *src_addr = (*src_addr as i64 + offset).clamp(0, 65535) as u16;
             }
@@ -3037,7 +3191,7 @@ pub async fn simulator_start(
     for d in dynamics.iter_mut() {
         if let DynKind::Route { slave_unit, connection_kind, src_addr, .. } = &mut d.kind {
             let (_id, offset) = crate::modbus::lookup_slave_id_and_address_offset(
-                &app, &ws, *slave_unit as i64, connection_kind,
+                &app, &ws, *slave_unit as i64, slave_table_kind(connection_kind),
             );
             *src_addr = (*src_addr as i64 + offset).clamp(0, 65535) as u16;
         }
@@ -3356,32 +3510,28 @@ pub async fn route_read_words(
     qty: u16,
     timeout_ms: u64,
 ) -> Result<Vec<u16>, String> {
-    use tokio::time::timeout;
-    let mut ctx = session.lock().await;
-    ctx.set_slave(tokio_modbus::prelude::Slave(unit));
+    if !(1..=4).contains(&fc) {
+        return Err(format!("unsupported route function code {fc}"));
+    }
     let dur = Duration::from_millis(timeout_ms.max(50));
-    let words = match fc {
-        3 => timeout(dur, ctx.read_holding_registers(start, qty)).await,
-        4 => timeout(dur, ctx.read_input_registers(start, qty)).await,
-        1 | 2 => {
-            let res = if fc == 1 {
-                timeout(dur, ctx.read_coils(start, qty)).await
-            } else {
-                timeout(dur, ctx.read_discrete_inputs(start, qty)).await
-            };
-            let bits = res
-                .map_err(|_| format!("route read timed out after {timeout_ms} ms"))?
-                .map_err(|e| format!("route read transport error: {e}"))?
-                .map_err(|e| format!("route read modbus exception: {e}"))?;
-            return Ok(bits.into_iter().map(|b| if b { 1u16 } else { 0u16 }).collect());
+    // The session-lock wait is inside the timeout: a session held by a hung
+    // read elsewhere makes this read time out too instead of waiting forever.
+    let read = async move {
+        let transport = |e: tokio_modbus::Error| format!("route read transport error: {e}");
+        let exception = |e: ExceptionCode| format!("route read modbus exception: {e}");
+        let bits_to_words = |bits: Vec<bool>| bits.into_iter().map(u16::from).collect::<Vec<u16>>();
+        let mut ctx = session.lock().await;
+        ctx.set_slave(tokio_modbus::prelude::Slave(unit));
+        match fc {
+            1 => ctx.read_coils(start, qty).await.map_err(transport)?.map(bits_to_words).map_err(exception),
+            2 => ctx.read_discrete_inputs(start, qty).await.map_err(transport)?.map(bits_to_words).map_err(exception),
+            3 => ctx.read_holding_registers(start, qty).await.map_err(transport)?.map_err(exception),
+            _ => ctx.read_input_registers(start, qty).await.map_err(transport)?.map_err(exception),
         }
-        other => return Err(format!("unsupported route function code {other}")),
     };
-    let out = words
+    tokio::time::timeout(dur, read)
+        .await
         .map_err(|_| format!("route read timed out after {timeout_ms} ms"))?
-        .map_err(|e| format!("route read transport error: {e}"))?
-        .map_err(|e| format!("route read modbus exception: {e}"))?;
-    Ok(out)
 }
 
 #[cfg(test)]
@@ -4903,5 +5053,191 @@ mod tests {
         let input = snap.get(&1).map(|b| b.input.clone()).unwrap_or_default();
         engine.stop().await;
         assert!(input.is_empty(), "cleared register was resurrected by the tick: {input:?}");
+    }
+
+    #[test]
+    fn interval_rule_has_no_cumulative_drift() {
+        let rules = vec![rule(1, Trigger::Interval { ms: 100.0 }, vec![Action::Toggle { unit: 1, bank: 1, address: 0 }])];
+        let mut st = HashMap::new();
+        let b = HashMap::new();
+        assert_eq!(eval_rules(&rules, &mut st, &b, 0.0, &[]).len(), 1);   // t=0 → next 100
+        assert_eq!(eval_rules(&rules, &mut st, &b, 150.0, &[]).len(), 1); // late fire → next 200 (not 250)
+        assert_eq!(eval_rules(&rules, &mut st, &b, 210.0, &[]).len(), 1); // on the 200 grid
+        // Far behind (> one period): fire once, then resync — no burst.
+        assert_eq!(eval_rules(&rules, &mut st, &b, 650.0, &[]).len(), 1);
+        assert_eq!(eval_rules(&rules, &mut st, &b, 660.0, &[]).len(), 0, "no catch-up burst");
+        assert_eq!(eval_rules(&rules, &mut st, &b, 750.0, &[]).len(), 1, "resynced to elapsed + period");
+    }
+
+    #[test]
+    fn advance_due_keeps_grid_and_resyncs_when_far_behind() {
+        assert_eq!(advance_due(100.0, 100.0, 130.0), 200.0);
+        assert_eq!(advance_due(100.0, 100.0, 199.0), 200.0);
+        assert_eq!(advance_due(100.0, 100.0, 450.0), 550.0);
+    }
+
+    #[test]
+    fn prune_next_due_drops_removed_and_retimed_registers() {
+        let mk = |addr: u16, interval: f64| DynReg {
+            unit: 1, bank: 3, address: addr, data_type: "u16".into(), byte_order: "ABCD".into(),
+            kind: DynKind::Generator { kind: "sine".into(), params: GenParams { min: 0.0, max: 1.0, period_ms: 1000.0 }, seed: 0 },
+            interval_ms: interval,
+        };
+        let mut due: HashMap<(u8, u8, u16), Due> = HashMap::new();
+        due.insert((1, 3, 0), Due { at: 500.0, period: 100.0 }); // unchanged → kept
+        due.insert((1, 3, 1), Due { at: 500.0, period: 100.0 }); // interval changed → reset
+        due.insert((1, 3, 2), Due { at: 500.0, period: 100.0 }); // removed → pruned
+        prune_next_due(&mut due, &[mk(0, 100.0), mk(1, 250.0)]);
+        assert_eq!(due.len(), 1);
+        assert!(due.contains_key(&(1, 3, 0)));
+    }
+
+    #[test]
+    fn reconcile_rules_resets_state_only_for_changed_rules() {
+        let keep = rule(1, Trigger::Interval { ms: 100.0 }, vec![Action::Toggle { unit: 1, bank: 1, address: 0 }]);
+        let change = rule(2, Trigger::Interval { ms: 100.0 }, vec![Action::Toggle { unit: 1, bank: 1, address: 1 }]);
+        let remove = rule(3, Trigger::Interval { ms: 100.0 }, vec![Action::Toggle { unit: 1, bank: 1, address: 2 }]);
+        let disable = rule(4, Trigger::Interval { ms: 100.0 }, vec![Action::Toggle { unit: 1, bank: 1, address: 3 }]);
+        let prev = vec![keep.clone(), change.clone(), remove.clone(), disable.clone()];
+        let changed = RuleDef { trigger: Trigger::Interval { ms: 500.0 }, ..change.clone() };
+        let disabled = RuleDef { enabled: false, ..disable.clone() };
+        let next = vec![keep.clone(), changed, disabled];
+        let mut states: HashMap<i64, RuleState> = HashMap::new();
+        let mut pending: Vec<PendingAction> = Vec::new();
+        for id in 1..=4 {
+            states.insert(id, RuleState { next_due: 900.0, last_condition: true, last_value: Some(1) });
+            pending.push(PendingAction { due: 1000.0, rule_id: id, action: keep.actions[0].clone(), seed: 0 });
+        }
+        reconcile_rules(&prev, &next, &mut states, &mut pending);
+        assert_eq!(states.keys().copied().collect::<Vec<_>>(), vec![1], "only the unchanged rule keeps its state");
+        assert_eq!(states[&1].next_due, 900.0);
+        assert_eq!(pending.iter().map(|p| p.rule_id).collect::<Vec<_>>(), vec![1], "queued actions of removed/changed/disabled rules dropped");
+    }
+
+    #[tokio::test]
+    async fn deleted_rules_queued_action_never_fires() {
+        // holding[0]=0; a rule fires at t=0 with a 300ms-delayed set-to-42.
+        // The rule is removed before the action is due: it must not fire.
+        let mut banks = HashMap::new();
+        place_words(&mut banks, 1, 3, 0, &[0]);
+        let ta = TimedAction { delay_ms: 300.0, ..timed(Action::Set { unit: 1, bank: 3, address: 0, value: 42 }) };
+        let r = RuleDef { id: 7, enabled: true, sort_order: 0, trigger: Trigger::Interval { ms: 60000.0 }, actions: vec![ta] };
+        let mut engine = SimEngine::new();
+        engine.start(NoopSink, "ws".into(), "127.0.0.1", 0, 20, banks, Vec::new(), Default::default(), Default::default(), vec![r]).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        engine.set_rules(Vec::new());
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        let v = engine.snapshot().get(&1).and_then(|b| b.holding.get(&0).copied());
+        engine.stop().await;
+        assert_eq!(v, Some(0), "a deleted rule's queued action fired");
+    }
+
+    /// A TCP endpoint that accepts connections and never answers, so a
+    /// Modbus read against it hangs until its timeout.
+    async fn black_hole() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let h = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((s, _)) = l.accept().await { held.push(s); }
+        });
+        (addr, h)
+    }
+
+    #[tokio::test]
+    async fn route_read_lock_wait_is_inside_the_timeout() {
+        let (addr, hole) = black_hole().await;
+        let ctx = tokio_modbus::client::tcp::connect(addr).await.unwrap();
+        let session = std::sync::Arc::new(tokio::sync::Mutex::new(ctx));
+        // Someone else holds the session (e.g. a hung read): the route read
+        // must give up after its own timeout, not wait for the lock forever.
+        let _held = session.clone().lock_owned().await;
+        let res = tokio::time::timeout(
+            std::time::Duration::from_millis(1500),
+            route_read_words(session.clone(), 1, 3, 0, 1, 100),
+        ).await;
+        hole.abort();
+        assert!(matches!(res, Ok(Err(_))), "route read waited on the session lock past its timeout");
+    }
+
+    #[tokio::test]
+    async fn slow_route_read_does_not_freeze_generators() {
+        use crate::modbus::SessionMap;
+        let (addr, hole) = black_hole().await;
+        let tcp_map: SessionMap = Default::default();
+        {
+            let ctx = tokio_modbus::client::tcp::connect(addr).await.unwrap();
+            tcp_map.lock().unwrap().insert("ws".to_string(), std::sync::Arc::new(tokio::sync::Mutex::new(ctx)));
+        }
+        let gen = SimRegister {
+            id: 1, unit_id: 1, function_code: 4, address: 0, alias: "".into(), data_type: "f32".into(),
+            hold_value: 0, value_source: "generator".into(), byte_order: "ABCD".into(),
+            source_params: "{\"kind\":\"ramp\",\"min\":0,\"max\":100,\"periodMs\":1000}".into(),
+            interval_ms: 20, sort_order: 0, device_instance_id: None, unit: None, display_format: None,
+        };
+        let route_reg = SimRegister {
+            id: 2, address: 10, data_type: "u16".into(), value_source: "route".into(),
+            source_params: "{\"slaveUnitId\":1,\"connectionKind\":\"tcp\",\"functionCode\":3,\"address\":0}".into(),
+            ..gen.clone()
+        };
+        let regs = [gen, route_reg];
+        let banks = registers_to_banks(&regs);
+        let dynamics: Vec<DynReg> = regs.iter().filter_map(parse_dynamic).collect();
+        let mut engine = SimEngine::new();
+        engine.start(NoopSink, "ws".into(), "127.0.0.1", 0, 20, banks, dynamics, tcp_map, Default::default(), Vec::new()).await.unwrap();
+        let read = |e: &SimEngine| {
+            let s = e.snapshot();
+            let b = s.get(&1).unwrap();
+            (b.input.get(&0).copied(), b.input.get(&1).copied())
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let a = read(&engine);
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let b = read(&engine);
+        // The route read can never complete; once it times out it is "stale".
+        let mut status = None;
+        for _ in 0..40 {
+            status = engine.statuses().get(&(1, 4, 10)).copied();
+            if status.is_some() { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        engine.stop().await;
+        hole.abort();
+        assert_ne!(a, b, "generator froze while a route read was pending");
+        assert_eq!(status, Some("stale"));
+    }
+
+    #[tokio::test]
+    async fn route_with_rtu_kind_reads_the_rtu_session() {
+        use crate::modbus::SessionMap;
+        // Source device on unit 7 holding[0]=4321, reachable through the RTU
+        // session map; the route says connectionKind "rtu" (not "serial").
+        let mut a = SimEngine::new();
+        let mut abanks = HashMap::new();
+        place_words(&mut abanks, 7, 3, 0, &[4321]);
+        let ainfo = a.start(NoopSink, "src".into(), "127.0.0.1", 0, 100, abanks, Vec::new(), Default::default(), Default::default(), Vec::new()).await.unwrap();
+        let aaddr: std::net::SocketAddr = ainfo.bound.parse().unwrap();
+        let rtu_map: SessionMap = Default::default();
+        {
+            let ctx = tokio_modbus::client::tcp::connect(aaddr).await.unwrap();
+            rtu_map.lock().unwrap().insert("ws".to_string(), std::sync::Arc::new(tokio::sync::Mutex::new(ctx)));
+        }
+        let route = DynReg {
+            unit: 1, bank: 3, address: 0, data_type: "u16".into(), byte_order: "ABCD".into(), interval_ms: 50.0,
+            kind: DynKind::Route { slave_unit: 7, connection_kind: "rtu".into(), src_fc: 3, src_addr: 0, count: 1, scale: 1.0, offset: 0.0, src_byte_order: "ABCD".into() },
+        };
+        let mut bbanks = HashMap::new();
+        place_words(&mut bbanks, 1, 3, 0, &[0]);
+        let mut b = SimEngine::new();
+        b.start(NoopSink, "ws".into(), "127.0.0.1", 0, 50, bbanks, vec![route], Default::default(), rtu_map, Vec::new()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let got = b.snapshot().get(&1).and_then(|x| x.holding.get(&0).copied());
+        let status = b.statuses().get(&(1, 3, 0)).copied();
+        b.stop().await;
+        a.stop().await;
+        assert_eq!(got, Some(4321));
+        assert_eq!(status, Some("ok"));
+        assert_eq!(slave_table_kind("rtu"), "serial");
+        assert_eq!(slave_table_kind("tcp"), "tcp");
     }
 }
