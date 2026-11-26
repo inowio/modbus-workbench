@@ -99,4 +99,69 @@ describe("TemplateEditorModal", () => {
     fireEvent.change(editor, { target: { value: "{ not json" } });
     expect(screen.getByText(/not valid json/i)).toBeInTheDocument();
   });
+
+  const reg = (o: number, extra: Record<string, unknown> = {}) => ({ offset: o, bank: 3, dataType: "u16", byteOrder: "ABCD", valueSource: "hold", sourceParams: "{}", alias: "r" + o, ...extra });
+  const withRegs = (registers: unknown[]) => ({ ...custom, registers }) as typeof custom;
+
+  it("adds a register at the next free offset (span-aware) and focuses its alias", () => {
+    render(<TemplateEditorModal open initial={withRegs([reg(4, { dataType: "f32", valueSource: "generator", sourceParams: '{"kind":"sine"}' })])} takenKeys={[]} onClose={vi.fn()} onSave={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: /add register/i }));
+    expect(screen.getByLabelText("Offset 1")).toHaveValue("6");
+    expect(screen.getByLabelText("Alias 1")).toHaveFocus();
+  });
+
+  it("duplicates after the row at the next free offset with a (copy) alias", () => {
+    render(<TemplateEditorModal open initial={withRegs([reg(0), reg(1)])} takenKeys={[]} onClose={vi.fn()} onSave={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: "Duplicate register 0" }));
+    expect(screen.getByLabelText("Alias 1")).toHaveValue("r0 (copy)");
+    expect(screen.getByLabelText("Offset 1")).toHaveValue("2");
+  });
+
+  it("highlights overlaps and blocks Save with a reason", () => {
+    render(<TemplateEditorModal open initial={withRegs([reg(0, { dataType: "u32" }), reg(1)])} takenKeys={[]} onClose={vi.fn()} onSave={vi.fn()} />);
+    expect(screen.getAllByText(/overlaps offset/i).length).toBe(2);
+    expect(screen.getByRole("button", { name: /save device/i })).toBeDisabled();
+    expect(screen.getByRole("status")).toHaveTextContent(/overlapping/i);
+  });
+
+  it("hides irrelevant type and byte order fields", () => {
+    render(<TemplateEditorModal open initial={withRegs([reg(0, { bank: 1, dataType: "bool" })])} takenKeys={[]} onClose={vi.fn()} onSave={vi.fn()} />);
+    expect(screen.getByLabelText("Type 0").tagName).not.toBe("SELECT");
+    expect(screen.getByLabelText("Type 0")).toHaveTextContent("bit");
+    expect(screen.getByLabelText("Order 0")).toHaveTextContent("—");
+  });
+
+  it("saves an empty alias as Reg <offset> and keeps optional fields", () => {
+    const onSave = vi.fn();
+    render(<TemplateEditorModal open initial={withRegs([reg(3, { alias: "", unit: "V", intervalMs: 500 })])} takenKeys={[]} onClose={vi.fn()} onSave={onSave} />);
+    fireEvent.click(screen.getByRole("button", { name: /save device/i }));
+    expect(onSave.mock.calls[0][0].registers[0]).toMatchObject({ alias: "Reg 3", unit: "V", intervalMs: 500 });
+  });
+
+  it("derives the key from the name until it is edited by hand", () => {
+    const onSave = vi.fn();
+    render(<TemplateEditorModal open initial={null} takenKeys={["custom_acme"]} onClose={vi.fn()} onSave={onSave} />);
+    fireEvent.change(screen.getByLabelText(/template name/i), { target: { value: "Acme" } });
+    expect(screen.getByLabelText(/template key/i)).toHaveValue("custom_acme_2");
+    fireEvent.change(screen.getByLabelText(/template name/i), { target: { value: "Acme Meter" } });
+    expect(screen.getByLabelText(/template key/i)).toHaveValue("custom_acme_meter");
+    fireEvent.change(screen.getByLabelText(/template key/i), { target: { value: "mine" } });
+    fireEvent.change(screen.getByLabelText(/template name/i), { target: { value: "Other" } });
+    expect(screen.getByLabelText(/template key/i)).toHaveValue("mine");
+  });
+
+  it("keeps a device preset's period absent unless typed", () => {
+    const onSave = vi.fn();
+    render(<TemplateEditorModal open initial={custom} takenKeys={[]} onClose={vi.fn()} onSave={onSave} />);
+    fireEvent.change(screen.getByLabelText("Source 0"), { target: { value: "device" } });
+    fireEvent.click(screen.getByRole("button", { name: /save device/i }));
+    expect(JSON.parse(onSave.mock.calls[0][0].registers[0].sourceParams)).not.toHaveProperty("periodMs");
+  });
+
+  it("switches the editor pane when another register is selected", () => {
+    render(<TemplateEditorModal open initial={withRegs([reg(0), reg(1)])} takenKeys={[]} onClose={vi.fn()} onSave={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: "Select register 1" }));
+    expect(screen.getByLabelText("Alias 1")).toHaveValue("r1");
+  });
 });
+
