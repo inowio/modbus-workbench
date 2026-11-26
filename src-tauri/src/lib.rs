@@ -22,6 +22,7 @@ mod analyzer_polling;
 mod simulator;
 
 mod modbus;
+mod slave_scan;
 use modbus::{
     modbus_rtu_connect, modbus_rtu_diagnostics_echo, modbus_rtu_disconnect,
     modbus_rtu_mask_write_register, modbus_rtu_read_device_identification,
