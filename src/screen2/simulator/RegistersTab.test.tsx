@@ -42,8 +42,9 @@ describe("RegistersTab", () => {
     render(<RegistersTab {...base()} selectedId={2} onSelectRegister={onSelectRegister} />);
     const rows = screen.getAllByRole("row").slice(1);
     expect(rows[0]).toHaveAttribute("tabindex", "0");
-    expect(rows[0]).toHaveAttribute("aria-selected", "false");
-    expect(rows[1]).toHaveAttribute("aria-selected", "true");
+    expect(rows[0]).not.toHaveAttribute("aria-current");
+    expect(rows[1]).toHaveAttribute("aria-current", "true");
+    expect(rows[1]).not.toHaveAttribute("aria-selected");
     expect(rows[1].className).toMatch(/bg-emerald/);
     fireEvent.keyDown(rows[0], { key: "Enter" });
     fireEvent.keyDown(rows[0], { key: " " });

@@ -217,7 +217,8 @@ export default function RegisterInspector(props: RegisterInspectorProps) {
     return () => document.removeEventListener("keydown", onKey);
   }, [open]);
 
-  if (!register || !reg) return null;
+  // While the prop switches to another register, the local copy is stale for one render; skip it.
+  if (!register || !reg || reg.id !== register.id) return null;
 
   const isNew = reg.id === 0;
   const parsedAddr = isNew ? parseAddressInput(addrText) : reg.address;

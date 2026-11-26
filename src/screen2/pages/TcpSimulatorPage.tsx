@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { FiDownload, FiTrash2, FiUpload, FiX } from "react-icons/fi";
 import { useOutletContext } from "react-router-dom";
 
@@ -17,6 +17,7 @@ import RegisterInspector from "../simulator/RegisterInspector";
 import RegistersTab from "../simulator/RegistersTab";
 import RulesTab from "../simulator/RulesTab";
 import SimFooterBar from "../simulator/SimFooterBar";
+import { fmtAddr } from "../simulator/ruleTargets";
 import { blankRegister } from "../simulator/simRegister";
 import SimStatusDashboard from "../simulator/SimStatusDashboard";
 import SimTabBar, { type TabKey } from "../simulator/SimTabBar";
@@ -65,6 +66,8 @@ export default function TcpSimulatorPage() {
   const [draft, setDraft] = useState<PageRegister | null>(null);
   // Address of a just-created register to select once the reload lands.
   const [pendingSelect, setPendingSelect] = useState<{ unitId: number; functionCode: number; address: number } | null>(null);
+  // True once Create was pressed on the draft: only then does a page error belong in the panel.
+  const [draftCreateTried, setDraftCreateTried] = useState(false);
   const [inspectorDirty, setInspectorDirty] = useState(false);
   const [pendingNav, setPendingNav] = useState<{ run: () => void; label: string } | null>(null);
   const [deviceModalOpen, setDeviceModalOpen] = useState(false);
@@ -79,7 +82,8 @@ export default function TcpSimulatorPage() {
   const [saveTemplateDraft, setSaveTemplateDraft] = useState<DeviceTemplate | null>(null);
 
   // While a save dialog is open its own error shows inside it, not in the page banner.
-  const dialogOpen = draft !== null || deviceModalOpen || ruleModalOpen;
+  const draftOwnsError = draft !== null && draftCreateTried;
+  const dialogOpen = draftOwnsError || deviceModalOpen || ruleModalOpen;
   const dialogError = sim.error ? humanizeError(sim.error) : null;
   const { setError: setSimError } = sim;
   const openDialog = useCallback((open: () => void) => { setSimError(null); open(); }, [setSimError]);
@@ -92,11 +96,6 @@ export default function TcpSimulatorPage() {
   }, [inspectorDirty]);
 
   const applyTab = useCallback((tab: TabKey) => { setActiveTab(tab); writeTab(ws, tab); }, [ws]);
-  const changeTab = useCallback((tab: TabKey) => {
-    if (tab === activeTab) return;
-    guardDiscard(() => applyTab(tab), "this register");
-  }, [activeTab, guardDiscard, applyTab]);
-
   const selectedRegister = useMemo<PageRegister | null>(
     () => sim.registers.find((r) => r.id === selectedRegisterId) ?? null,
     [sim.registers, selectedRegisterId],
@@ -105,8 +104,36 @@ export default function TcpSimulatorPage() {
   const inspectorLabel = draft
     ? "the new register"
     : selectedRegister
-      ? (selectedRegister.alias?.trim() || `unit ${selectedRegister.unitId} address ${selectedRegister.address}`)
+      ? (selectedRegister.alias?.trim() || `unit ${selectedRegister.unitId} address ${fmtAddr(selectedRegister.address, addrFmt)}`)
       : "this register";
+  const changeTab = useCallback((tab: TabKey) => {
+    if (tab === activeTab) return;
+    guardDiscard(() => applyTab(tab), inspectorLabel);
+  }, [activeTab, guardDiscard, applyTab, inspectorLabel]);
+
+  // The draft's own address is "taken" by the register it just created for one
+  // render (before the panel swaps to it); hide that match so no false alert flashes.
+  const inspectorRegisters = useMemo(
+    () => !pendingSelect ? sim.registers : sim.registers.filter((r) => !(
+      r.unitId === pendingSelect.unitId && r.functionCode === pendingSelect.functionCode && r.address === pendingSelect.address
+    )),
+    [sim.registers, pendingSelect],
+  );
+
+  // Draft ended: forget that Create was tried.
+  useEffect(() => { if (!draft) setDraftCreateTried(false); }, [draft]);
+
+  // Below lg the inspector is a drawer: move focus into it when it opens.
+  const inspectorWrapRef = useRef<HTMLDivElement>(null);
+  const inspectorOpen = activeTab === "registers" && inspectorRegister !== null;
+  useEffect(() => {
+    if (!inspectorOpen) return;
+    const narrow = typeof window.matchMedia === "function" && window.matchMedia("(max-width: 1023.98px)").matches;
+    if (!narrow) return;
+    inspectorWrapRef.current?.querySelector<HTMLElement>(
+      'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [href], [tabindex]:not([tabindex="-1"])',
+    )?.focus();
+  }, [inspectorOpen]);
 
   // After a successful Create, switch the panel to editing the new register.
   useEffect(() => {
@@ -136,8 +163,12 @@ export default function TcpSimulatorPage() {
 
   const createRegister = useCallback(async (reg: PageRegister): Promise<boolean> => {
     setSimError(null);
+    setDraftCreateTried(true);
+    // Mark the pending address up-front so the panel never sees the new register
+    // as a conflict with its own draft while the reload lands.
+    setPendingSelect({ unitId: reg.unitId, functionCode: reg.functionCode, address: reg.address });
     const ok = await sim.addRegister(reg);
-    if (ok) setPendingSelect({ unitId: reg.unitId, functionCode: reg.functionCode, address: reg.address });
+    if (!ok) setPendingSelect(null);
     return ok;
   }, [sim, setSimError]);
 
@@ -305,17 +336,17 @@ export default function TcpSimulatorPage() {
               onClick={closeInspector}
               className="fixed inset-0 z-30 bg-slate-950/50 lg:hidden"
             />
-            <div className="fixed inset-y-0 right-0 z-40 flex w-full max-w-md flex-col rounded-l-2xl bg-white shadow-2xl dark:bg-slate-900 lg:static lg:z-auto lg:block lg:w-96 lg:max-w-none lg:shrink-0 lg:self-start lg:rounded-none lg:bg-transparent lg:pb-2 lg:shadow-none dark:lg:bg-transparent lg:sticky lg:top-0">
+            <div ref={inspectorWrapRef} className="fixed inset-y-0 right-0 z-40 flex w-full max-w-md flex-col rounded-l-2xl bg-white shadow-2xl dark:bg-slate-900 lg:static lg:z-auto lg:block lg:w-96 lg:max-w-none lg:shrink-0 lg:self-start lg:rounded-none lg:bg-transparent lg:pb-2 lg:shadow-none dark:lg:bg-transparent lg:sticky lg:inset-auto lg:top-0">
               <RegisterInspector
                 register={inspectorRegister}
                 devices={sim.devices}
-                registers={sim.registers}
+                registers={inspectorRegisters}
                 addrFmt={addrFmt}
                 history={history}
                 liveValue={selectedRegister ? liveValueOf(selectedRegister) : "—"}
                 sourceStatus={selectedRegister ? sim.snapshotFor(selectedRegister.unitId, selectedRegister.functionCode, selectedRegister.address)?.sourceStatus : undefined}
                 running={sim.status.running}
-                error={draft ? dialogError : null}
+                error={draftOwnsError ? dialogError : null}
                 onSave={(reg) => void sim.updateRegister(reg)}
                 onCreate={createRegister}
                 onDuplicate={(reg) => void sim.duplicateRegister(reg)}
@@ -443,7 +474,7 @@ export default function TcpSimulatorPage() {
         description={(() => {
           if (!confirmDeleteRegister) return null;
           const r = confirmDeleteRegister;
-          const label = r.alias?.trim() ? r.alias.trim() : `unit ${r.unitId}, address ${r.address}`;
+          const label = r.alias?.trim() ? r.alias.trim() : `unit ${r.unitId}, address ${fmtAddr(r.address, addrFmt)}`;
           const lastOfDevice =
             r.deviceInstanceId != null &&
             sim.registers.filter((x) => x.deviceInstanceId === r.deviceInstanceId).length === 1;

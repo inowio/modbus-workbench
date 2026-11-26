@@ -82,6 +82,7 @@ describe("TcpSimulatorPage (tabbed shell)", () => {
     const wrapper = save.parentElement!.parentElement!.parentElement as HTMLElement;
     expect(wrapper.className).toMatch(/lg:sticky/);
     expect(wrapper.className).toMatch(/lg:top-0/);
+    expect(wrapper.className).toMatch(/lg:inset-auto/); // cancels the drawer's inset-y-0 / right-0
   });
 
   it("opens the inspector as a right-side drawer below lg, closable from the backdrop (S9)", async () => {
@@ -101,12 +102,43 @@ describe("TcpSimulatorPage (tabbed shell)", () => {
   it("highlights the selected row and closes the inspector on Escape (S5/S6)", async () => {
     renderPage();
     const row = (await screen.findByText("temp")).closest("tr") as HTMLElement;
-    expect(row).toHaveAttribute("aria-selected", "false");
+    expect(row).not.toHaveAttribute("aria-current");
     fireEvent.click(row);
     await screen.findByRole("button", { name: /^save$/i });
-    expect(row).toHaveAttribute("aria-selected", "true");
+    expect(row).toHaveAttribute("aria-current", "true");
     fireEvent.keyDown(document, { key: "Escape" });
     await waitFor(() => expect(screen.queryByRole("button", { name: /^save$/i })).toBeNull());
+  });
+
+  it("moves focus into the drawer when it opens below lg (M3)", async () => {
+    const mm = vi.fn((q: string) => ({ matches: true, media: q, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
+    vi.stubGlobal("matchMedia", mm);
+    window.matchMedia = mm as unknown as typeof window.matchMedia;
+    try {
+      renderPage();
+      fireEvent.click(await screen.findByText("temp"));
+      const close = await screen.findByRole("button", { name: "Close" });
+      await waitFor(() => expect(close).toHaveFocus());
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("names the register in the discard prompt using the Hex address format and on tab change (M4)", async () => {
+    window.localStorage.setItem("inowio.addressFormat", "hex");
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "simulator_get_config") return Promise.resolve({ enabled: false, host: "0.0.0.0", port: 502, tickMs: 100 });
+      if (cmd === "simulator_list_registers") return Promise.resolve([{ ...reg, alias: "", address: 255 }]);
+      if (cmd === "simulator_list_devices") return Promise.resolve([device]);
+      if (cmd === "simulator_status") return Promise.resolve({ running: false, listen: null, clientCount: 0 });
+      return Promise.resolve([]);
+    });
+    renderPage();
+    fireEvent.click(await screen.findByText("0x00FF"));
+    fireEvent.change(await screen.findByLabelText("Unit"), { target: { value: "V" } });
+    fireEvent.click(screen.getByRole("tab", { name: /devices/i }));
+    const dialog = await screen.findByRole("dialog");
+    expect(dialog.textContent).toMatch(/Discard changes to unit 1 address 0x00FF\?/);
   });
 
   it("asks before discarding unsaved inspector edits when selecting another row (S5)", async () => {
@@ -164,6 +196,47 @@ describe("TcpSimulatorPage dialogs keep open on failed saves", () => {
     expect(screen.getByText("New register")).toBeTruthy();
     expect((screen.getByLabelText("Alias") as HTMLInputElement).value).toBe("My reg");
     expect((screen.getByLabelText("Address") as HTMLInputElement).value).toBe("7");
+  });
+
+  it("routes unrelated page errors (failed Start) to the page banner, not the open draft (M10)", async () => {
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "simulator_get_config") return Promise.resolve({ enabled: false, host: "0.0.0.0", port: 502, tickMs: 100 });
+      if (cmd === "simulator_list_registers") return Promise.resolve([reg]);
+      if (cmd === "simulator_list_devices") return Promise.resolve([device]);
+      if (cmd === "simulator_status") return Promise.resolve({ running: false, listen: null, clientCount: 0 });
+      if (cmd === "simulator_start") return Promise.reject("boom start failed");
+      return Promise.resolve([]);
+    });
+    renderPage();
+    fireEvent.click(await screen.findByRole("button", { name: /add register/i }));
+    await screen.findByText("New register");
+    fireEvent.click(screen.getByRole("button", { name: /^start/i }));
+    const dismiss = await screen.findByRole("button", { name: "Dismiss error" });
+    expect(dismiss.parentElement!.textContent).toMatch(/boom start failed/);
+    // Draft panel has no alert of its own.
+    expect(screen.getByText("New register").closest("div[class*='rounded-2xl']")!.querySelector("[role='alert']")).toBeNull();
+  });
+
+  it("never flashes an 'already used' alert for the register it just created (M6)", async () => {
+    let registers = [reg];
+    invokeMock.mockImplementation((cmd: string, args?: any) => {
+      if (cmd === "simulator_get_config") return Promise.resolve({ enabled: false, host: "0.0.0.0", port: 502, tickMs: 100 });
+      if (cmd === "simulator_list_registers") return Promise.resolve(registers);
+      if (cmd === "simulator_list_devices") return Promise.resolve([device]);
+      if (cmd === "simulator_status") return Promise.resolve({ running: false, listen: null, clientCount: 0 });
+      if (cmd === "simulator_add_register") { registers = [...registers, { ...args.register, id: 9 }]; return Promise.resolve(9); }
+      return Promise.resolve([]);
+    });
+    renderPage();
+    fireEvent.click(await screen.findByRole("button", { name: /add register/i }));
+    fireEvent.change(await screen.findByLabelText("Alias"), { target: { value: "Fresh" } });
+    let sawConflict = false;
+    const obs = new MutationObserver(() => { if (/already used/i.test(document.body.textContent ?? "")) sawConflict = true; });
+    obs.observe(document.body, { childList: true, subtree: true, characterData: true });
+    fireEvent.click(screen.getByRole("button", { name: /^create$/i }));
+    await screen.findByRole("button", { name: /^save$/i });
+    obs.disconnect();
+    expect(sawConflict).toBe(false);
   });
 
   it("switches the panel to editing the new register after a successful create", async () => {

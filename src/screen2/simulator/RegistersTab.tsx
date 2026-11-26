@@ -374,7 +374,7 @@ export default function RegistersTab(props: RegistersTabProps) {
                 <tr
                   key={r.id}
                   tabIndex={0}
-                  aria-selected={r.id === selectedId}
+                  aria-current={r.id === selectedId ? "true" : undefined}
                   className={`cursor-pointer border-t border-slate-100 outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-emerald-500 dark:border-slate-800 ${
                     r.id === selectedId
                       ? "bg-emerald-500/10 hover:bg-emerald-500/15 dark:bg-emerald-500/15"
