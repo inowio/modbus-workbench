@@ -56,6 +56,8 @@ export type RegistersTabProps = {
   snapshotFor: (u: number, fc: number, a: number) => SnapshotRow | undefined;
   addrFmt: "dec" | "hex";
   onAddrFmt: (f: "dec" | "hex") => void;
+  /** Currently open register (highlighted row). */
+  selectedId?: number | null;
   onSelectRegister: (reg: PageRegister) => void;
   onDelete: (id: number) => void;
   onAddRegister: () => void;
@@ -71,6 +73,7 @@ export default function RegistersTab(props: RegistersTabProps) {
     snapshotFor,
     addrFmt,
     onAddrFmt,
+    selectedId = null,
     onSelectRegister,
     onDelete,
     onAddRegister,
@@ -370,8 +373,21 @@ export default function RegistersTab(props: RegistersTabProps) {
               {pageRows.map((r) => (
                 <tr
                   key={r.id}
-                  className="cursor-pointer border-t border-slate-100 hover:bg-slate-50 dark:border-slate-800 dark:hover:bg-white/5"
+                  tabIndex={0}
+                  aria-selected={r.id === selectedId}
+                  className={`cursor-pointer border-t border-slate-100 outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-emerald-500 dark:border-slate-800 ${
+                    r.id === selectedId
+                      ? "bg-emerald-500/10 hover:bg-emerald-500/15 dark:bg-emerald-500/15"
+                      : "hover:bg-slate-50 dark:hover:bg-white/5"
+                  }`}
                   onClick={() => onSelectRegister(r)}
+                  onKeyDown={(e) => {
+                    if (e.target !== e.currentTarget) return;
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.preventDefault();
+                      onSelectRegister(r);
+                    }
+                  }}
                 >
                   {columns.map((col) => (
                     <td key={col} className="px-2 py-1.5">
