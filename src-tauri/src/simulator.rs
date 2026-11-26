@@ -1,11 +1,16 @@
 //! Modbus TCP **server** ("TCP Simulator"): exposes configured registers so
 //! external masters can poll/write the app as one or more virtual devices.
 //!
-//! Layer 1 (this module): in-memory banks per Unit ID, a tokio-modbus TCP
-//! server task, Hold registers, register CRUD, Start/Stop. Generators, rules,
-//! route-from-slave, and device templates arrive in later plans.
+//! Contents: in-memory banks per Unit ID served by a tokio-modbus TCP server;
+//! register sources (Hold, generator, device preset, route-from-slave); rules
+//! (interval / condition / on-write triggers, delayed actions); devices
+//! instantiated from built-in, custom (app-global) or workspace-slave
+//! templates; profile export/import; and the CRUD commands. Register, device
+//! and rule edits apply to a running simulator immediately (the tick and the
+//! route reader re-read their live lists); port, expose host and tick
+//! interval apply on the next Start.
 
-#![allow(dead_code)] // trimmed as later tasks consume these items
+#![allow(dead_code)] // a few items (e.g. SimEngine::new, create_sim_schema) are only used by tests
 
 use std::collections::HashMap;
 use std::future;
@@ -287,8 +292,8 @@ pub enum DynKind {
         scale: f64,
         offset: f64,
         /// Byte order the SOURCE value is decoded with. When it equals the
-        /// register's own `byte_order` and scale/offset are identity, the tick
-        /// takes a fast path and mirrors the raw words verbatim.
+        /// register's own `byte_order` and scale/offset are identity, the
+        /// route reader takes a fast path and mirrors the raw words verbatim.
         src_byte_order: String,
     },
 }
@@ -360,9 +365,8 @@ pub fn dyn_value(d: &DynReg, elapsed_ms: f64) -> f64 {
             generator_value(kind, params, elapsed_ms, seed ^ (elapsed_ms as u64))
         }
         DynKind::Preset { preset, params, seed } => preset_value(preset, params, elapsed_ms, *seed),
-        // Route registers are populated by the tick's routed network read
-        // (Task 4), not by `dyn_value`; this arm only exists to keep the
-        // match exhaustive.
+        // Route registers are populated by `route_loop`'s network reads, not
+        // by `dyn_value`; this arm only exists to keep the match exhaustive.
         DynKind::Route { .. } => 0.0,
     }
 }
@@ -3332,13 +3336,13 @@ pub async fn simulator_start(
         .collect();
     rules.sort_by_key(|r| r.sort_order);
 
-    // Resolve each route register's on-wire source address once at start:
-    // user-facing source address + the source slave's configured
-    // address_offset, the same mapping manual reads use.
-    // Note: the source slave's address_offset is captured once here, at Start.
-    // Editing that slave's offset while the simulator is running has no effect
-    // until the next Start; the live connection itself, though, IS re-resolved
-    // on every tick.
+    // Resolve each route register's on-wire source address: user-facing
+    // source address + the source slave's configured address_offset, the same
+    // mapping manual reads use. Resolved here at Start and again by
+    // `refresh_running_config` whenever a simulator register/device/rule edit
+    // refreshes the live list; editing only the slave's offset takes effect on
+    // the next Start or simulator edit. The client session itself is looked up
+    // on every route read.
     for d in dynamics.iter_mut() {
         if let DynKind::Route { slave_unit, connection_kind, src_addr, .. } = &mut d.kind {
             let (_id, offset) = crate::modbus::lookup_slave_id_and_address_offset(
