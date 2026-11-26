@@ -299,7 +299,12 @@ describe("SlaveScannerModal", () => {
     expect(within(unit17).getByText("9600 8N1")).toBeInTheDocument();
     expect(within(unit17).getByText("14 ms")).toBeInTheDocument();
 
-    expect(screen.getByText(/Answered but garbled — maybe wrong baud rate/)).toBeInTheDocument();
+    // Garbled replies start collapsed to a one-line summary, so they don't crowd out real devices.
+    const garbledToggle = screen.getByRole("button", { name: /Answered but garbled — maybe wrong baud rate \(1\)/ });
+    expect(garbledToggle).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByRole("listitem", { name: "Unit 9 on COM3" })).toBeNull();
+    expect(screen.getByText(/COM3 at 9600 8N1: 1 address/)).toBeInTheDocument();
+    fireEvent.click(garbledToggle);
     const unit9 = screen.getByRole("listitem", { name: "Unit 9 on COM3" });
     expect(within(unit9).getByText("CRC error")).toBeInTheDocument();
 

@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { useEffect, useId, useMemo, useRef, useState } from "react";
-import { FiSearch, FiSquare, FiX } from "react-icons/fi";
+import { FiAlertTriangle, FiSearch, FiSquare, FiX } from "react-icons/fi";
 
 import {
   SLAVE_SCAN_EVENTS,
@@ -18,13 +18,21 @@ import {
   estimateScanSeconds,
   formatDuration,
   formatSettings,
+  groupScanResults,
   isAlreadyInWorkspace,
   newScanId,
   suggestSlaveName,
 } from "../utils/slaveScan";
 import { normalizeConnectionSettings, type ConnectionSettings, type PortItem } from "./ConnectionSettingsForm";
 import ScanResultsList from "./ScanResultsList";
-import SlaveScanForm, { buildRequest, formProblem, initialForm, workspaceSerial, type FormState } from "./SlaveScanForm";
+import SlaveScanForm, {
+  buildRequest,
+  formProblem,
+  initialForm,
+  sweptBauds,
+  workspaceSerial,
+  type FormState,
+} from "./SlaveScanForm";
 
 export type ScanPick = {
   unitId: number;
@@ -219,7 +227,7 @@ export default function SlaveScannerModal({ open, workspaceName, existingSlaves,
     if (formProblem(form) !== null) return null;
     const serial = form.kind === "serial";
     const ports = Math.max(1, form.ports.length);
-    const combos = serial && form.sweepOn ? form.sweepBauds.length * form.sweepParities.length : 1;
+    const combos = serial && form.sweepOn ? sweptBauds(form).length * form.sweepParities.length : 1;
     // Serial: every port scans the whole range in parallel; TCP: `concurrency` workers share it.
     return estimateScanSeconds({
       addresses: Number(form.quantity) * (serial ? ports : 1),
@@ -230,6 +238,11 @@ export default function SlaveScannerModal({ open, workspaceName, existingSlaves,
       parallelism: serial ? ports : Number(form.concurrency),
     });
   }, [form]);
+
+  const counts = useMemo(() => {
+    const g = groupScanResults(results);
+    return { found: g.found.length, garbled: g.garbled.length, gateway: g.gateway.length };
+  }, [results]);
 
   if (!open) return null;
 
@@ -308,7 +321,24 @@ export default function SlaveScannerModal({ open, workspaceName, existingSlaves,
   }
 
   const fieldId = (name: string) => `${id}-${name}`;
-  const showResults = results.length > 0 || busy || summary !== null;
+  const showStatus = busy || summary !== null || results.length > 0;
+  const pct = progress && progress.total > 0 ? Math.min(100, (progress.checked / progress.total) * 100) : 0;
+
+  const statusChip =
+    phase === "scanning"
+      ? { text: "Scanning", cls: "border-emerald-600/40 bg-emerald-500/10 text-emerald-800 dark:text-emerald-200", pulse: true }
+      : phase === "cancelling"
+        ? { text: "Cancelling", cls: "border-amber-500/40 bg-amber-500/10 text-amber-900 dark:text-amber-200", pulse: true }
+        : summary
+          ? { text: "Finished", cls: "border-slate-300 bg-slate-100 text-slate-700 dark:border-slate-700 dark:bg-white/5 dark:text-slate-300", pulse: false }
+          : { text: "Ready", cls: "border-slate-300 bg-slate-100 text-slate-700 dark:border-slate-700 dark:bg-white/5 dark:text-slate-300", pulse: false };
+
+  const stat = (label: string, value: string, tone: string) => (
+    <div className="flex flex-col rounded-lg border border-slate-200 bg-white px-3 py-2 dark:border-slate-800 dark:bg-slate-950/30">
+      <span className="text-[11px] font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">{label}</span>
+      <span className={`font-mono text-lg font-semibold ${tone}`}>{value}</span>
+    </div>
+  );
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 backdrop-blur-xs">
@@ -318,127 +348,178 @@ export default function SlaveScannerModal({ open, workspaceName, existingSlaves,
         role="dialog"
         aria-modal="true"
         aria-labelledby={fieldId("title")}
-        className="relative flex max-h-[90vh] w-full max-w-3xl flex-col overflow-hidden rounded-2xl border border-slate-200 bg-white text-slate-900 shadow-2xl dark:border-slate-800 dark:bg-slate-900 dark:text-slate-100"
+        className="relative flex h-[92vh] w-[96vw] max-w-[1800px] flex-col overflow-hidden rounded-2xl border border-slate-200 bg-white text-slate-900 shadow-2xl dark:border-slate-800 dark:bg-slate-900 dark:text-slate-100"
       >
-        <div className="flex items-start justify-between gap-3 p-4 pb-0">
-          <div>
-            <div id={fieldId("title")} className="text-sm font-semibold text-emerald-700 dark:text-emerald-300">
-              Scan for slaves
-            </div>
-            <div className="mt-1 text-sm text-slate-600 dark:text-slate-300">
-              Checks a range of unit IDs and lists the devices that answer.
+        <header className="flex items-center justify-between gap-3 border-b border-slate-200 px-5 py-4 dark:border-slate-800">
+          <div className="flex min-w-0 items-center gap-3">
+            <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-emerald-500/15 text-emerald-700 dark:text-emerald-300">
+              <FiSearch className="h-4.5 w-4.5" aria-hidden="true" />
+            </span>
+            <div className="min-w-0">
+              <div id={fieldId("title")} className="text-base font-semibold text-slate-900 dark:text-slate-100">
+                Scan for slaves
+              </div>
+              <div className="truncate text-sm text-slate-600 dark:text-slate-400">
+                Checks a range of unit IDs and lists the devices that answer.
+              </div>
             </div>
           </div>
-          <button
-            type="button"
-            className="rounded-full border border-slate-300 bg-slate-100 p-2 text-slate-700 transition hover:border-slate-400 dark:border-slate-700 dark:bg-white/5 dark:text-slate-100 dark:hover:border-slate-600"
-            onClick={() => closeModal()}
-            aria-label="Close scanner"
-            title="Close"
-          >
-            <FiX className="h-4 w-4" aria-hidden="true" />
-          </button>
-        </div>
+          <div className="flex shrink-0 items-center gap-3">
+            <span
+              className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-semibold ${statusChip.cls}`}
+            >
+              <span
+                className={`h-1.5 w-1.5 rounded-full bg-current ${statusChip.pulse ? "animate-pulse" : "opacity-60"}`}
+                aria-hidden="true"
+              />
+              {statusChip.text}
+            </span>
+            <button
+              type="button"
+              className="rounded-full border border-slate-300 bg-slate-100 p-2 text-slate-700 transition hover:border-slate-400 dark:border-slate-700 dark:bg-white/5 dark:text-slate-100 dark:hover:border-slate-600"
+              onClick={() => closeModal()}
+              aria-label="Close scanner"
+              title="Close"
+            >
+              <FiX className="h-4 w-4" aria-hidden="true" />
+            </button>
+          </div>
+        </header>
 
-        <div className="min-h-0 flex-1 overflow-y-auto p-4">
-          {error ? (
-            <div className="mb-4 rounded-xl border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-800 dark:text-rose-200">
-              {error}
+        {/* Narrow windows: one scrolling column whose parts never shrink (so nothing overlaps).
+            From md: settings and results side by side, each scrolling on its own. */}
+        <div className="min-h-0 flex-1 overflow-y-auto md:grid md:grid-cols-[minmax(320px,380px)_1fr] md:overflow-hidden lg:grid-cols-[minmax(360px,420px)_1fr]">
+          {/* Settings */}
+          <aside className="flex flex-col border-b border-slate-200 bg-slate-50/60 md:min-h-0 md:border-r md:border-b-0 dark:border-slate-800 dark:bg-slate-950/30">
+            <div className="p-5 md:min-h-0 md:flex-1 md:overflow-y-auto">
+              {loading ? (
+                <div className="text-sm text-slate-600 dark:text-slate-300">Loading connection settings…</div>
+              ) : (
+                <SlaveScanForm form={form} setForm={setForm} portItems={portItems} disabled={busy} />
+              )}
             </div>
-          ) : null}
 
-          {loading ? (
-            <div className="text-sm text-slate-600 dark:text-slate-300">Loading connection settings…</div>
-          ) : (
-            <SlaveScanForm form={form} setForm={setForm} portItems={portItems} disabled={busy} />
-          )}
-
-          {busy ? (
-            <div className="mt-4 flex flex-col gap-2">
-              <div className="flex items-center justify-between gap-3 text-xs text-slate-600 dark:text-slate-300">
-                <span>
-                  {phase === "cancelling"
-                    ? "Cancelling…"
-                    : progress
-                      ? `Checking unit ${progress.current.unitId} on ${progress.current.target}${
-                          progress.current.settings ? ` at ${formatSettings(progress.current.settings)}` : ""
-                        }`
-                      : "Starting scan…"}
-                </span>
-                {progress ? <span className="font-mono">{`${progress.checked} / ${progress.total}`}</span> : null}
+            <div className="flex flex-col gap-3 border-t border-slate-200 bg-white/80 p-4 dark:border-slate-800 dark:bg-slate-900/80">
+              <div className="min-h-5 text-sm">
+                {problem ? (
+                  <span className="text-rose-700 dark:text-rose-300">{problem}</span>
+                ) : estimate !== null && !loading ? (
+                  <span className="text-slate-600 dark:text-slate-300">{`Estimated time: ${formatDuration(estimate)} (worst case)`}</span>
+                ) : null}
               </div>
-              <div
-                role="progressbar"
-                aria-label="Scan progress"
-                aria-valuemin={0}
-                aria-valuemax={progress?.total ?? 0}
-                aria-valuenow={progress?.checked ?? 0}
-                className="h-2 w-full overflow-hidden rounded-full bg-slate-200 dark:bg-slate-800"
-              >
-                <div
-                  className="h-full rounded-full bg-emerald-500 transition-[width]"
-                  style={{
-                    width: progress && progress.total > 0 ? `${Math.min(100, (progress.checked / progress.total) * 100)}%` : "0%",
-                  }}
-                />
-              </div>
-            </div>
-          ) : null}
-
-          {summary ? <div className="mt-4 text-sm text-slate-600 dark:text-slate-300">{summary}</div> : null}
-
-          {notices.length > 0 ? (
-            <ul className="mt-4 flex flex-col gap-2">
-              {notices.map((n) => (
-                <li
-                  key={n}
-                  className="rounded-xl border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm text-amber-900 dark:text-amber-200"
+              {busy ? (
+                <button
+                  type="button"
+                  className="inline-flex w-full items-center justify-center gap-2 rounded-xl border border-rose-600/60 bg-rose-500/10 px-4 py-2.5 text-sm font-semibold text-rose-800 transition hover:border-rose-500 hover:bg-rose-500/15 disabled:cursor-not-allowed disabled:opacity-60 dark:border-rose-500/60 dark:text-rose-200 dark:hover:border-rose-400"
+                  onClick={() => requestCancel()}
+                  disabled={phase === "cancelling"}
                 >
-                  {n}
-                </li>
-              ))}
-            </ul>
-          ) : null}
+                  <FiSquare className="h-4 w-4" aria-hidden="true" />
+                  {phase === "cancelling" ? "Cancelling…" : "Cancel"}
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  className="inline-flex w-full items-center justify-center gap-2 rounded-xl border border-emerald-600/60 bg-emerald-500/15 px-4 py-2.5 text-sm font-semibold text-emerald-800 transition hover:border-emerald-500 hover:bg-emerald-500/25 disabled:cursor-not-allowed disabled:opacity-60 dark:border-emerald-500/60 dark:text-emerald-200 dark:hover:border-emerald-400"
+                  onClick={() => void handleScan()}
+                  disabled={loading || problem !== null}
+                >
+                  <FiSearch className="h-4 w-4" aria-hidden="true" />
+                  Scan
+                </button>
+              )}
+            </div>
+          </aside>
 
-          {showResults ? (
-            <ScanResultsList
-              results={results}
-              scanning={busy}
-              isExisting={(ev) => isAlreadyInWorkspace(ev, existingSlaves, resultKind)}
-              onAdd={handleAdd}
-            />
-          ) : null}
-        </div>
-
-        <div className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-200 p-4 dark:border-slate-800">
-          <div className="text-sm text-slate-600 dark:text-slate-300">
-            {problem ? (
-              <span className="text-rose-700 dark:text-rose-300">{problem}</span>
-            ) : estimate !== null && !loading ? (
-              `Estimated time: ${formatDuration(estimate)} (worst case)`
+          {/* Status and results */}
+          <main className="flex flex-col gap-5 p-5 md:min-h-0 md:overflow-y-auto">
+            {error ? (
+              <div className="flex items-start gap-2 rounded-xl border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-800 dark:text-rose-200">
+                <FiAlertTriangle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />
+                <span>{error}</span>
+              </div>
             ) : null}
-          </div>
-          {busy ? (
-            <button
-              type="button"
-              className="inline-flex items-center gap-2 rounded-full border border-rose-600/60 bg-rose-500/10 px-4 py-2 text-sm font-semibold text-rose-800 transition hover:border-rose-500 disabled:cursor-not-allowed disabled:opacity-60 dark:border-rose-500/60 dark:text-rose-200 dark:hover:border-rose-400"
-              onClick={() => requestCancel()}
-              disabled={phase === "cancelling"}
-            >
-              <FiSquare className="h-4 w-4" aria-hidden="true" />
-              {phase === "cancelling" ? "Cancelling…" : "Cancel"}
-            </button>
-          ) : (
-            <button
-              type="button"
-              className="inline-flex items-center gap-2 rounded-full border border-emerald-600/60 bg-emerald-500/10 px-4 py-2 text-sm font-semibold text-emerald-800 transition hover:border-emerald-500 hover:text-emerald-900 disabled:cursor-not-allowed disabled:opacity-60 dark:border-emerald-500/60 dark:text-emerald-200 dark:hover:border-emerald-400 dark:hover:text-emerald-100"
-              onClick={() => void handleScan()}
-              disabled={loading || problem !== null}
-            >
-              <FiSearch className="h-4 w-4" aria-hidden="true" />
-              Scan
-            </button>
-          )}
+
+            {showStatus ? (
+              <div className="@container flex flex-col gap-4 rounded-xl border border-slate-200 bg-slate-50/60 p-4 dark:border-slate-800 dark:bg-slate-950/30">
+                {busy ? (
+                  <div className="flex flex-col gap-2">
+                    <div className="flex items-center justify-between gap-3 text-sm text-slate-700 dark:text-slate-200">
+                      <span>
+                        {phase === "cancelling"
+                          ? "Cancelling…"
+                          : progress
+                            ? `Checking unit ${progress.current.unitId} on ${progress.current.target}${
+                                progress.current.settings ? ` at ${formatSettings(progress.current.settings)}` : ""
+                              }`
+                            : "Starting scan…"}
+                      </span>
+                      {progress ? (
+                        <span className="font-mono text-xs text-slate-500 dark:text-slate-400">{`${progress.checked} / ${progress.total}`}</span>
+                      ) : null}
+                    </div>
+                    <div
+                      role="progressbar"
+                      aria-label="Scan progress"
+                      aria-valuemin={0}
+                      aria-valuemax={progress?.total ?? 0}
+                      aria-valuenow={progress?.checked ?? 0}
+                      className="h-2.5 w-full overflow-hidden rounded-full bg-slate-200 dark:bg-slate-800"
+                    >
+                      <div className="h-full rounded-full bg-emerald-500 transition-[width]" style={{ width: `${pct}%` }} />
+                    </div>
+                  </div>
+                ) : summary ? (
+                  <div className="text-sm font-medium text-slate-700 dark:text-slate-200">{summary}</div>
+                ) : null}
+
+                <div className="grid grid-cols-2 gap-2 @lg:grid-cols-4">
+                  {stat(
+                    "Checked",
+                    progress ? `${progress.checked}` : busy ? "0" : "—",
+                    "text-slate-900 dark:text-slate-100",
+                  )}
+                  {stat("Found", String(counts.found), "text-emerald-700 dark:text-emerald-300")}
+                  {stat("Garbled", String(counts.garbled), "text-amber-700 dark:text-amber-300")}
+                  {stat("No device (gateway)", String(counts.gateway), "text-slate-600 dark:text-slate-300")}
+                </div>
+              </div>
+            ) : null}
+
+            {notices.length > 0 ? (
+              <ul className="flex flex-col gap-2">
+                {notices.map((n) => (
+                  <li
+                    key={n}
+                    className="flex items-start gap-2 rounded-xl border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm text-amber-900 dark:text-amber-200"
+                  >
+                    <FiAlertTriangle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />
+                    <span>{n}</span>
+                  </li>
+                ))}
+              </ul>
+            ) : null}
+
+            {showStatus ? (
+              <ScanResultsList
+                results={results}
+                scanning={busy}
+                isExisting={(ev) => isAlreadyInWorkspace(ev, existingSlaves, resultKind)}
+                onAdd={handleAdd}
+              />
+            ) : (
+              <div className="flex flex-1 flex-col items-center justify-center gap-3 rounded-xl border border-dashed border-slate-300 p-10 text-center dark:border-slate-700">
+                <span className="flex h-12 w-12 items-center justify-center rounded-2xl bg-emerald-500/10 text-emerald-700 dark:text-emerald-300">
+                  <FiSearch className="h-6 w-6" aria-hidden="true" />
+                </span>
+                <div className="text-base font-semibold text-slate-800 dark:text-slate-100">No scan yet</div>
+                <p className="max-w-md text-sm text-slate-600 dark:text-slate-400">
+                  Pick the connection and address range on the left, then press Scan. Devices appear here as soon as
+                  they answer, and you can cancel once the one you need is listed.
+                </p>
+              </div>
+            )}
+          </main>
         </div>
       </div>
     </div>

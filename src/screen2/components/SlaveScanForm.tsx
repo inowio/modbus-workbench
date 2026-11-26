@@ -1,4 +1,4 @@
-import { useId, useMemo, type Dispatch, type SetStateAction } from "react";
+import { useId, useMemo, type Dispatch, type ReactNode, type SetStateAction } from "react";
 
 import type { ProbeKind, ScanKind, ScanRequest, SerialParams, SerialParity } from "../api/slaveScan";
 import { SCAN_BAUDS, SCAN_PARITIES, defaultQuantity, defaultWaitMs, unitRange } from "../utils/slaveScan";
@@ -38,11 +38,35 @@ const PROBE_OPTIONS: { value: ProbeKind; label: string }[] = [
 ];
 
 const inputCls =
-  "w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 outline-hidden focus:border-emerald-600/60 focus:ring-2 focus:ring-emerald-500/10 disabled:cursor-not-allowed disabled:opacity-60 dark:border-slate-700 dark:bg-slate-950/40 dark:text-slate-100 dark:focus:border-emerald-500/60";
-const labelCls = "text-xs font-semibold text-slate-700 dark:text-slate-200";
-const checkCls = "h-4 w-4 accent-emerald-600";
-const pillCls =
-  "inline-flex cursor-pointer items-center rounded-full px-3 py-1 text-xs font-semibold transition has-[:checked]:bg-emerald-500/15 has-[:checked]:text-emerald-800 has-[:focus-visible]:ring-2 has-[:focus-visible]:ring-emerald-500/40 dark:has-[:checked]:text-emerald-200";
+  "w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 outline-hidden focus:border-emerald-600/60 focus:ring-2 focus:ring-emerald-500/10 disabled:cursor-not-allowed disabled:opacity-60 dark:border-slate-700 dark:bg-slate-950/40 dark:text-slate-100 dark:focus:border-emerald-500/60";
+const labelCls = "text-xs font-medium text-slate-600 dark:text-slate-300";
+const checkCls = "h-4 w-4 shrink-0 accent-emerald-600";
+/** Segmented control option (a visually hidden radio inside). */
+const segmentCls =
+  "flex flex-1 cursor-pointer items-center justify-center rounded-lg px-3 py-1.5 text-sm font-semibold text-slate-600 transition hover:text-slate-900 has-[:checked]:bg-white has-[:checked]:text-emerald-800 has-[:checked]:shadow-sm has-[:focus-visible]:ring-2 has-[:focus-visible]:ring-emerald-500/40 dark:text-slate-400 dark:hover:text-slate-100 dark:has-[:checked]:bg-slate-800 dark:has-[:checked]:text-emerald-200";
+/** Toggle chip (a visually hidden checkbox inside), used for the sweep choices. */
+const chipCls =
+  "inline-flex cursor-pointer items-center rounded-full border border-slate-300 px-2.5 py-1 font-mono text-xs text-slate-600 transition hover:border-slate-400 has-[:checked]:border-emerald-600/60 has-[:checked]:bg-emerald-500/15 has-[:checked]:text-emerald-800 has-[:focus-visible]:ring-2 has-[:focus-visible]:ring-emerald-500/40 dark:border-slate-700 dark:text-slate-300 dark:hover:border-slate-600 dark:has-[:checked]:border-emerald-500/60 dark:has-[:checked]:text-emerald-200";
+
+function Section({ title, aside, children }: { title: string; aside?: ReactNode; children: ReactNode }) {
+  return (
+    <section className="flex flex-col gap-2.5">
+      <div className="flex items-baseline justify-between gap-2">
+        <h3 className="text-[11px] font-semibold uppercase tracking-[0.12em] text-slate-500 dark:text-slate-400">{title}</h3>
+        {aside ? <span className="text-xs text-slate-500 dark:text-slate-400">{aside}</span> : null}
+      </div>
+      {children}
+    </section>
+  );
+}
+
+/** Splits a port label such as "COM12 - wch.cn USB-SERIAL CH340 (COM12) (6)" into name and description. */
+function portDescription(item: PortItem): string {
+  const label = (item.label || "").trim();
+  if (!label || label === item.port) return "";
+  const prefix = `${item.port} - `;
+  return label.startsWith(prefix) ? label.slice(prefix.length) : label;
+}
 
 /** The sweep's baud choices: the standard list, plus the current baud in sorted position if it is not in it. */
 export function sweepBauds(baud: string): readonly number[] {
@@ -108,7 +132,7 @@ export function formProblem(f: FormState): string | null {
   }
   if (f.kind === "serial") {
     if (f.ports.length === 0) return "Select at least one serial port";
-    if (f.sweepOn && (f.sweepBauds.length === 0 || f.sweepParities.length === 0)) {
+    if (f.sweepOn && (sweptBauds(f).length === 0 || f.sweepParities.length === 0)) {
       return "Pick at least one baud rate and one parity";
     }
   } else {
@@ -119,6 +143,12 @@ export function formProblem(f: FormState): string | null {
   if (intIn(f.waitMs, 20, 5000) === null) return "Wait must be 20–5000 ms";
   if (intIn(f.retries, 0, 3) === null) return "Retries must be 0–3";
   return null;
+}
+
+/** The ticked sweep bauds that are still offered for the current baud, sorted. */
+export function sweptBauds(f: FormState): number[] {
+  const offered = sweepBauds(f.baud);
+  return f.sweepBauds.filter((b) => offered.includes(b)).sort((x, y) => x - y);
 }
 
 export function buildRequest(f: FormState, scanId: string): ScanRequest {
@@ -153,7 +183,7 @@ export function buildRequest(f: FormState, scanId: string): ScanRequest {
     },
     sweep: f.sweepOn
       ? {
-          bauds: [...f.sweepBauds].sort((x, y) => x - y),
+          bauds: sweptBauds(f),
           parities: SCAN_PARITIES.filter((p) => f.sweepParities.includes(p)),
         }
       : null,
@@ -236,312 +266,358 @@ export default function SlaveScanForm({ form, setForm, portItems, disabled }: Sl
     return on ? (list.includes(value) ? list : [...list, value]) : list.filter((v) => v !== value);
   }
 
+
+  const range = unitRange(form.kind);
+
   return (
-    <fieldset disabled={disabled} className="grid min-w-0 gap-4 disabled:opacity-80">
-      <div
-        role="radiogroup"
-        aria-label="Connection type"
-        className="inline-flex w-fit gap-1 rounded-full border border-slate-300 bg-slate-100 p-1 text-slate-700 dark:border-slate-700 dark:bg-slate-950/60 dark:text-slate-300"
-      >
-        {(
-          [
-            { value: "serial", label: "Serial (RTU)" },
-            { value: "tcp", label: "TCP" },
-          ] as const
-        ).map((opt) => (
-          <label key={opt.value} className={pillCls}>
-            <input
-              type="radio"
-              className="sr-only"
-              name={fieldId("kind")}
-              value={opt.value}
-              checked={form.kind === opt.value}
-              onChange={() => setKind(opt.value)}
-            />
-            {opt.label}
-          </label>
-        ))}
-      </div>
+    <fieldset disabled={disabled} className="flex min-w-0 flex-col gap-6 disabled:opacity-80">
+      <Section title="Connection">
+        <div
+          role="radiogroup"
+          aria-label="Connection type"
+          className="flex gap-1 rounded-xl border border-slate-200 bg-slate-100 p-1 dark:border-slate-800 dark:bg-slate-950/60"
+        >
+          {(
+            [
+              { value: "serial", label: "Serial (RTU)" },
+              { value: "tcp", label: "TCP" },
+            ] as const
+          ).map((opt) => (
+            <label key={opt.value} className={segmentCls}>
+              <input
+                type="radio"
+                className="sr-only"
+                name={fieldId("kind")}
+                value={opt.value}
+                checked={form.kind === opt.value}
+                onChange={() => setKind(opt.value)}
+              />
+              {opt.label}
+            </label>
+          ))}
+        </div>
+      </Section>
 
       {form.kind === "serial" ? (
         <>
-          <div className="flex flex-col gap-2">
-            <span className={labelCls}>Serial port(s)</span>
+          <Section
+            title="Serial ports"
+            aside={portOptions.length > 0 ? `${form.ports.length} of ${portOptions.length} selected` : undefined}
+          >
             {portOptions.length === 0 ? (
-              <span className="text-sm text-slate-500 dark:text-slate-400">No serial ports detected.</span>
+              <span className="rounded-lg border border-dashed border-slate-300 px-3 py-3 text-sm text-slate-500 dark:border-slate-700 dark:text-slate-400">
+                No serial ports detected.
+              </span>
             ) : (
-              <div className="flex flex-wrap gap-x-4 gap-y-2">
-                {portOptions.map((p) => (
-                  <label key={p.port} className="inline-flex items-center gap-2 text-sm">
-                    <input
-                      type="checkbox"
-                      className={checkCls}
-                      checked={form.ports.includes(p.port)}
-                      onChange={(e) => patch({ ports: toggleIn(form.ports, p.port, e.currentTarget.checked) })}
-                    />
-                    {p.label || p.port}
-                  </label>
-                ))}
+              <div className="flex max-h-60 flex-col gap-1.5 overflow-y-auto pr-1">
+                {portOptions.map((p) => {
+                  const description = portDescription(p);
+                  return (
+                    <label
+                      key={p.port}
+                      className="flex cursor-pointer items-center gap-3 rounded-lg border border-slate-200 bg-white px-3 py-2 transition hover:border-slate-300 has-[:checked]:border-emerald-600/50 has-[:checked]:bg-emerald-500/5 dark:border-slate-800 dark:bg-slate-950/30 dark:hover:border-slate-700 dark:has-[:checked]:border-emerald-500/50 dark:has-[:checked]:bg-emerald-500/10"
+                      title={p.label || p.port}
+                    >
+                      <input
+                        type="checkbox"
+                        className={checkCls}
+                        checked={form.ports.includes(p.port)}
+                        onChange={(e) => patch({ ports: toggleIn(form.ports, p.port, e.currentTarget.checked) })}
+                      />
+                      <span className="flex min-w-0 flex-col">
+                        <span className="font-mono text-sm font-semibold text-slate-900 dark:text-slate-100">{p.port}</span>
+                        {description ? (
+                          <span className="truncate text-xs text-slate-500 dark:text-slate-400">{description}</span>
+                        ) : null}
+                      </span>
+                    </label>
+                  );
+                })}
               </div>
             )}
-          </div>
+          </Section>
 
-          <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
-            <div className="flex flex-col gap-1">
-              <label className={labelCls} htmlFor={fieldId("baud")}>
-                Baud
-              </label>
-              <select
-                id={fieldId("baud")}
-                className={inputCls}
-                value={form.baud}
-                disabled={form.sweepOn}
-                title={form.sweepOn ? "Replaced by the baud rates ticked below" : undefined}
-                onChange={(e) => patch({ baud: e.currentTarget.value })}
-              >
-                {baudOptions.map((b) => (
-                  <option key={b} value={String(b)}>
-                    {b}
-                  </option>
-                ))}
-              </select>
-            </div>
-            <div className="flex flex-col gap-1">
-              <label className={labelCls} htmlFor={fieldId("parity")}>
-                Parity
-              </label>
-              <select
-                id={fieldId("parity")}
-                className={inputCls}
-                value={form.parity}
-                disabled={form.sweepOn}
-                title={form.sweepOn ? "Replaced by the parities ticked below" : undefined}
-                onChange={(e) => patch({ parity: toParity(e.currentTarget.value) })}
-              >
-                {SCAN_PARITIES.map((p) => (
-                  <option key={p} value={p}>
-                    {PARITY_NAME[p]}
-                  </option>
-                ))}
-              </select>
-            </div>
-            <div className="flex flex-col gap-1">
-              <label className={labelCls} htmlFor={fieldId("databits")}>
-                Data bits
-              </label>
-              <select
-                id={fieldId("databits")}
-                className={inputCls}
-                value={form.dataBits}
-                onChange={(e) => patch({ dataBits: e.currentTarget.value })}
-              >
-                {["5", "6", "7", "8"].map((d) => (
-                  <option key={d} value={d}>
-                    {d}
-                  </option>
-                ))}
-              </select>
-            </div>
-            <div className="flex flex-col gap-1">
-              <label className={labelCls} htmlFor={fieldId("stopbits")}>
-                Stop bits
-              </label>
-              <select
-                id={fieldId("stopbits")}
-                className={inputCls}
-                value={form.stopBits}
-                onChange={(e) => patch({ stopBits: e.currentTarget.value })}
-              >
-                {["1", "2"].map((s) => (
-                  <option key={s} value={s}>
-                    {s}
-                  </option>
-                ))}
-              </select>
-            </div>
-            <div className="flex flex-col gap-1">
-              <label className={labelCls} htmlFor={fieldId("flow")}>
-                Flow control
-              </label>
-              <select
-                id={fieldId("flow")}
-                className={inputCls}
-                value={form.flowControl}
-                onChange={(e) => patch({ flowControl: e.currentTarget.value })}
-              >
-                {flowOptions.map((f) => (
-                  <option key={f} value={f}>
-                    {f}
-                  </option>
-                ))}
-              </select>
-            </div>
-          </div>
-
-          <div className="flex flex-col gap-2">
-            <label className="inline-flex items-center gap-2 text-sm">
-              <input
-                type="checkbox"
-                className={checkCls}
-                checked={form.sweepOn}
-                onChange={(e) => toggleSweep(e.currentTarget.checked)}
-              />
-              Also try other baud rates &amp; parity
-            </label>
-            {form.sweepOn ? (
-              <div className="ml-6 flex flex-col gap-2 rounded-xl border border-slate-200 bg-slate-50/70 p-3 dark:border-slate-800 dark:bg-slate-950/30">
-                <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
-                  <span className={labelCls}>Baud rates</span>
-                  {sweepBaudOptions.map((b) => (
-                    <label key={b} className="inline-flex items-center gap-1.5 text-sm">
-                      <input
-                        type="checkbox"
-                        className={checkCls}
-                        checked={form.sweepBauds.includes(b)}
-                        onChange={(e) => patch({ sweepBauds: toggleIn(form.sweepBauds, b, e.currentTarget.checked) })}
-                      />
+          <Section title="Serial settings">
+            <div className="grid grid-cols-2 gap-3">
+              <div className="flex flex-col gap-1">
+                <label className={labelCls} htmlFor={fieldId("baud")}>
+                  Baud
+                </label>
+                <select
+                  id={fieldId("baud")}
+                  className={inputCls}
+                  value={form.baud}
+                  disabled={form.sweepOn}
+                  title={form.sweepOn ? "Replaced by the baud rates ticked below" : undefined}
+                  onChange={(e) => patch({ baud: e.currentTarget.value })}
+                >
+                  {baudOptions.map((b) => (
+                    <option key={b} value={String(b)}>
                       {b}
-                    </label>
+                    </option>
                   ))}
-                </div>
-                <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
-                  <span className={labelCls}>Parity</span>
-                  {SCAN_PARITIES.map((p) => (
-                    <label key={p} className="inline-flex items-center gap-1.5 text-sm" title={PARITY_NAME[p]}>
-                      <input
-                        type="checkbox"
-                        className={checkCls}
-                        checked={form.sweepParities.includes(p)}
-                        onChange={(e) =>
-                          patch({ sweepParities: toggleIn(form.sweepParities, p, e.currentTarget.checked) })
-                        }
-                      />
-                      {PARITY_LETTER[p]}
-                    </label>
-                  ))}
-                </div>
+                </select>
               </div>
-            ) : null}
-          </div>
+              <div className="flex flex-col gap-1">
+                <label className={labelCls} htmlFor={fieldId("parity")}>
+                  Parity
+                </label>
+                <select
+                  id={fieldId("parity")}
+                  className={inputCls}
+                  value={form.parity}
+                  disabled={form.sweepOn}
+                  title={form.sweepOn ? "Replaced by the parities ticked below" : undefined}
+                  onChange={(e) => patch({ parity: toParity(e.currentTarget.value) })}
+                >
+                  {SCAN_PARITIES.map((p) => (
+                    <option key={p} value={p}>
+                      {PARITY_NAME[p]}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="flex flex-col gap-1">
+                <label className={labelCls} htmlFor={fieldId("databits")}>
+                  Data bits
+                </label>
+                <select
+                  id={fieldId("databits")}
+                  className={inputCls}
+                  value={form.dataBits}
+                  onChange={(e) => patch({ dataBits: e.currentTarget.value })}
+                >
+                  {["5", "6", "7", "8"].map((d) => (
+                    <option key={d} value={d}>
+                      {d}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="flex flex-col gap-1">
+                <label className={labelCls} htmlFor={fieldId("stopbits")}>
+                  Stop bits
+                </label>
+                <select
+                  id={fieldId("stopbits")}
+                  className={inputCls}
+                  value={form.stopBits}
+                  onChange={(e) => patch({ stopBits: e.currentTarget.value })}
+                >
+                  {["1", "2"].map((s) => (
+                    <option key={s} value={s}>
+                      {s}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="col-span-2 flex flex-col gap-1">
+                <label className={labelCls} htmlFor={fieldId("flow")}>
+                  Flow control
+                </label>
+                <select
+                  id={fieldId("flow")}
+                  className={inputCls}
+                  value={form.flowControl}
+                  onChange={(e) => patch({ flowControl: e.currentTarget.value })}
+                >
+                  {flowOptions.map((f) => (
+                    <option key={f} value={f}>
+                      {f}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
+
+            <div className="flex flex-col gap-3 rounded-lg border border-slate-200 bg-slate-50/70 p-3 dark:border-slate-800 dark:bg-slate-950/30">
+              <div className="flex flex-col gap-0.5">
+                <label className="flex cursor-pointer items-center gap-2.5 text-sm font-medium text-slate-800 dark:text-slate-100">
+                  <input
+                    type="checkbox"
+                    className={checkCls}
+                    checked={form.sweepOn}
+                    aria-describedby={fieldId("sweep-hint")}
+                    onChange={(e) => toggleSweep(e.currentTarget.checked)}
+                  />
+                  Also try other baud rates &amp; parity
+                </label>
+                <p id={fieldId("sweep-hint")} className="pl-6.5 text-xs text-slate-500 dark:text-slate-400">
+                  Use when the device&apos;s serial settings are unknown too. Each setting repeats the whole range.
+                </p>
+              </div>
+              {form.sweepOn ? (
+                <div className="flex flex-col gap-3 pl-6">
+                  <div className="flex flex-col gap-1.5">
+                    <span className={labelCls}>Baud rates</span>
+                    <div className="flex flex-wrap gap-1.5">
+                      {sweepBaudOptions.map((b) => (
+                        <label key={b} className={chipCls}>
+                          <input
+                            type="checkbox"
+                            className="sr-only"
+                            checked={form.sweepBauds.includes(b)}
+                            onChange={(e) => patch({ sweepBauds: toggleIn(form.sweepBauds, b, e.currentTarget.checked) })}
+                          />
+                          {b}
+                        </label>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="flex flex-col gap-1.5">
+                    <span className={labelCls}>Parity</span>
+                    <div className="flex flex-wrap gap-1.5">
+                      {SCAN_PARITIES.map((p) => (
+                        <label key={p} className={chipCls} title={PARITY_NAME[p]}>
+                          <input
+                            type="checkbox"
+                            className="sr-only"
+                            checked={form.sweepParities.includes(p)}
+                            onChange={(e) =>
+                              patch({ sweepParities: toggleIn(form.sweepParities, p, e.currentTarget.checked) })
+                            }
+                          />
+                          {PARITY_LETTER[p]}
+                        </label>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              ) : null}
+            </div>
+          </Section>
         </>
       ) : (
-        <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-          <div className="col-span-2 flex flex-col gap-1">
-            <label className={labelCls} htmlFor={fieldId("host")}>
-              Host
-            </label>
-            <input
-              id={fieldId("host")}
-              className={inputCls}
-              value={form.host}
-              onChange={(e) => patch({ host: e.currentTarget.value })}
-            />
+        <Section title="TCP target">
+          <div className="grid grid-cols-2 gap-3">
+            <div className="col-span-2 flex flex-col gap-1">
+              <label className={labelCls} htmlFor={fieldId("host")}>
+                Host
+              </label>
+              <input
+                id={fieldId("host")}
+                className={inputCls}
+                value={form.host}
+                placeholder="e.g. 192.168.1.10"
+                onChange={(e) => patch({ host: e.currentTarget.value })}
+              />
+            </div>
+            <div className="flex flex-col gap-1">
+              <label className={labelCls} htmlFor={fieldId("tcpport")}>
+                TCP port
+              </label>
+              <input
+                id={fieldId("tcpport")}
+                type="number"
+                min={1}
+                max={65535}
+                className={inputCls}
+                value={form.tcpPort}
+                onChange={(e) => patch({ tcpPort: e.currentTarget.value })}
+              />
+            </div>
+            <div className="flex flex-col gap-1">
+              <label className={labelCls} htmlFor={fieldId("concurrency")}>
+                Parallel checks
+              </label>
+              <input
+                id={fieldId("concurrency")}
+                type="number"
+                min={1}
+                max={32}
+                className={inputCls}
+                value={form.concurrency}
+                onChange={(e) => patch({ concurrency: e.currentTarget.value })}
+              />
+            </div>
           </div>
-          <div className="flex flex-col gap-1">
-            <label className={labelCls} htmlFor={fieldId("tcpport")}>
-              TCP port
-            </label>
-            <input
-              id={fieldId("tcpport")}
-              type="number"
-              min={1}
-              max={65535}
-              className={inputCls}
-              value={form.tcpPort}
-              onChange={(e) => patch({ tcpPort: e.currentTarget.value })}
-            />
-          </div>
-          <div className="flex flex-col gap-1">
-            <label className={labelCls} htmlFor={fieldId("concurrency")}>
-              Parallel checks
-            </label>
-            <input
-              id={fieldId("concurrency")}
-              type="number"
-              min={1}
-              max={32}
-              className={inputCls}
-              value={form.concurrency}
-              onChange={(e) => patch({ concurrency: e.currentTarget.value })}
-            />
-          </div>
-        </div>
+          <p className="text-xs text-slate-500 dark:text-slate-400">
+            Behind a TCP-to-RTU gateway, use 1 parallel check and a wait longer than the gateway&apos;s own timeout.
+          </p>
+        </Section>
       )}
 
-      <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
-        <div className="flex flex-col gap-1">
-          <label className={labelCls} htmlFor={fieldId("start")}>
-            Start
-          </label>
-          <input
-            id={fieldId("start")}
-            type="number"
-            min={unitRange(form.kind).min}
-            max={unitRange(form.kind).max}
-            className={inputCls}
-            value={form.start}
-            onChange={(e) => setStart(e.currentTarget.value)}
-          />
+      <Section title="Addresses" aside={`Valid ${range.min}–${range.max}`}>
+        <div className="grid grid-cols-2 gap-3">
+          <div className="flex flex-col gap-1">
+            <label className={labelCls} htmlFor={fieldId("start")}>
+              Start
+            </label>
+            <input
+              id={fieldId("start")}
+              type="number"
+              min={range.min}
+              max={range.max}
+              className={inputCls}
+              value={form.start}
+              onChange={(e) => setStart(e.currentTarget.value)}
+            />
+          </div>
+          <div className="flex flex-col gap-1">
+            <label className={labelCls} htmlFor={fieldId("quantity")}>
+              Quantity
+            </label>
+            <input
+              id={fieldId("quantity")}
+              type="number"
+              min={1}
+              className={inputCls}
+              value={form.quantity}
+              onChange={(e) => patch({ quantity: e.currentTarget.value, quantityEdited: true })}
+            />
+          </div>
         </div>
-        <div className="flex flex-col gap-1">
-          <label className={labelCls} htmlFor={fieldId("quantity")}>
-            Quantity
-          </label>
-          <input
-            id={fieldId("quantity")}
-            type="number"
-            min={1}
-            className={inputCls}
-            value={form.quantity}
-            onChange={(e) => patch({ quantity: e.currentTarget.value, quantityEdited: true })}
-          />
+      </Section>
+
+      <Section title="Checks">
+        <div className="grid grid-cols-2 gap-3">
+          <div className="col-span-2 flex flex-col gap-1">
+            <label className={labelCls} htmlFor={fieldId("probe")}>
+              Check with
+            </label>
+            <select
+              id={fieldId("probe")}
+              className={inputCls}
+              value={form.probe}
+              onChange={(e) => patch({ probe: e.currentTarget.value as ProbeKind })}
+            >
+              {PROBE_OPTIONS.map((o) => (
+                <option key={o.value} value={o.value}>
+                  {o.label}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="flex flex-col gap-1">
+            <label className={labelCls} htmlFor={fieldId("wait")}>
+              Wait (ms)
+            </label>
+            <input
+              id={fieldId("wait")}
+              type="number"
+              min={20}
+              max={5000}
+              className={inputCls}
+              value={form.waitMs}
+              onChange={(e) => patch({ waitMs: e.currentTarget.value, waitEdited: true })}
+            />
+          </div>
+          <div className="flex flex-col gap-1">
+            <label className={labelCls} htmlFor={fieldId("retries")}>
+              Retries
+            </label>
+            <input
+              id={fieldId("retries")}
+              type="number"
+              min={0}
+              max={3}
+              className={inputCls}
+              value={form.retries}
+              onChange={(e) => patch({ retries: e.currentTarget.value })}
+            />
+          </div>
         </div>
-        <div className="flex flex-col gap-1">
-          <label className={labelCls} htmlFor={fieldId("probe")}>
-            Check with
-          </label>
-          <select
-            id={fieldId("probe")}
-            className={inputCls}
-            value={form.probe}
-            onChange={(e) => patch({ probe: e.currentTarget.value as ProbeKind })}
-          >
-            {PROBE_OPTIONS.map((o) => (
-              <option key={o.value} value={o.value}>
-                {o.label}
-              </option>
-            ))}
-          </select>
-        </div>
-        <div className="flex flex-col gap-1">
-          <label className={labelCls} htmlFor={fieldId("wait")}>
-            Wait (ms)
-          </label>
-          <input
-            id={fieldId("wait")}
-            type="number"
-            min={20}
-            max={5000}
-            className={inputCls}
-            value={form.waitMs}
-            onChange={(e) => patch({ waitMs: e.currentTarget.value, waitEdited: true })}
-          />
-        </div>
-        <div className="flex flex-col gap-1">
-          <label className={labelCls} htmlFor={fieldId("retries")}>
-            Retries
-          </label>
-          <input
-            id={fieldId("retries")}
-            type="number"
-            min={0}
-            max={3}
-            className={inputCls}
-            value={form.retries}
-            onChange={(e) => patch({ retries: e.currentTarget.value })}
-          />
-        </div>
-      </div>
+      </Section>
     </fieldset>
   );
 }
