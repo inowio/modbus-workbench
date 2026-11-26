@@ -160,8 +160,8 @@ export default function TemplateEditorModal(props: {
   const [typingCategory, setTypingCategory] = useState(false);
   const [sel, setSel] = useState(0);
   const [focusTick, setFocusTick] = useState(0);
-  // Reason the selected register's scaling can't be saved (null = fine).
-  const [scalingError, setScalingError] = useState<string | null>(null);
+  // Invalid scaling text currently typed in the selected register (it is never stored; see scalingBlock for stored values).
+  const [draftError, setDraftError] = useState<string | null>(null);
   const aliasRef = useRef<HTMLInputElement>(null);
   const [addrFmt] = useAppAddressFormat();
 
@@ -254,13 +254,23 @@ export default function TemplateEditorModal(props: {
   const keyTrim = t.templateKey.trim();
   const keyClashes = !isEdit && props.takenKeys.includes(keyTrim);
   const overlaps = findOverlaps(t.registers);
-  const valid = keyTrim !== "" && t.name.trim() !== "" && !keyClashes && overlaps.size === 0 && scalingError === null;
+  // Any register (including ones loaded already invalid) with unusable scaling blocks Save.
+  const scalingBlock = (() => {
+    for (let i = 0; i < t.registers.length; i += 1) {
+      const r = t.registers[i];
+      if (r.bank === 1 || r.bank === 2) continue;
+      const err = validateScaling(scalingTexts(r), false).error;
+      if (err) return `Register ${i + 1}: ${err}`;
+    }
+    return null;
+  })();
+  const valid = keyTrim !== "" && t.name.trim() !== "" && !keyClashes && overlaps.size === 0 && scalingBlock === null && draftError === null;
   const blocker =
     t.name.trim() === "" ? "Enter a name to save."
       : keyTrim === "" ? "Enter a key (Advanced) to save."
         : keyClashes ? "Choose a different key (Advanced)."
           : overlaps.size > 0 ? `Fix overlapping registers to save (${overlaps.size}).`
-            : scalingError;
+            : scalingBlock ?? draftError;
   const selIdx = Math.min(sel, t.registers.length - 1);
   const selected = selIdx >= 0 ? t.registers[selIdx] : null;
 
@@ -405,7 +415,7 @@ export default function TemplateEditorModal(props: {
             <div className="@container min-h-0 min-w-0 overflow-y-auto rounded-xl border border-slate-200 p-4 dark:border-slate-700">
               {selected ? (
                 <RegisterEditor key={`${selIdx}:${t.registers.length}`} index={selIdx} reg={selected} addrFmt={addrFmt} aliasRef={aliasRef}
-                  onChange={(patch) => setReg(selIdx, patch)} onScalingError={setScalingError} />
+                  onChange={(patch) => setReg(selIdx, patch)} onScalingError={setDraftError} />
               ) : (
                 <div className="py-10 text-center text-xs text-slate-500 dark:text-slate-400">
                   Select a register to edit it.
@@ -557,13 +567,17 @@ function RegisterEditor(props: {
   // Scaling is typed as text; invalid text keeps the stored value and blocks Save.
   const [scalingText, setScalingText] = useState<ScalingText>(() => scalingTexts(r));
   const scalingCheck = validateScaling(scalingText, isBit);
-  const scalingError = scalingCheck.error;
+  const draftError = scalingCheck.error;
   useEffect(() => {
-    onScalingError(scalingError);
+    onScalingError(draftError);
     return () => onScalingError(null);
-  }, [scalingError, onScalingError]);
+  }, [draftError, onScalingError]);
   const editScaling = (field: keyof ScalingText, text: string) => {
     setScalingText((prev) => ({ ...prev, [field]: text }));
+    // Values that fail validation stay in the field (with the error) but never reach the register.
+    const next = validateScaling({ ...scalingText, [field]: text }, false);
+    const fieldError = field === "scale" ? next.scaleError : field === "offset" ? next.offsetError : next.decimalsError;
+    if (fieldError) return;
     const n = parseOptionalNumber(text);
     if (n === undefined) return;
     if (field === "scale") onChange({ scale: n ?? undefined });

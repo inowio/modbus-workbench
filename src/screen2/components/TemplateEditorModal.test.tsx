@@ -287,6 +287,21 @@ describe("TemplateEditorModal", () => {
       expect(screen.getByRole("button", { name: /save device/i })).toBeEnabled();
     });
 
+    it("keeps Scale 0 out of the saved register even after selecting another register", () => {
+      const onSave = vi.fn();
+      render(<TemplateEditorModal open initial={withRegs([reg(0, scaled), reg(1)])} takenKeys={[]} onClose={vi.fn()} onSave={onSave} />);
+      fireEvent.change(screen.getByLabelText("Scale 0"), { target: { value: "0" } });
+      fireEvent.click(screen.getByRole("button", { name: /^Register 2:/ }));
+      save();
+      expect(onSave.mock.calls[0][0].registers[0].scale).toBe(0.1);
+    });
+
+    it("blocks Save for a loaded register that already has scale 0", () => {
+      render(<TemplateEditorModal open initial={withRegs([reg(0), reg(1, { scale: 0 })])} takenKeys={[]} onClose={vi.fn()} onSave={vi.fn()} />);
+      expect(screen.getByRole("button", { name: /save device/i })).toBeDisabled();
+      expect(screen.getByText("Register 2: Scale can't be zero.")).toBeInTheDocument();
+    });
+
     it("drops scaling when the register becomes a bit bank", () => {
       const onSave = vi.fn();
       render(<TemplateEditorModal open initial={withRegs([reg(0, scaled)])} takenKeys={[]} onClose={vi.fn()} onSave={onSave} />);
