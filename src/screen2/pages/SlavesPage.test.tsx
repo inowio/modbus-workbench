@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import SlavesPage from "./SlavesPage";
 
@@ -35,8 +35,23 @@ vi.mock("../api/logs", async () => {
   };
 });
 
+let scannerProps: {
+  open: boolean;
+  workspaceName: string;
+  onClose: () => void;
+  onAdd: (pick: unknown) => void;
+} | null = null;
+
+vi.mock("../components/SlaveScannerModal", () => ({
+  default: (props: NonNullable<typeof scannerProps>) => {
+    scannerProps = props;
+    return props.open ? <div data-testid="scanner-modal">scanner</div> : null;
+  },
+}));
+
 describe("SlavesPage", () => {
   beforeEach(() => {
+    scannerProps = null;
     invokeMock.mockReset();
     navigateMock.mockReset();
     pushToastMock.mockReset();
@@ -263,5 +278,158 @@ describe("SlavesPage", () => {
         expect.objectContaining({ message: "Failed to clone slave" }),
       ),
     );
+  });
+
+  describe("slave scanner integration", () => {
+    const pick = {
+      unitId: 17,
+      connectionKind: "serial",
+      suggestedName: "Slave 17",
+      serialToSave: {
+        port: "COM5",
+        params: { baud: 19200, parity: "even", dataBits: 8, stopBits: 1, flowControl: "none" },
+        portDiffers: true,
+      },
+    };
+    const wsSettings = {
+      kind: "serial",
+      serialPort: "COM1",
+      serialBaud: 9600,
+      serialParity: "none",
+      serialDataBits: 8,
+      serialStopBits: 1,
+      serialFlowControl: "none",
+      tcpHost: "10.0.0.5",
+      tcpPort: 1502,
+    };
+
+    function setupScan(opts: { setFails?: boolean } = {}) {
+      invokeMock.mockImplementation((command: string, args?: Record<string, unknown>) => {
+        if (command === "list_slaves") return Promise.resolve([]);
+        if (command === "create_slave") {
+          const s = (args?.slave ?? {}) as { name: string; unitId: number };
+          return Promise.resolve({ id: 9, name: s.name, unitId: s.unitId, createdAt: "", updatedAt: "" });
+        }
+        if (command === "get_connection_settings") return Promise.resolve(wsSettings);
+        if (command === "set_connection_settings") {
+          return opts.setFails ? Promise.reject(new Error("disk full")) : Promise.resolve(null);
+        }
+        return Promise.resolve(null);
+      });
+    }
+
+    async function openFromPick() {
+      render(<SlavesPage />);
+      fireEvent.click(await screen.findByRole("button", { name: /^scan$/i }));
+      await screen.findByTestId("scanner-modal");
+      act(() => scannerProps!.onAdd(pick));
+      return await screen.findByRole("dialog");
+    }
+
+    it("Scan button opens the scanner", async () => {
+      setupScan();
+      render(<SlavesPage />);
+      expect(screen.queryByTestId("scanner-modal")).toBeNull();
+      fireEvent.click(await screen.findByRole("button", { name: /^scan$/i }));
+      expect(await screen.findByTestId("scanner-modal")).toBeInTheDocument();
+      expect(scannerProps?.workspaceName).toBe("TestWS");
+    });
+
+    it("scan pick pre-fills the Add form", async () => {
+      setupScan();
+      const dialog = await openFromPick();
+      expect(screen.queryByTestId("scanner-modal")).toBeNull();
+      expect(within(dialog).getByLabelText("Name")).toHaveValue("Slave 17");
+      expect(within(dialog).getByLabelText(/unit id/i)).toHaveValue(17);
+      expect(within(dialog).getByLabelText("Connection")).toHaveValue("serial");
+      const box = within(dialog).getByRole("checkbox", {
+        name: "Also save serial settings (19200 8E1, COM5) to the workspace",
+      });
+      expect(box).not.toBeChecked();
+      expect(
+        within(dialog).getByText("Changes the port and settings for all serial slaves in this workspace"),
+      ).toBeInTheDocument();
+    });
+
+    it("manual Add shows Connection defaulting to Serial and no checkbox", async () => {
+      setupScan();
+      render(<SlavesPage />);
+      fireEvent.click(await screen.findByRole("button", { name: /^add$/i }));
+      const dialog = await screen.findByRole("dialog");
+      expect(within(dialog).getByLabelText("Connection")).toHaveValue("serial");
+      expect(within(dialog).queryByRole("checkbox")).toBeNull();
+    });
+
+    it("Add with TCP kind sends connectionKind", async () => {
+      setupScan();
+      render(<SlavesPage />);
+      fireEvent.click(await screen.findByRole("button", { name: /^add$/i }));
+      const dialog = await screen.findByRole("dialog");
+      fireEvent.change(within(dialog).getByLabelText("Name"), { target: { value: "Gw" } });
+      fireEvent.change(within(dialog).getByLabelText(/unit id/i), { target: { value: "3" } });
+      fireEvent.change(within(dialog).getByLabelText("Connection"), { target: { value: "tcp" } });
+      fireEvent.click(within(dialog).getByRole("button", { name: /^add$/i }));
+      await waitFor(() =>
+        expect(invokeMock).toHaveBeenCalledWith(
+          "create_slave",
+          expect.objectContaining({ slave: expect.objectContaining({ connectionKind: "tcp", unitId: 3 }) }),
+        ),
+      );
+    });
+
+    it("ticked checkbox saves serial settings after creating the slave", async () => {
+      setupScan();
+      const dialog = await openFromPick();
+      fireEvent.click(within(dialog).getByRole("checkbox"));
+      fireEvent.click(within(dialog).getByRole("button", { name: /^add$/i }));
+      await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("set_connection_settings", expect.anything()));
+      const cmds = invokeMock.mock.calls.map((c) => c[0]);
+      expect(cmds.indexOf("create_slave")).toBeLessThan(cmds.indexOf("set_connection_settings"));
+      const call = invokeMock.mock.calls.find((c) => c[0] === "set_connection_settings")!;
+      expect(call[1].name).toBe("TestWS");
+      expect(typeof call[1].nowIso).toBe("string");
+      expect(call[1].settings).toEqual({
+        ...wsSettings,
+        serialPort: "COM5",
+        serialBaud: 19200,
+        serialParity: "even",
+        serialDataBits: 8,
+        serialStopBits: 1,
+        serialFlowControl: "none",
+      });
+    });
+
+    it("unticked checkbox does not touch workspace settings", async () => {
+      setupScan();
+      const dialog = await openFromPick();
+      fireEvent.click(within(dialog).getByRole("button", { name: /^add$/i }));
+      await waitFor(() => expect(pushToastMock).toHaveBeenCalledWith('Slave "Slave 17" added', "info"));
+      expect(invokeMock.mock.calls.some((c) => c[0] === "set_connection_settings")).toBe(false);
+    });
+
+    it("settings save failure keeps the slave and toasts", async () => {
+      setupScan({ setFails: true });
+      const dialog = await openFromPick();
+      fireEvent.click(within(dialog).getByRole("checkbox"));
+      fireEvent.click(within(dialog).getByRole("button", { name: /^add$/i }));
+      await waitFor(() =>
+        expect(pushToastMock).toHaveBeenCalledWith(
+          expect.stringMatching(/^Slave added, but saving serial settings failed: .*disk full/),
+          "error",
+        ),
+      );
+      await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+      expect(await screen.findByText(/Slave 17/)).toBeInTheDocument();
+    });
+
+    it("resets scan-pick state when the Add modal closes", async () => {
+      setupScan();
+      const dialog = await openFromPick();
+      fireEvent.click(within(dialog).getByRole("button", { name: /cancel/i }));
+      fireEvent.click(await screen.findByRole("button", { name: /^add$/i }));
+      const again = await screen.findByRole("dialog");
+      expect(within(again).queryByRole("checkbox")).toBeNull();
+      expect(within(again).getByLabelText("Name")).toHaveValue("");
+    });
   });
 });
