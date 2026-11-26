@@ -1874,7 +1874,10 @@ fn validate_template_shape(t: &DeviceTemplate) -> Result<(), String> {
 /// new custom templates are appended.
 #[tauri::command]
 pub fn simulator_list_device_templates(app: tauri::AppHandle) -> Result<Vec<DeviceTemplate>, String> {
-    let custom = read_custom_templates(&app)?;
+    // A damaged custom-template file must not hide the built-in devices from
+    // Add Device; the Virtual Devices view reports the error (and the file is
+    // backed up), so here we fall back to the built-ins alone.
+    let custom = read_custom_templates(&app).unwrap_or_default();
     let mut out = builtin_templates();
     for c in custom {
         if let Some(existing) = out.iter_mut().find(|t| t.template_key == c.template_key) {
