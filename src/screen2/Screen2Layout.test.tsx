@@ -1,5 +1,6 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { MemoryRouter, Route, Routes, useOutletContext } from "react-router-dom";
+import { StrictMode } from "react";
+import { MemoryRouter, Route, Routes, useNavigate, useOutletContext } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import Screen2Layout, { type Screen2OutletContext } from "./Screen2Layout";
@@ -86,7 +87,10 @@ function setupInvoke(options?: { logsPaneOpen?: boolean }) {
 }
 
 describe("Screen2Layout", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
+    // The previous test's unmount schedules its deferred workspace close a tick
+    // later; let it run before the mocks are cleared so it isn't counted here.
+    await new Promise((r) => setTimeout(r, 0));
     vi.clearAllMocks();
     listWorkspaceLogsMock.mockResolvedValue([]);
     listAppLogsMock.mockResolvedValue([]);
@@ -141,8 +145,52 @@ describe("Screen2Layout", () => {
     fireEvent.click(exitButton);
 
     await screen.findByText("Picker");
-    expect(invokeMock).toHaveBeenCalledWith("close_workspace_connections", { name: "UnitTest" });
-    expect(invokeMock).not.toHaveBeenCalledWith("modbus_rtu_disconnect", expect.anything());
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("close_workspace_connections", { name: "UnitTest" }),
+    );
+    const closes = invokeMock.mock.calls.filter(([cmd]) => cmd === "close_workspace_connections");
+    expect(closes).toHaveLength(1);
+  });
+
+  it("moving between pages inside a workspace keeps its connections open", async () => {
+    setupInvoke();
+    function GoToAnalyzer() {
+      const navigate = useNavigate();
+      return <button type="button" onClick={() => navigate("/app/UnitTest/analyzer")}>Go analyzer</button>;
+    }
+    render(
+      <MemoryRouter initialEntries={["/app/UnitTest/workspace"]}>
+        <Routes>
+          <Route path="/app/:workspaceName/*" element={<Screen2Layout />}>
+            <Route path="workspace" element={<GoToAnalyzer />} />
+            <Route path="analyzer" element={<div>Analyzer page</div>} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: "Go analyzer" }));
+    await screen.findByText("Analyzer page");
+    await new Promise((r) => setTimeout(r, 20));
+    expect(invokeMock).not.toHaveBeenCalledWith("close_workspace_connections", expect.anything());
+  });
+
+  it("a remount of the same workspace (React StrictMode) does not close its connections", async () => {
+    setupInvoke();
+    render(
+      <StrictMode>
+        <MemoryRouter initialEntries={["/app/UnitTest/workspace"]}>
+          <Routes>
+            <Route path="/app/:workspaceName/*" element={<Screen2Layout />}>
+              <Route path="workspace" element={<div>Workspace page</div>} />
+            </Route>
+          </Routes>
+        </MemoryRouter>
+      </StrictMode>,
+    );
+    await screen.findByText("Workspace page");
+    await new Promise((r) => setTimeout(r, 20));
+    expect(invokeMock).not.toHaveBeenCalledWith("close_workspace_connections", expect.anything());
   });
 
   it("focus mode hides the sidebar navigation and the app header", async () => {

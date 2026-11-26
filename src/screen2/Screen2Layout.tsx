@@ -158,10 +158,24 @@ export default function Screen2Layout() {
     }
   }
 
+  // Runs once when the workspace really closes (exit, switch, or the layout
+  // unmounting). The close is deferred a tick and cancelled if the same
+  // workspace mounts again straight away — React StrictMode's dev-only
+  // mount → unmount → mount must not stop a running simulator on entry.
+  const pendingCloseRef = useRef<{ name: string; timer: number } | null>(null);
   useEffect(() => {
     const name = workspaceName;
+    const pending = pendingCloseRef.current;
+    if (pending && pending.name === name) {
+      window.clearTimeout(pending.timer);
+      pendingCloseRef.current = null;
+    }
     return () => {
-      void disconnectAll(name);
+      const timer = window.setTimeout(() => {
+        if (pendingCloseRef.current?.timer === timer) pendingCloseRef.current = null;
+        void disconnectAll(name);
+      }, 0);
+      pendingCloseRef.current = { name, timer };
     };
   }, [workspaceName]);
 
@@ -183,7 +197,6 @@ export default function Screen2Layout() {
       setPendingExit(true);
       setNavGuardOpen(true);
     } else {
-      void disconnectAll(workspaceName);
       navigate("/");
     }
   }
@@ -1025,7 +1038,6 @@ export default function Screen2Layout() {
                   const exit = pendingExit;
                   dismissNavGuard();
                   if (exit) {
-                    void disconnectAll(workspaceName);
                     navigate("/");
                   } else if (target) {
                     navigate(target);
