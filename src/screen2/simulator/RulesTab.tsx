@@ -7,6 +7,9 @@ import type { PageRegister, SimDevice } from "./useSimulatorData";
 const BANK_LABEL: Record<number, string> = { 1: "coil", 2: "discrete", 3: "holding", 4: "input" };
 const bankLabel = (bank: number): string => BANK_LABEL[bank] ?? "reg";
 
+/** Legacy onWrite triggers with a missing or negative address match any address (backend semantics). */
+const isAnyAddress = (address: unknown): boolean => address === undefined || address === null || Number(address) < 0;
+
 type ActionRow = {
   type: string;
   bank: number;
@@ -30,7 +33,7 @@ export function ruleSummary(rule: SimRule): string {
       case "condition":
         return `${bank}[${t.address}] ${t.op} ${t.value}`;
       case "onWrite":
-        return `onWrite ${bank}[${t.address}]`;
+        return `onWrite ${bank}[${isAnyAddress(t.address) ? "any" : t.address}]`;
       default:
         return String(t.type ?? "unknown trigger");
     }
@@ -99,6 +102,7 @@ function triggerPiece(rule: SimRule, resolve: Resolver): Piece {
         return { text, missing: r.missing };
       }
       case "onWrite": {
+        if (isAnyAddress(t.address)) return { text: `On write to ${bankLabel(Number(t.bank))} (any address)`, missing: false };
         const r = resolve(t.unit, t.bank, t.address);
         return { text: `On write to ${r.label}`, missing: r.missing };
       }

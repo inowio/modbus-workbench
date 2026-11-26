@@ -164,5 +164,16 @@ describe("RulesTab", () => {
       render(<RulesTab rules={[{ ...r2, name: "" } as any]} devices={[]} onAdd={vi.fn()} onEdit={vi.fn()} onToggle={vi.fn()} onDelete={vi.fn()} />);
       expect(screen.getByRole("checkbox", { name: "Enable rule #5" })).toBeInTheDocument();
     });
+
+    it("shows a legacy onWrite rule with no/negative address as 'any address', not missing (M5)", () => {
+      const noAddr = { ...r2, id: 6, trigger: JSON.stringify({ type: "onWrite", unit: 1, bank: 3 }) };
+      const negAddr = { ...r2, id: 7, trigger: JSON.stringify({ type: "onWrite", unit: 1, bank: 1, address: -1 }) };
+      render(<RulesTab rules={[noAddr as any, negAddr as any]} devices={[]} registers={regs} onAdd={vi.fn()} onEdit={vi.fn()} onToggle={vi.fn()} onDelete={vi.fn()} />);
+      const holding = screen.getByText("On write to holding (any address)");
+      expect(holding).not.toHaveAttribute("title");
+      expect(holding.className).not.toMatch(/amber/);
+      expect(screen.getByText("On write to coil (any address)")).toBeInTheDocument();
+      expect(ruleSummary(noAddr as any)).toBe("onWrite holding[any]");
+    });
   });
 });
