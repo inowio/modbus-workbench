@@ -1,4 +1,4 @@
-import { render, screen, fireEvent } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { describe, it, expect, vi } from "vitest";
 import SimStatusDashboard from "./SimStatusDashboard";
 
@@ -87,6 +87,34 @@ describe("SimStatusDashboard", () => {
       render(<SimStatusDashboard {...base} onChangePort={onChangePort} />);
       fireEvent.blur(screen.getByLabelText("Port"));
       expect(onChangePort).not.toHaveBeenCalled();
+    });
+
+    it("reverts the draft to the saved value when the backend rejects the commit (M4)", async () => {
+      const onChangePort = vi.fn(() => Promise.resolve(false));
+      render(<SimStatusDashboard {...base} onChangePort={onChangePort} />);
+      const port = screen.getByLabelText("Port") as HTMLInputElement;
+      fireEvent.change(port, { target: { value: "5020" } });
+      fireEvent.blur(port);
+      expect(onChangePort).toHaveBeenCalledWith(5020);
+      await waitFor(() => expect(port.value).toBe("502"));
+    });
+
+    it("keeps the committed draft when the save succeeds (M4)", async () => {
+      const onSaveConfig = vi.fn(() => Promise.resolve(true));
+      render(<SimStatusDashboard {...base} onSaveConfig={onSaveConfig} />);
+      const tick = screen.getByLabelText("Tick interval (ms)") as HTMLInputElement;
+      fireEvent.change(tick, { target: { value: "250" } });
+      fireEvent.blur(tick);
+      await Promise.resolve();
+      expect(onSaveConfig).toHaveBeenCalledWith({ tickMs: 250 });
+      expect(tick.value).toBe("250");
+    });
+
+    it("shows no validation error before the config has loaded (M4)", () => {
+      render(<SimStatusDashboard {...base} config={null} />);
+      expect(screen.queryByRole("alert")).toBeNull();
+      expect(screen.getByLabelText("Tick interval (ms)")).not.toHaveAttribute("aria-invalid");
+      expect(screen.getByLabelText("Port")).not.toHaveAttribute("aria-invalid");
     });
   });
 });

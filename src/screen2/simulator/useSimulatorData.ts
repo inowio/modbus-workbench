@@ -114,12 +114,20 @@ export function useSimulatorData(ws: string) {
     };
   }, [ws]);
 
-  const saveConfig = useCallback(async (patch: Partial<SimConfig>) => {
-    if (!config) return;
+  /** Optimistic save; resolves false (error set, saved config restored) on failure. */
+  const saveConfig = useCallback(async (patch: Partial<SimConfig>): Promise<boolean> => {
+    if (!config) return false;
     const next = { ...config, ...patch };
     setConfig(next);
-    try { await invoke("simulator_set_config", { name: ws, config: next }); }
-    catch (e) { setError(String(e)); }
+    try {
+      await invoke("simulator_set_config", { name: ws, config: next });
+      return true;
+    } catch (e) {
+      setError(String(e));
+      // Roll back unless something newer replaced the optimistic value.
+      setConfig((cur) => (cur === next ? config : cur));
+      return false;
+    }
   }, [config, ws]);
 
   const start = useCallback(async () => {

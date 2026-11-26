@@ -11,43 +11,54 @@ type Props = {
   busy: boolean;
   onStart: () => void;
   onStop: () => void;
-  onSaveConfig: (patch: Partial<SimConfig>) => void;
+  /** May resolve false when the backend rejects the value (the draft then reverts). */
+  onSaveConfig: (patch: Partial<SimConfig>) => CommitResult;
   onChangeExpose: (host: string) => void;
-  onChangePort: (port: number) => void;
+  onChangePort: (port: number) => CommitResult;
   onRefresh: () => void;
   registerCount: number;
   unitCount: number;
   deviceCount: number;
 };
 
+type CommitResult = void | boolean | Promise<void | boolean>;
+
 const CARD_CLASS = "rounded-2xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-white/5";
 
 /**
  * Integer input that edits a local draft and commits only on blur/Enter when
  * the draft is valid. Escape reverts. Invalid drafts show a red border + message.
+ * A commit that resolves `false` (backend rejected it) reverts the draft to the
+ * saved value. `value: null` (config not loaded yet) shows an empty, disabled,
+ * unvalidated field.
  */
 function DraftIntInput({
   value, min, max, label, message, className, disabled, onCommit,
 }: {
-  value: number;
+  value: number | null;
   min: number;
   max: number;
   label: string;
   message: string;
   className: string;
   disabled?: boolean;
-  onCommit: (n: number) => void;
+  onCommit: (n: number) => CommitResult;
 }) {
-  const [draft, setDraft] = useState(String(value));
-  useEffect(() => { setDraft(String(value)); }, [value]);
+  const saved = value === null ? "" : String(value);
+  const [draft, setDraft] = useState(saved);
+  useEffect(() => { setDraft(saved); }, [saved]);
 
+  const loading = value === null;
   const trimmed = draft.trim();
   const n = Number(trimmed);
   const valid = /^\d+$/.test(trimmed) && n >= min && n <= max;
-  const invalid = !valid;
+  const invalid = !loading && !valid;
 
   const commit = () => {
-    if (valid && n !== value) onCommit(n);
+    if (loading || !valid || n === value) return;
+    void Promise.resolve(onCommit(n)).then((ok) => {
+      if (ok === false) setDraft(saved);
+    });
   };
 
   return (
@@ -59,12 +70,12 @@ function DraftIntInput({
         aria-invalid={invalid ? "true" : undefined}
         className={`${className} ${invalid ? "border-rose-500 dark:border-rose-500" : "border-slate-300 dark:border-slate-700"}`}
         value={draft}
-        disabled={disabled}
+        disabled={disabled || loading}
         onChange={(e) => setDraft(e.target.value)}
         onBlur={commit}
         onKeyDown={(e) => {
           if (e.key === "Enter") { e.preventDefault(); commit(); }
-          else if (e.key === "Escape") { e.preventDefault(); setDraft(String(value)); }
+          else if (e.key === "Escape") { e.preventDefault(); setDraft(saved); }
         }}
       />
       {invalid ? <span role="alert" className="text-xs text-rose-600 dark:text-rose-300">{message}</span> : null}
@@ -90,7 +101,7 @@ export default function SimStatusDashboard({
   const [addressesExpanded, setAddressesExpanded] = useState(false);
 
   const host = config?.host ?? "0.0.0.0";
-  const port = config?.port ?? 502;
+  const port = config ? config.port : null;
   const effectiveListen = status.listen ?? listen;
 
   return (
@@ -152,7 +163,7 @@ export default function SimStatusDashboard({
             <div className="mt-1 flex flex-wrap items-center gap-2 text-sm">
               <DraftIntInput
                 label="Tick interval (ms)"
-                value={config?.tickMs ?? 0}
+                value={config ? config.tickMs : null}
                 min={10}
                 max={60000}
                 message="Enter 10–60000 ms."

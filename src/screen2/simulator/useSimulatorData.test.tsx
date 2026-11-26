@@ -140,4 +140,20 @@ describe("useSimulatorData", () => {
     await act(async () => { ok = await result.current.addDevice({ templateKey: "t", deviceName: "d", unitId: 1, baseAddress: 0 }); });
     expect(ok).toBe(false);
   });
+
+  it("saveConfig resolves false and restores the saved config when the backend rejects it (M4)", async () => {
+    const { result } = renderHook(() => useSimulatorData("ws"));
+    await waitFor(() => expect(result.current.config?.port).toBe(502));
+    invokeMock.mockImplementation((cmd: string) =>
+      cmd === "simulator_set_config" ? Promise.reject("port in use") : Promise.resolve(null));
+    let ok: boolean | undefined;
+    await act(async () => { ok = await result.current.saveConfig({ port: 5020 }); });
+    expect(ok).toBe(false);
+    expect(result.current.config?.port).toBe(502);
+    expect(result.current.error).toContain("port in use");
+    invokeMock.mockImplementation(() => Promise.resolve(null));
+    await act(async () => { ok = await result.current.saveConfig({ port: 5020 }); });
+    expect(ok).toBe(true);
+    expect(result.current.config?.port).toBe(5020);
+  });
 });

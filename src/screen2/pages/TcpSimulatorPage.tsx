@@ -175,9 +175,9 @@ export default function TcpSimulatorPage() {
         busy={sim.busy}
         onStart={() => void sim.start()}
         onStop={() => void sim.stop()}
-        onSaveConfig={(patch) => void sim.saveConfig(patch)}
+        onSaveConfig={(patch) => sim.saveConfig(patch)}
         onChangeExpose={(host) => void sim.saveConfig({ host })}
-        onChangePort={(port) => void sim.saveConfig({ port })}
+        onChangePort={(port) => sim.saveConfig({ port })}
         onRefresh={() => void sim.reload()}
         registerCount={sim.registers.length}
         unitCount={new Set(sim.registers.map((r) => r.unitId)).size}
