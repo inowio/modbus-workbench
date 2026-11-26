@@ -17,6 +17,8 @@ const slavesSection: HelpSectionDefinition = {
     "polling",
     "mask write",
     "scan",
+    "ip range",
+    "subnet",
     "attachments",
     "read after write",
     "monitor",
@@ -28,7 +30,7 @@ const slavesSection: HelpSectionDefinition = {
   searchText:
     "Learn how to maintain the slaves list, open slave detail, configure connections, poll intervals, register selector, Edit and Monitor views, live monitor dashboard with density, search, filters and pinning, status bar, toolbar actions, register rows, mask write, row actions, read-after-write, attachments, switching behavior, address format, and safety rules." +
     " Clone a slave to duplicate its register map and settings under a new name and Unit ID." +
-    " Scan for slaves: find an unknown Unit ID (slave address) over serial or TCP, baud and parity sweep, several COM ports, gateway, garbled, add from result.",
+    " Scan for slaves: find an unknown Unit ID (slave address) over serial or TCP, IP range scan to find Modbus devices on a subnet, baud and parity sweep, several COM ports, gateway, garbled, add from result.",
   anchors: [
     { id: "list-overview", label: "Slaves list overview" },
     { id: "list-layout", label: "List layout" },
@@ -38,6 +40,7 @@ const slavesSection: HelpSectionDefinition = {
     { id: "list-actions", label: "Per-slave actions" },
     { id: "list-dialogs", label: "Add / clone / edit / delete" },
     { id: "list-scan", label: "Scan for slaves" },
+    { id: "list-scan-range", label: "Scan an IP range" },
     { id: "list-best", label: "List best practices" },
     { id: "list-scope", label: "List scope" },
     { id: "detail-purpose", label: "Slave detail purpose" },
@@ -142,6 +145,30 @@ const slavesSection: HelpSectionDefinition = {
         </p>
         <p className="text-xs text-slate-500 dark:text-slate-400">
           Scanning only reads. It never writes to a device. To discover a device's register map once you have its Unit ID, use Scan &amp; Add on the slave detail page. The built-in TCP simulator answers addresses without a device with exception 0x0B, like a gateway, so scanning it lists only the configured devices.
+        </p>
+      </SectionBlock>
+      <SectionBlock section="slaves" anchor="list-scan-range" title="Scan an IP range">
+        <p>
+          Do not know which host a TCP device is on? In the scanner, set the TCP target to <strong>IP range</strong> to search a network for Modbus devices. This is discovery only: there is no <strong>Add</strong> button, because a workspace has a single TCP host. Note the address you find and enter it in the workspace's TCP settings.
+        </p>
+        <ul className="list-disc space-y-1 pl-5">
+          <li><strong>Choosing the range</strong> — <strong>Network</strong> holds the first three octets and is pre-filled from this PC (shown as <em>This PC: …</em>; <strong>Use my network</strong> restores it). <strong>From</strong> and <strong>To</strong> take 1–254. A preview line, for example <em>192.168.68.1 → 192.168.68.254 · 254 addresses</em>, shows what will be scanned.</li>
+          <li><strong>Custom range (CIDR or across subnets)</strong> — a collapsed field for anything else: <code>a.b.c.d-e</code>, <code>a.b.c.d-w.x.y.z</code>, <code>a.b.c.d/n</code> or a single IP. A range is limited to 1024 addresses; broadcast, multicast and 0.x addresses are refused.</li>
+          <li><strong>Two stages</strong> — first <em>Finding hosts — n / N</em> tries to open the Modbus port on each address. Then <em>Scanning unit IDs on … (host i of n)</em> runs the normal unit-ID scan on each host that answered, up to 4 hosts at once.</li>
+          <li><strong>Unit IDs and timeouts</strong> — in range mode the unit-ID scan defaults to 1–247. Stage 2 uses the unit-ID settings in the scanner (Check with, Wait, Retries) and the workspace connect timeout.</li>
+          <li><strong>Advanced</strong> — <strong>Connect wait (ms)</strong> (default 300) is how long stage 1 waits for each host to accept a connection. <strong>Parallel hosts</strong> (default 64) is how many addresses stage 1 tries at once.</li>
+        </ul>
+        <p>The <strong>Hosts</strong> counter and list show each host's status:</p>
+        <ul className="list-disc space-y-1 pl-5">
+          <li><strong>{'{n}'} device(s)</strong> — Unit IDs answered on this host.</li>
+          <li><strong>answers every unit ID</strong> — the host ignores the Unit ID, so it is a single device.</li>
+          <li><strong>gateway</strong> — a TCP-to-RTU gateway answered; the devices behind it may need a slower scan.</li>
+          <li><strong>port open, no Modbus reply</strong> — something accepts connections on the port but no unit ID replied.</li>
+          <li><strong>connection lost during scan</strong> — the host dropped the connection part-way.</li>
+          <li><strong>scanning…</strong> and <strong>not scanned (cancelled)</strong> — in progress, or stopped before reaching it.</li>
+        </ul>
+        <p className="text-xs text-slate-500 dark:text-slate-400">
+          Firewalls often make a host time out instead of refusing the connection, so on a slow or filtered network raise <strong>Connect wait</strong>. To find the built-in simulator, start it in this app with <strong>Expose</strong> set to LAN.
         </p>
       </SectionBlock>
       <SectionBlock section="slaves" anchor="list-best" title="List best practices">

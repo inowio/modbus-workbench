@@ -9,6 +9,9 @@ All notable changes to this project are tracked here following [Keep a Changelog
   Unit ID over serial (one or several ports, optional baud/parity sweep) or TCP
   (parallel checks), lists answers live, flags gateway and garbled replies, and
   adds a result as a slave with its serial settings if you choose.
+- **IP range scan** — the scanner's TCP target can be an IP range (your local
+  network or a custom range up to 1024 addresses); it finds hosts with the Modbus
+  port open, then scans unit IDs on each and lists the devices it finds.
 - **Unit dropdown** — Analyzer signals now pick a unit from a grouped list
   (Temperature, Electrical, Pressure, Flow, Vibration, Time and more), with
   **Custom…** for your own label. The unit is only a label and never converts
