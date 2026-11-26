@@ -9,6 +9,11 @@ export type TemplateRegister = {
   valueSource: string;
   sourceParams: string;
   alias: string;
+  // Optional fields carried by saved templates; the editor keeps them as-is on save.
+  unit?: string | null;
+  displayFormat?: string | null;
+  intervalMs?: number;
+  holdValue?: number;
 };
 
 export type DeviceTemplate = {
