@@ -88,6 +88,14 @@
     color: rgb(148 163 184) !important;
   }
 
+  /* Highlighted / selected option in the open native list: emerald-tinted with light text.
+     !important is needed so it beats the `.dark optgroup option` background/colour rule. */
+  .dark option:checked:not(:disabled),
+  .dark option:hover:not(:disabled) {
+    background-color: rgb(16 185 129 / 0.35) !important;
+    color: rgb(236 253 245) !important;
+  }
+
   body {
     @apply m-0 min-h-screen bg-slate-50 font-sans text-slate-900 antialiased;
   }
