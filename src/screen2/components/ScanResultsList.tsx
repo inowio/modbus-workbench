@@ -9,6 +9,8 @@ export type ScanResultsListProps = {
   scanning: boolean;
   isExisting(ev: ScanFoundEvent): boolean;
   onAdd(ev: ScanFoundEvent): void;
+  /** False hides the Add button and "already in workspace" badge (range scans list devices only). */
+  allowAdd?: boolean;
 };
 
 function rowKey(ev: ScanFoundEvent): string {
@@ -92,7 +94,7 @@ export function garbledSummary(events: ScanFoundEvent[]): string {
 }
 
 /** The three result groups of a slave scan: Found, then collapsed garbled and gateway groups. */
-export default function ScanResultsList({ results, scanning, isExisting, onAdd }: ScanResultsListProps) {
+export default function ScanResultsList({ results, scanning, isExisting, onAdd, allowAdd = true }: ScanResultsListProps) {
   const groups = useMemo(() => groupScanResults(results), [results]);
   const [gatewayOpen, setGatewayOpen] = useState(false);
   const [garbledOpen, setGarbledOpen] = useState(false);
@@ -119,7 +121,7 @@ export default function ScanResultsList({ results, scanning, isExisting, onAdd }
                   ev={ev}
                   tone="found"
                   action={
-                    isExisting(ev) ? (
+                    !allowAdd ? null : isExisting(ev) ? (
                       <span className="rounded-full border border-slate-300 bg-slate-100 px-2.5 py-1 text-xs font-semibold whitespace-nowrap text-slate-600 dark:border-slate-700 dark:bg-white/5 dark:text-slate-300">
                         already in workspace
                       </span>

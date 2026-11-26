@@ -10,6 +10,7 @@ import {
   startSlaveScan,
   type ScanDoneEvent,
   type ScanFoundEvent,
+  type ScanHostEvent,
   type ScanNoticeEvent,
   type ScanProgressEvent,
   type SerialParams,
@@ -26,6 +27,7 @@ import {
   suggestSlaveName,
 } from "../utils/slaveScan";
 import { normalizeConnectionSettings, type ConnectionSettings, type PortItem } from "./ConnectionSettingsForm";
+import ScanHostsList from "./ScanHostsList";
 import ScanResultsList from "./ScanResultsList";
 import SlaveScanForm, {
   buildRequest,
@@ -86,6 +88,13 @@ export default function SlaveScannerModal({ open, workspaceName, existingSlaves,
   const [phase, setPhaseState] = useState<Phase>("idle");
   const [resultKind, setResultKind] = useState<"serial" | "tcp">("serial");
   const [results, setResults] = useState<ScanFoundEvent[]>([]);
+  /** Whether the running or last scan was an IP-range scan (results grouped by host, no Add). */
+  const [rangeScan, setRangeScan] = useState(false);
+  /** Latest status per host ("ip:port") of the range scan. */
+  const [hosts, setHosts] = useState<Map<string, ScanHostEvent>>(() => new Map());
+  /** Addresses in the range of the running or last range scan. */
+  const [rangeAddresses, setRangeAddresses] = useState(0);
+  const [cancelledDone, setCancelledDone] = useState(false);
   const [progress, setProgress] = useState<ScanProgressEvent | null>(null);
   const [notices, setNotices] = useState<string[]>([]);
   const [summary, setSummary] = useState<string | null>(null);
@@ -133,6 +142,9 @@ export default function SlaveScannerModal({ open, workspaceName, existingSlaves,
     setLoading(true);
     setError(null);
     setResults([]);
+    setHosts(new Map());
+    setRangeScan(false);
+    setCancelledDone(false);
     setNotices([]);
     setProgress(null);
     setSummary(null);
@@ -175,6 +187,9 @@ export default function SlaveScannerModal({ open, workspaceName, existingSlaves,
       listen<ScanFoundEvent>(SLAVE_SCAN_EVENTS.found, ({ payload }) => {
         if (accept(payload)) setResults((prev) => [...prev, payload]);
       }),
+      listen<ScanHostEvent>(SLAVE_SCAN_EVENTS.host, ({ payload }) => {
+        if (accept(payload)) setHosts((prev) => new Map(prev).set(payload.host, payload));
+      }),
       listen<ScanProgressEvent>(SLAVE_SCAN_EVENTS.progress, ({ payload }) => {
         if (accept(payload)) setProgress(payload);
       }),
@@ -185,6 +200,7 @@ export default function SlaveScannerModal({ open, workspaceName, existingSlaves,
         if (!accept(payload)) return;
         lastDoneScanIdRef.current = payload.scanId;
         setFinalChecked(payload.checked);
+        setCancelledDone(payload.reason === "cancelled");
         currentScanIdRef.current = null;
         phaseRef.current = "idle";
         setPhaseState("idle");
@@ -277,6 +293,11 @@ export default function SlaveScannerModal({ open, workspaceName, existingSlaves,
     scanWorkspaceRef.current = workspaceName;
     setPhase("scanning");
     setResultKind(request.kind === "serial" ? "serial" : "tcp");
+    const rangeParsed = request.kind === "tcpRange" ? parseIpRange(form.range) : null;
+    setRangeScan(request.kind === "tcpRange");
+    setRangeAddresses(rangeParsed !== null && !("error" in rangeParsed) ? rangeParsed.count : 0);
+    setHosts(new Map());
+    setCancelledDone(false);
     setResults([]);
     setNotices([]);
     setProgress(null);
@@ -344,6 +365,7 @@ export default function SlaveScannerModal({ open, workspaceName, existingSlaves,
 
   const fieldId = (name: string) => `${id}-${name}`;
   const showStatus = busy || summary !== null || results.length > 0;
+  const hostList = [...hosts.values()];
   const pct = progress && progress.total > 0 ? Math.min(100, (progress.checked / progress.total) * 100) : 0;
 
   const statusChip =
@@ -474,7 +496,11 @@ export default function SlaveScannerModal({ open, workspaceName, existingSlaves,
                       <span>
                         {phase === "cancelling"
                           ? "Cancelling…"
-                          : progress
+                          : progress?.phase === "hosts"
+                            ? `Finding hosts — ${progress.checked} / ${progress.total}`
+                            : progress && progress.hostIndex != null && progress.hostCount != null
+                              ? `Scanning unit IDs on ${progress.current.target} (host ${progress.hostIndex} of ${progress.hostCount})`
+                              : progress
                             ? `Checking unit ${progress.current.unitId} on ${progress.current.target}${
                                 progress.current.settings ? ` at ${formatSettings(progress.current.settings)}` : ""
                               }`
@@ -499,15 +525,22 @@ export default function SlaveScannerModal({ open, workspaceName, existingSlaves,
                   <div className="text-sm font-medium text-slate-700 dark:text-slate-200">{summary}</div>
                 ) : null}
 
-                <div className="grid grid-cols-2 gap-2 @lg:grid-cols-4">
+                <div className={`grid grid-cols-2 gap-2 ${rangeScan ? "@lg:grid-cols-5" : "@lg:grid-cols-4"}`}>
                   {stat(
                     "Checked",
-                    progress ? `${progress.checked}` : finalChecked !== null ? `${finalChecked}` : busy ? "0" : "—",
+                    progress ? (progress.phase === "hosts" ? "0" : `${progress.checked}`) : finalChecked !== null ? `${finalChecked}` : busy ? "0" : "—",
                     "text-slate-900 dark:text-slate-100",
                   )}
                   {stat("Found", String(counts.found), "text-emerald-700 dark:text-emerald-300")}
                   {stat("Garbled", String(counts.garbled), "text-amber-700 dark:text-amber-300")}
                   {stat("No device (gateway)", String(counts.gateway), "text-slate-600 dark:text-slate-300")}
+                  {rangeScan
+                    ? stat(
+                        "Hosts",
+                        `${hostList.length} / ${rangeAddresses}`,
+                        "text-slate-900 dark:text-slate-100",
+                      )
+                    : null}
                 </div>
               </div>
             ) : null}
@@ -526,7 +559,9 @@ export default function SlaveScannerModal({ open, workspaceName, existingSlaves,
               </ul>
             ) : null}
 
-            {showStatus ? (
+            {showStatus && rangeScan ? (
+              <ScanHostsList hosts={hostList} results={results} scanning={busy} cancelled={cancelledDone} />
+            ) : showStatus ? (
               <ScanResultsList
                 results={results}
                 scanning={busy}

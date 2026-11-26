@@ -233,9 +233,9 @@ describe("SlaveScannerModal", () => {
       },
     });
 
-    // All four listeners were registered before start was invoked.
+    // All five listeners were registered before start was invoked.
     expect(listenMock.mock.calls.map((c) => c[0]).sort()).toEqual(
-      ["slave_scan_done", "slave_scan_found", "slave_scan_notice", "slave_scan_progress"],
+      ["slave_scan_done", "slave_scan_found", "slave_scan_host", "slave_scan_notice", "slave_scan_progress"],
     );
     const startOrder = invokeMock.mock.invocationCallOrder[invokeMock.mock.calls.findIndex((c) => c[0] === "start_slave_scan")];
     expect(Math.max(...listenMock.mock.invocationCallOrder)).toBeLessThan(startOrder);
@@ -677,6 +677,110 @@ describe("SlaveScannerModal", () => {
       const req = (startCalls()[0][1] as { request: ScanRequest }).request;
       expect(req.kind).toBe("tcp");
       expect(req.range ?? null).toBeNull();
+    });
+
+    describe("results and progress", () => {
+      const T3 = "192.168.68.3:502";
+      const T7 = "192.168.68.7:502";
+      const hostEvent = (scanId: string, host: string, status: string, extra: Record<string, unknown> = {}) => ({
+        workspace: WS,
+        scanId,
+        host,
+        status,
+        connectMs: 12,
+        found: 0,
+        gateway: false,
+        ...extra,
+      });
+      const tcpFound = (scanId: string, target: string, unitId: number) =>
+        foundEvent(scanId, { target, unitId, settings: null });
+
+      async function startRangeScan(): Promise<string> {
+        setupRange();
+        await openRangeMode();
+        await waitFor(() => expect(screen.getByLabelText("Range")).toHaveValue("192.168.68.1-254"));
+        return startScan();
+      }
+
+      it("groups results by host with status badges and no Add", async () => {
+        const scanId = await startRangeScan();
+        fire("slave_scan_host", hostEvent(scanId, T3, "open"));
+        fire("slave_scan_host", hostEvent(scanId, T7, "open"));
+        fire("slave_scan_found", tcpFound(scanId, T3, 1));
+        fire("slave_scan_host", hostEvent(scanId, T3, "devices", { found: 1 }));
+        fire("slave_scan_host", hostEvent(scanId, T7, "noModbus"));
+        expect(screen.getByText("1 device(s)")).toBeInTheDocument();
+        expect(screen.getByText("port open, no Modbus reply")).toBeInTheDocument();
+        expect(screen.getByRole("region", { name: `Host ${T3}` })).toBeInTheDocument();
+        expect(screen.getByLabelText("Unit 1 on " + T3)).toBeInTheDocument();
+        expect(screen.queryByRole("button", { name: "Add" })).toBeNull();
+        expect(screen.getByText("Hosts")).toBeInTheDocument();
+        expect(screen.getByText("2 / 254")).toBeInTheDocument();
+      });
+
+      it("progress shows both phases", async () => {
+        const scanId = await startRangeScan();
+        const current = { target: "192.168.68.1:502", unitId: 1, settings: null };
+        fire("slave_scan_progress", {
+          workspace: WS, scanId, checked: 120, total: 254, phase: "hosts", hostIndex: null, hostCount: null, current,
+        });
+        expect(screen.getByText("Finding hosts — 120 / 254")).toBeInTheDocument();
+        fire("slave_scan_progress", {
+          workspace: WS, scanId, checked: 5, total: 20, phase: "units", hostIndex: 2, hostCount: 3,
+          current: { ...current, target: T3 },
+        });
+        expect(screen.getByText(`Scanning unit IDs on ${T3} (host 2 of 3)`)).toBeInTheDocument();
+        expect(screen.getByRole("progressbar")).toHaveAttribute("aria-valuenow", "5");
+      });
+
+      it("answers-all host is collapsed behind show N replies", async () => {
+        const scanId = await startRangeScan();
+        fire("slave_scan_found", tcpFound(scanId, T3, 1));
+        fire("slave_scan_found", tcpFound(scanId, T3, 2));
+        fire("slave_scan_host", hostEvent(scanId, T3, "answersAll", { found: 2 }));
+        expect(screen.getByText("answers every unit ID")).toBeInTheDocument();
+        expect(screen.queryByLabelText("Unit 1 on " + T3)).toBeNull();
+        fireEvent.click(screen.getByRole("button", { name: "show 2 replies" }));
+        expect(screen.getByLabelText("Unit 1 on " + T3)).toBeInTheDocument();
+      });
+
+      it("open host after cancelled done shows not scanned (cancelled)", async () => {
+        const scanId = await startRangeScan();
+        fire("slave_scan_host", hostEvent(scanId, T3, "open"));
+        expect(screen.getByText("scanning…")).toBeInTheDocument();
+        fire("slave_scan_done", { workspace: WS, scanId, reason: "cancelled", checked: 0, found: 0, error: null });
+        expect(screen.getByText("not scanned (cancelled)")).toBeInTheDocument();
+        expect(screen.queryByText("scanning…")).toBeNull();
+      });
+
+      it("Cancel during stage 1 calls cancel_slave_scan", async () => {
+        const scanId = await startRangeScan();
+        fire("slave_scan_progress", {
+          workspace: WS, scanId, checked: 10, total: 254, phase: "hosts", hostIndex: null, hostCount: null,
+          current: { target: "192.168.68.1:502", unitId: 1, settings: null },
+        });
+        fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+        await waitFor(() => expect(cancelCalls()).toEqual([["cancel_slave_scan", { name: WS, scanId }]]));
+      });
+
+      it("a finished range scan leaves no half progress bar", async () => {
+        const scanId = await startRangeScan();
+        fire("slave_scan_host", hostEvent(scanId, T3, "answersAll", { found: 1 }));
+        fire("slave_scan_done", { workspace: WS, scanId, reason: "completed", checked: 3, found: 1, error: null });
+        expect(screen.queryByRole("progressbar")).toBeNull();
+        expect(screen.getByText("Scan complete — checked 3, found 1")).toBeInTheDocument();
+      });
+
+      it("single-host mode keeps ScanResultsList with Add", async () => {
+        setupRange();
+        renderModal();
+        await loaded();
+        fireEvent.click(screen.getByRole("radio", { name: "TCP" }));
+        const scanId = await startScan();
+        fire("slave_scan_found", tcpFound(scanId, "192.168.1.10:502", 5));
+        expect(screen.getByRole("button", { name: "Add" })).toBeInTheDocument();
+        expect(screen.queryByText("Hosts")).toBeNull();
+      });
     });
   });
 });
