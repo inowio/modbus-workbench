@@ -52,6 +52,34 @@ All notable changes to this project are tracked here following [Keep a Changelog
 - **Analyzer tiles appear instantly** — switching tabs and focus-view cycling no
   longer slide every tile into place; tiles only animate while editing the
   layout, and trend charts update in place instead of being rebuilt.
+- **Exiting a workspace frees its serial port** — leaving a workspace now stops
+  its Analyzer polling and TCP simulator and closes its connections, so another
+  workspace (or the slave scanner) can open the same COM port without
+  "Access is denied".
+- **TCP Simulator server** — reads of more registers than Modbus allows are
+  rejected with an "illegal data value" exception instead of a broken reply;
+  multi-register and multi-coil writes are all-or-nothing; "on write" rules see
+  every written address.
+- **TCP Simulator rules** — rules no longer create registers or units that were
+  never configured, and a condition on a missing register never fires. Deleted
+  or edited rules no longer run leftover delayed actions or old timers, and
+  interval rules and generators keep time without drifting.
+- **TCP Simulator stays responsive** — a slow or unplugged route source no
+  longer freezes generators, rules and live values; device presets drift slowly
+  as intended instead of sweeping their range every second.
+- **TCP Simulator edits** — moving a device by a small offset and importing a
+  profile are all-or-nothing; dialogs stay open and show the error when a save
+  fails; Port and Tick interval are checked and saved when you leave the field;
+  the register panel's buttons stay visible; the rule dialog requires a name and
+  an action, warns about targets with no register, and uses plain-language
+  labels; the Rules table shows register names and flags missing targets; hex
+  search works; the "changes apply on next Start" notes are gone (edits apply
+  immediately).
+- **Virtual Devices** — a damaged custom-device file is backed up and reported
+  instead of being silently replaced on the next save; "Clone & edit" creates a
+  new device instead of overwriting an earlier clone; templates with
+  overlapping registers are rejected; saving a device as a template keeps each
+  register's unit, display format, interval and hold value.
 
 ### Changed
 - **Workspace upgrade** — when 0.6.0 starts, every workspace is upgraded as the
