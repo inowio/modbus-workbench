@@ -121,6 +121,7 @@ const simulatorSection: HelpSectionDefinition = {
           <li>Supports concurrent client connections; values update on a fixed <strong>tick</strong>.</li>
           <li>Register values can be fixed, generated, or routed from a live slave, and are editable while running—masters see the change on the next poll.</li>
           <li>Configuration is saved with the workspace, so each project has its own simulator setup.</li>
+          <li>Exiting a workspace stops its TCP simulator and Analyzer polling and closes its connections.</li>
         </ul>
       </SectionBlock>
 
