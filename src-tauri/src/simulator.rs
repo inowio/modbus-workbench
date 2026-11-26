@@ -372,16 +372,34 @@ pub fn dyn_value(d: &DynReg, elapsed_ms: f64) -> f64 {
 }
 
 /// Overwrite `words` at consecutive addresses starting at `address`, but ONLY
-/// where an address is already configured: a missing unit is a no-op and a
-/// missing address inside the span is skipped. This is the runtime write path
+/// when every address of the span is already configured: a missing unit, a
+/// missing address anywhere in the span, or a span past 65535 writes nothing
+/// (all-or-nothing, so e.g. an f32 action never lands half a value on a
+/// single u16 register). This is the runtime write path
 /// (rule actions, generator/device/route updates) — nothing but configured
 /// registers ever exists, and a register deleted or moved while the tick was
 /// computing its value is not resurrected ("ghost register"). Seeding
 /// (`registers_to_banks`, `apply_to_running`) uses `place_words` instead.
 pub fn update_existing_words(banks: &mut HashMap<u8, SimBanks>, unit: u8, bank: u8, address: u16, words: &[u16]) {
     let Some(b) = banks.get_mut(&unit) else { return };
+    if address as usize + words.len() > 65536 {
+        return;
+    }
+    let all_present = (0..words.len()).all(|i| {
+        let addr = address + i as u16;
+        match bank {
+            1 => b.coils.contains_key(&addr),
+            2 => b.discrete_inputs.contains_key(&addr),
+            3 => b.holding.contains_key(&addr),
+            4 => b.input.contains_key(&addr),
+            _ => false,
+        }
+    });
+    if !all_present {
+        return;
+    }
     for (i, &w) in words.iter().enumerate() {
-        let Ok(addr) = u16::try_from(address as usize + i) else { break };
+        let addr = address + i as u16;
         match bank {
             1 => { if let Some(slot) = b.coils.get_mut(&addr) { *slot = w != 0; } }
             2 => { if let Some(slot) = b.discrete_inputs.get_mut(&addr) { *slot = w != 0; } }
@@ -5713,5 +5731,34 @@ mod tests {
         assert_eq!(r.display_format, None);
         let r = slave_row_to_route_register(1, "tcp", 3, 10, "Temp", "u16", "", None);
         assert_eq!(r.display_format, None);
+    }
+
+    #[test]
+    fn update_existing_words_is_all_or_nothing_for_a_span() {
+        // An f32 (2-word) write onto a single configured u16 register must not
+        // write the high word alone (M2).
+        let mut b = banks1(&[(1, 3, 5, 7)]);
+        update_existing_words(&mut b, 1, 3, 5, &[0x4148, 0x0000]);
+        assert_eq!(b[&1].holding.get(&5), Some(&7));
+        assert!(b[&1].holding.get(&6).is_none());
+        // A fully configured span is written.
+        place_words(&mut b, 1, 3, 6, &[0]);
+        update_existing_words(&mut b, 1, 3, 5, &[0x4148, 0x0001]);
+        assert_eq!((b[&1].holding[&5], b[&1].holding[&6]), (0x4148, 0x0001));
+        // A span that would run past 65535 writes nothing either.
+        place_words(&mut b, 1, 3, 65535, &[3]);
+        update_existing_words(&mut b, 1, 3, 65535, &[1, 2]);
+        assert_eq!(b[&1].holding[&65535], 3);
+    }
+
+    #[test]
+    fn multi_word_rule_action_onto_a_single_word_register_writes_nothing() {
+        let mut b = banks1(&[(1, 3, 5, 7)]);
+        let ta = TimedAction {
+            action: Action::Set { unit: 1, bank: 3, address: 5, value: 12 },
+            delay_ms: 0.0, data_type: "f32".into(), byte_order: "ABCD".into(),
+        };
+        apply_timed_action(&mut b, &ta, 0);
+        assert_eq!(b[&1].holding.get(&5), Some(&7), "partial f32 write landed on a u16 register");
     }
 }
