@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 
 import { fmtAddr, type AddrFmt } from "./ruleTargets";
-import { engFromRaw, rawFromEng, registerScaling } from "./scaling";
+import { engFromRaw, rawFromEng, registerScaling, roundHalfAway } from "./scaling";
 import ScalingFields, { EMPTY_SCALING_TEXT, parseOptionalNumber, scalingTexts, validateScaling, type ScalingText } from "./ScalingFields";
 import { rwLabel, type PageRegister } from "./simFilters";
 import { addressConflict, parseAddressInput } from "./simRegister";
@@ -81,6 +81,12 @@ function parseIntText(text: string, min: number, max: number): number | null {
 }
 
 /** Engineering text for a raw value, trimmed of float noise. */
+/** Raw hold value for an engineering value typed in the panel. Hold storage is
+ * always a whole number (the backend stores it as i64), so round even at identity. */
+function holdRawFromText(text: string, scale: number, offset: number, dataType: string): number {
+  return roundHalfAway(rawFromEng(Number(text), scale, offset, dataType));
+}
+
 function engText(raw: number, scale: number, offset: number): string {
   return String(Number(engFromRaw(raw, scale, offset).toFixed(9)));
 }
@@ -114,7 +120,8 @@ export type RegisterInspectorProps = {
   liveRaw?: number | null;
   sourceStatus?: string | null;
   running: boolean;
-  onSave: (reg: PageRegister) => void;
+  /** May report success (true/void) or failure (false), sync or async. */
+  onSave: (reg: PageRegister) => void | boolean | Promise<boolean | void>;
   onDuplicate: (reg: PageRegister) => void;
   onDelete: (id: number) => void;
   onClose: () => void;
@@ -320,7 +327,15 @@ export default function RegisterInspector(props: RegisterInspectorProps) {
     if (field === "scale") set({ scale: n });
     else if (field === "offset") set({ scaleOffset: n });
     else set({ decimals: n === null ? null : Number.isInteger(n) ? n : reg.decimals ?? null });
-    if (field !== "decimals") setHoldText(null);
+    if (field === "decimals") return;
+    if (holdText === null) return; // nothing typed: keep raw, re-derive the shown value
+    // A typed engineering hold value stays; its raw follows the new scaling.
+    const next = registerScaling({
+      dataType: reg.dataType,
+      scale: field === "scale" ? n : scaleParsed ?? null,
+      scaleOffset: field === "offset" ? n : offsetParsed ?? null,
+    });
+    set({ holdValue: holdRawFromText(holdText, next.scale, next.offset, reg.dataType) });
   };
   const previewRaw = running && liveRaw !== null ? liveRaw : reg.valueSource === "hold" ? reg.holdValue : liveRaw ?? 0;
   const holdShown = holdText ?? engText(reg.holdValue, sc.scale, sc.offset);
@@ -341,7 +356,10 @@ export default function RegisterInspector(props: RegisterInspectorProps) {
 
   const handleSave = () => {
     if (intervalError || scalingError) return;
-    onSave(withScaling({ ...reg, sourceParams: buildSourceParams() }));
+    void Promise.resolve(onSave(withScaling({ ...reg, sourceParams: buildSourceParams() }))).then((ok) => {
+      // Saved: show the stored hold value; failed: keep what was typed.
+      if (ok !== false) setHoldText(null);
+    });
   };
 
   const handleCreate = () => {
@@ -528,7 +546,7 @@ export default function RegisterInspector(props: RegisterInspectorProps) {
                   value={holdShown}
                   onChange={(e) => {
                     setHoldText(e.target.value);
-                    set({ holdValue: rawFromEng(Number(e.target.value), sc.scale, sc.offset, reg.dataType) });
+                    set({ holdValue: holdRawFromText(e.target.value, sc.scale, sc.offset, reg.dataType) });
                   }}
                   className={INPUT_CLASS}
                 />

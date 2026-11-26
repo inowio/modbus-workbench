@@ -345,7 +345,7 @@ export default function TcpSimulatorPage() {
                 sourceStatus={selectedRegister ? sim.snapshotFor(selectedRegister.unitId, selectedRegister.functionCode, selectedRegister.address)?.sourceStatus : undefined}
                 running={sim.status.running}
                 error={draftOwnsError ? dialogError : null}
-                onSave={(reg) => void sim.updateRegister(reg)}
+                onSave={(reg) => sim.updateRegister(reg)}
                 onCreate={createRegister}
                 onDuplicate={(reg) => void sim.duplicateRegister(reg)}
                 onDelete={(id) => setConfirmDeleteRegister(sim.registers.find((r) => r.id === id) ?? null)}

@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import RegisterInspector from "./RegisterInspector";
@@ -446,6 +446,58 @@ describe("RegisterInspector scaling", () => {
     expect(screen.getByText("raw 256")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
     expect(p.onSave.mock.calls[0][0].holdValue).toBe(256);
+  });
+
+  it("stores a hold value typed at identity scaling as a whole raw number", () => {
+    const p = base();
+    const plain = { ...scaled, id: 30, dataType: "i16", holdValue: 0, scale: null, scaleOffset: null };
+    render(<RegisterInspector {...p} register={plain} />);
+    fireEvent.click(screen.getByRole("tab", { name: /source/i }));
+    fireEvent.change(screen.getByLabelText(/initial value/i), { target: { value: "23.5" } });
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+    expect(p.onSave.mock.calls[0][0].holdValue).toBe(24);
+    fireEvent.change(screen.getByLabelText(/initial value/i), { target: { value: "-23.5" } });
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+    expect(p.onSave.mock.calls[1][0].holdValue).toBe(-24);
+  });
+
+  it("keeps the typed engineering hold value when the scale is edited afterwards", () => {
+    const p = base();
+    render(<RegisterInspector {...p} register={{ ...scaled, id: 31, holdValue: 0, scale: null, scaleOffset: null }} />);
+    fireEvent.click(screen.getByRole("tab", { name: /source/i }));
+    fireEvent.change(screen.getByLabelText(/initial value/i), { target: { value: "23.5" } });
+    fireEvent.click(screen.getByRole("tab", { name: /general/i }));
+    fireEvent.change(screen.getByLabelText("Scale"), { target: { value: "0.1" } });
+    fireEvent.click(screen.getByRole("tab", { name: /source/i }));
+    expect((screen.getByLabelText(/initial value/i) as HTMLInputElement).value).toBe("23.5");
+    expect(screen.getByText("raw 235")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("tab", { name: /general/i }));
+    fireEvent.change(screen.getByLabelText("Offset"), { target: { value: "-40" } });
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+    const saved = p.onSave.mock.calls[0][0];
+    expect(saved).toMatchObject({ scale: 0.1, scaleOffset: -40, holdValue: 635 });
+    expect(Number.isInteger(saved.holdValue)).toBe(true);
+  });
+
+  it("shows the stored hold value after a successful save and keeps the typed one after a failed save", async () => {
+    const ok = vi.fn().mockResolvedValue(true);
+    const { unmount } = render(<RegisterInspector {...base()} onSave={ok} register={{ ...scaled, id: 32 }} />);
+    fireEvent.click(screen.getByRole("tab", { name: /source/i }));
+    const initial = () => screen.getByLabelText(/initial value/i) as HTMLInputElement;
+    fireEvent.change(initial(), { target: { value: "23.56" } });
+    expect(initial().value).toBe("23.56");
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+    expect(ok.mock.calls[0][0].holdValue).toBe(236);
+    await waitFor(() => expect(initial().value).toBe("23.6"));
+    unmount();
+    const fail = vi.fn().mockResolvedValue(false);
+    render(<RegisterInspector {...base()} onSave={fail} register={{ ...scaled, id: 33 }} />);
+    fireEvent.click(screen.getByRole("tab", { name: /source/i }));
+    fireEvent.change(initial(), { target: { value: "23.56" } });
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+    await waitFor(() => expect(fail).toHaveBeenCalled());
+    await Promise.resolve();
+    expect(initial().value).toBe("23.56");
   });
 
   it("labels generator and device Min/Max with the unit", () => {
