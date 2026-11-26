@@ -90,6 +90,17 @@ All notable changes to this project are tracked here following [Keep a Changelog
   bar to Settings → Display. It is app-wide, remembered, and used by the
   Analyzer and TCP Simulator. It only changes how addresses are written, never
   values.
+- **Virtual Device editor** — a larger two-pane editor: the register list on
+  the left, the selected register's settings on the right. New registers go to
+  the next free offset, overlaps are flagged as you type, fields that don't
+  apply (type and byte order for coils) are hidden, and the key is generated
+  from the name (under Advanced).
+- **TCP Simulator page** — registers are added and edited in the side panel
+  (the Add Register dialog is gone), with an unsaved-changes guard, Esc to
+  close, and a drawer on narrow windows. Tick interval sits next to Port and an
+  Uptime card replaces it; device cards show the device name, icon and real
+  address ranges; while stopped, the Value column shows each register's source
+  and Live Values offers Start.
 
 ## [0.5.0] - 2026-08-10
 ### Added
