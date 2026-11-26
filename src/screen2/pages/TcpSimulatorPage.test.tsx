@@ -83,6 +83,54 @@ describe("TcpSimulatorPage (tabbed shell)", () => {
     expect(wrapper.className).toMatch(/lg:sticky/);
     expect(wrapper.className).toMatch(/lg:top-0/);
   });
+
+  it("opens the inspector as a right-side drawer below lg, closable from the backdrop (S9)", async () => {
+    renderPage();
+    fireEvent.click(await screen.findByText("temp"));
+    const save = await screen.findByRole("button", { name: /^save$/i });
+    const wrapper = save.parentElement!.parentElement!.parentElement as HTMLElement;
+    expect(wrapper.className).toMatch(/fixed/);
+    expect(wrapper.className).toMatch(/inset-y-0/);
+    expect(wrapper.className).toMatch(/right-0/);
+    expect(wrapper.className).toMatch(/max-w-md/);
+    expect(wrapper.className).toMatch(/lg:static/);
+    fireEvent.click(screen.getByTestId("inspector-backdrop"));
+    await waitFor(() => expect(screen.queryByRole("button", { name: /^save$/i })).toBeNull());
+  });
+
+  it("highlights the selected row and closes the inspector on Escape (S5/S6)", async () => {
+    renderPage();
+    const row = (await screen.findByText("temp")).closest("tr") as HTMLElement;
+    expect(row).toHaveAttribute("aria-selected", "false");
+    fireEvent.click(row);
+    await screen.findByRole("button", { name: /^save$/i });
+    expect(row).toHaveAttribute("aria-selected", "true");
+    fireEvent.keyDown(document, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("button", { name: /^save$/i })).toBeNull());
+  });
+
+  it("asks before discarding unsaved inspector edits when selecting another row (S5)", async () => {
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "simulator_get_config") return Promise.resolve({ enabled: false, host: "0.0.0.0", port: 502, tickMs: 100 });
+      if (cmd === "simulator_list_registers") return Promise.resolve([reg, { ...reg, id: 2, address: 101, alias: "other" }]);
+      if (cmd === "simulator_list_devices") return Promise.resolve([device]);
+      if (cmd === "simulator_list_rules") return Promise.resolve([]);
+      if (cmd === "simulator_list_device_templates") return Promise.resolve([]);
+      if (cmd === "simulator_status") return Promise.resolve({ running: false, listen: null, clientCount: 0 });
+      return Promise.resolve(null);
+    });
+    renderPage();
+    fireEvent.click(await screen.findByText("temp"));
+    fireEvent.change(await screen.findByDisplayValue("temp"), { target: { value: "temp edited" } });
+    fireEvent.click(screen.getByText("other"));
+    const dialog = await screen.findByRole("dialog");
+    expect(dialog.textContent).toMatch(/Discard changes to temp\?/);
+    fireEvent.click(within(dialog).getByRole("button", { name: /keep editing/i }));
+    expect(screen.getByDisplayValue("temp edited")).toBeTruthy();
+    fireEvent.click(screen.getByText("other"));
+    fireEvent.click(within(await screen.findByRole("dialog")).getByRole("button", { name: /^discard$/i }));
+    expect(await screen.findByDisplayValue("other")).toBeTruthy();
+  });
 });
 
 describe("TcpSimulatorPage dialogs keep open on failed saves", () => {
@@ -104,30 +152,38 @@ describe("TcpSimulatorPage dialogs keep open on failed saves", () => {
     listenMock.mockResolvedValue(() => {});
   });
 
-  it("keeps the register dialog open and shows the error when the save fails", async () => {
+  it("keeps the new-register panel open and shows the error when the create fails", async () => {
     renderPage();
     fireEvent.click(await screen.findByRole("button", { name: /add register/i }));
-    const dialog = await screen.findByRole("dialog");
-    fireEvent.click(within(dialog).getByRole("button", { name: /^save$/i }));
-    const alert = await within(dialog).findByRole("alert");
+    expect(await screen.findByText("New register")).toBeTruthy();
+    fireEvent.change(screen.getByLabelText("Alias") as HTMLInputElement, { target: { value: "My reg" } });
+    fireEvent.change(screen.getByLabelText("Address"), { target: { value: "7" } });
+    fireEvent.click(screen.getByRole("button", { name: /^create$/i }));
+    const alert = await screen.findByRole("alert");
     expect(alert.textContent).toMatch(/already exists/i);
-    expect(screen.getByRole("dialog")).toBeTruthy();
+    expect(screen.getByText("New register")).toBeTruthy();
+    expect((screen.getByLabelText("Alias") as HTMLInputElement).value).toBe("My reg");
+    expect((screen.getByLabelText("Address") as HTMLInputElement).value).toBe("7");
   });
 
-  it("closes the register dialog when the save succeeds", async () => {
-    invokeMock.mockImplementation((cmd: string) => {
+  it("switches the panel to editing the new register after a successful create", async () => {
+    let registers = [reg];
+    invokeMock.mockImplementation((cmd: string, args?: any) => {
       if (cmd === "simulator_get_config") return Promise.resolve({ enabled: false, host: "0.0.0.0", port: 502, tickMs: 100 });
-      if (cmd === "simulator_list_registers") return Promise.resolve([reg]);
+      if (cmd === "simulator_list_registers") return Promise.resolve(registers);
       if (cmd === "simulator_list_devices") return Promise.resolve([device]);
       if (cmd === "simulator_list_rules") return Promise.resolve([]);
       if (cmd === "simulator_status") return Promise.resolve({ running: false, listen: null, clientCount: 0 });
+      if (cmd === "simulator_add_register") { registers = [...registers, { ...args.register, id: 9 }]; return Promise.resolve(9); }
       return Promise.resolve(null);
     });
     renderPage();
     fireEvent.click(await screen.findByRole("button", { name: /add register/i }));
-    const dialog = await screen.findByRole("dialog");
-    fireEvent.click(within(dialog).getByRole("button", { name: /^save$/i }));
-    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    fireEvent.change(await screen.findByLabelText("Alias"), { target: { value: "Fresh" } });
+    fireEvent.click(screen.getByRole("button", { name: /^create$/i }));
+    expect(await screen.findByRole("button", { name: /^save$/i })).toBeTruthy();
+    expect(screen.queryByText("New register")).toBeNull();
+    expect(screen.getByDisplayValue("Fresh")).toBeTruthy();
   });
 
   it("keeps the rule dialog open and shows the error when the save fails", async () => {

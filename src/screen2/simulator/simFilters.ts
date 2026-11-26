@@ -1,4 +1,4 @@
-import type { SimRegister } from "../components/SimRegisterModal";
+import type { SimRegister } from "./simRegister";
 
 export type PageRegister = SimRegister & { deviceInstanceId?: number | null };
 

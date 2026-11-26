@@ -1,8 +1,9 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import RegisterInspector from "./RegisterInspector";
 import type { PageRegister } from "./simFilters";
+import { blankRegister } from "./simRegister";
 import type { SimDevice } from "./useSimulatorData";
 
 const reg: PageRegister = {
@@ -145,7 +146,164 @@ describe("RegisterInspector", () => {
     const p = base();
     const gen = { ...reg, id: 9, valueSource: "generator", sourceParams: JSON.stringify({ kind: "sine", min: 0, max: 10 }) };
     render(<RegisterInspector {...p} register={gen} />);
+    fireEvent.change(screen.getByDisplayValue("Temperature"), { target: { value: "Gen" } });
     fireEvent.click(screen.getByRole("button", { name: /save/i }));
     expect(JSON.parse((p.onSave.mock.calls[0][0] as PageRegister).sourceParams).periodMs).toBe(1000);
+  });
+
+  describe("polish (S5)", () => {
+    it("shows the header address in Hex when the setting is hex", () => {
+      render(<RegisterInspector {...base()} addrFmt="hex" />);
+      expect(screen.getByText(/Unit 1 · Holding · 0x9C41/)).toBeInTheDocument();
+    });
+
+    it("removes the duplicated Value Source and Interval footer lines", () => {
+      render(<RegisterInspector {...base()} />);
+      expect(screen.queryByText(/^Value Source:/)).toBeNull();
+      expect(screen.queryByText(/^Interval:/)).toBeNull();
+      expect(screen.getByText("Temp Sensor A")).toBeInTheDocument();
+    });
+
+    it("closes on Escape", () => {
+      const p = base();
+      render(<RegisterInspector {...p} />);
+      fireEvent.keyDown(document, { key: "Escape" });
+      expect(p.onClose).toHaveBeenCalled();
+    });
+
+    it("does not close on Escape while a modal dialog is open", () => {
+      const p = base();
+      render(<><RegisterInspector {...p} /><div role="dialog" aria-modal="true" /></>);
+      fireEvent.keyDown(document, { key: "Escape" });
+      expect(p.onClose).not.toHaveBeenCalled();
+    });
+
+    it("disables Save until something changes, then flags unsaved changes", () => {
+      const p = base();
+      render(<RegisterInspector {...p} />);
+      const save = screen.getByRole("button", { name: /^save$/i });
+      expect(save).toBeDisabled();
+      expect(screen.queryByText(/unsaved changes/i)).toBeNull();
+      fireEvent.change(screen.getByLabelText(/^unit$/i), { target: { value: "K" } });
+      expect(save).not.toBeDisabled();
+      expect(screen.getByText(/unsaved changes/i)).toBeInTheDocument();
+      fireEvent.change(screen.getByLabelText(/^unit$/i), { target: { value: "°C" } });
+      expect(save).toBeDisabled();
+    });
+
+    it("reports dirty state to the page", () => {
+      const onDirtyChange = vi.fn();
+      render(<RegisterInspector {...base()} onDirtyChange={onDirtyChange} />);
+      expect(onDirtyChange).toHaveBeenLastCalledWith(false);
+      fireEvent.change(screen.getByLabelText(/^unit$/i), { target: { value: "K" } });
+      expect(onDirtyChange).toHaveBeenLastCalledWith(true);
+    });
+
+    it("treats a source-param edit as unsaved", () => {
+      render(<RegisterInspector {...base()} />);
+      fireEvent.click(screen.getByRole("tab", { name: /source/i }));
+      fireEvent.change(screen.getByLabelText(/^min$/i), { target: { value: "5" } });
+      expect(screen.getByRole("button", { name: /^save$/i })).not.toBeDisabled();
+    });
+  });
+
+  describe("new register draft (S4)", () => {
+    const existing = [reg, { ...reg, id: 2, address: 5, dataType: "u16", alias: "Other", valueSource: "hold", sourceParams: "{}" }];
+    const draftProps = (extra: Record<string, unknown> = {}) => ({
+      ...base(),
+      register: blankRegister(existing),
+      registers: existing,
+      onCreate: vi.fn(() => true),
+      ...extra,
+    });
+
+    it("titles the panel New register, hides Duplicate/Delete and offers Create + Cancel", () => {
+      const p = draftProps();
+      render(<RegisterInspector {...p} />);
+      expect(screen.getByText("New register")).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: /duplicate/i })).toBeNull();
+      expect(screen.queryByRole("button", { name: /^delete$/i })).toBeNull();
+      expect(screen.queryByRole("button", { name: /^save$/i })).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: /^cancel$/i }));
+      expect(p.onClose).toHaveBeenCalled();
+    });
+
+    it("creates a default holding register", () => {
+      const p = draftProps();
+      render(<RegisterInspector {...p} />);
+      fireEvent.click(screen.getByRole("button", { name: /^create$/i }));
+      expect(p.onCreate).toHaveBeenCalledWith(expect.objectContaining({ id: 0, unitId: 1, functionCode: 3, dataType: "u16", valueSource: "hold" }));
+    });
+
+    it("accepts a 0x address and shows the draft address in the current format", () => {
+      const p = draftProps({ addrFmt: "hex" });
+      render(<RegisterInspector {...p} />);
+      const addr = screen.getByLabelText("Address") as HTMLInputElement;
+      expect(addr.value).toMatch(/^0x[0-9A-F]{4}$/);
+      fireEvent.change(addr, { target: { value: "0x0200" } });
+      fireEvent.click(screen.getByRole("button", { name: /^create$/i }));
+      expect(p.onCreate).toHaveBeenCalledWith(expect.objectContaining({ address: 512 }));
+    });
+
+    it("blocks Create with an inline error when unit+type+address is taken", () => {
+      const p = draftProps();
+      render(<RegisterInspector {...p} />);
+      fireEvent.change(screen.getByLabelText("Address"), { target: { value: "5" } });
+      expect(screen.getByRole("alert").textContent).toMatch(/already used/i);
+      expect(screen.getByRole("button", { name: /^create$/i })).toBeDisabled();
+    });
+
+    it("treats a multi-word span as taken too", () => {
+      const p = draftProps();
+      render(<RegisterInspector {...p} />);
+      fireEvent.click(screen.getByRole("tab", { name: /source/i }));
+      fireEvent.change(screen.getByLabelText(/value source/i), { target: { value: "device" } });
+      fireEvent.click(screen.getByRole("tab", { name: /general/i }));
+      fireEvent.change(screen.getByLabelText("Data Type"), { target: { value: "f32" } });
+      fireEvent.change(screen.getByLabelText("Address"), { target: { value: "4" } });
+      expect(screen.getByRole("alert").textContent).toMatch(/already used/i);
+    });
+
+    it("rejects an invalid address", () => {
+      render(<RegisterInspector {...draftProps()} />);
+      fireEvent.change(screen.getByLabelText("Address"), { target: { value: "99999" } });
+      expect(screen.getByRole("alert").textContent).toMatch(/65535/);
+      expect(screen.getByRole("button", { name: /^create$/i })).toBeDisabled();
+    });
+
+    it("restricts a coil to hold and serialises a generator draft", () => {
+      const p = draftProps();
+      render(<RegisterInspector {...p} />);
+      fireEvent.change(screen.getByLabelText("Register type"), { target: { value: "1" } });
+      fireEvent.click(screen.getByRole("tab", { name: /source/i }));
+      expect(screen.getByRole("option", { name: /^generator$/i })).toBeDisabled();
+      fireEvent.click(screen.getByRole("tab", { name: /general/i }));
+      fireEvent.change(screen.getByLabelText("Register type"), { target: { value: "4" } });
+      fireEvent.click(screen.getByRole("tab", { name: /source/i }));
+      fireEvent.change(screen.getByLabelText(/value source/i), { target: { value: "generator" } });
+      fireEvent.change(screen.getByLabelText(/generator kind/i), { target: { value: "sine" } });
+      fireEvent.click(screen.getByRole("button", { name: /^create$/i }));
+      const arg = (p.onCreate as any).mock.calls[0][0];
+      expect(arg.functionCode).toBe(4);
+      expect(arg.valueSource).toBe("generator");
+      expect(JSON.parse(arg.sourceParams)).toMatchObject({ kind: "sine", periodMs: 1000 });
+    });
+
+    it("serialises a route draft", () => {
+      const p = draftProps();
+      render(<RegisterInspector {...p} />);
+      fireEvent.click(screen.getByRole("tab", { name: /source/i }));
+      fireEvent.change(screen.getByLabelText(/value source/i), { target: { value: "route" } });
+      fireEvent.change(screen.getByLabelText(/source slave unit/i), { target: { value: "7" } });
+      fireEvent.change(screen.getByLabelText(/source function/i), { target: { value: "4" } });
+      fireEvent.click(screen.getByRole("button", { name: /^create$/i }));
+      const sp = JSON.parse((p.onCreate as any).mock.calls[0][0].sourceParams);
+      expect(sp).toMatchObject({ slaveUnitId: 7, functionCode: 4, connectionKind: "tcp" });
+    });
+
+    it("shows a save error inside the panel and keeps the entered values", () => {
+      render(<RegisterInspector {...draftProps({ error: "Backend said no" })} />);
+      expect(within(screen.getByRole("alert")).getByText("Backend said no")).toBeInTheDocument();
+    });
   });
 });

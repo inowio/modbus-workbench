@@ -3,7 +3,7 @@ import { listen as tauriListen, type UnlistenFn } from "@tauri-apps/api/event";
 import { useCallback, useEffect, useState } from "react";
 
 import type { DeviceTemplate } from "../components/AddDeviceModal";
-import type { SimRegister } from "../components/SimRegisterModal";
+import type { SimRegister } from "./simRegister";
 import type { SimRule } from "../components/SimRuleModal";
 
 export type SimConfig = { enabled: boolean; host: string; port: number; tickMs: number };

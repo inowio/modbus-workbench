@@ -1,7 +1,6 @@
 import { bankName, fmtAddr, type AddrFmt } from "./ruleTargets";
 
-// Shared source-param helpers for the register editors (RegisterInspector and
-// SimRegisterModal), so both serialise device/generator params the same way.
+// Shared source-param helpers for the register editor (RegisterInspector).
 
 export type SourceParams = {
   kind?: string;

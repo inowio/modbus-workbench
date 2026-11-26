@@ -1,6 +1,8 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
+import { fmtAddr, type AddrFmt } from "./ruleTargets";
 import { rwLabel, type PageRegister } from "./simFilters";
+import { addressConflict, parseAddressInput } from "./simRegister";
 import { buildPeriodicParams, initialPeriodText, parseSourceParams, periodPlaceholder } from "./sourceParams";
 import type { SimDevice } from "./useSimulatorData";
 
@@ -21,8 +23,53 @@ type SubTab = "general" | "source" | "advanced";
 const INPUT_CLASS = "rounded-lg border border-slate-300 bg-white px-2 py-1 dark:border-slate-700 dark:bg-slate-900";
 const LABEL_CLASS = "flex flex-col gap-1 text-xs";
 
+type SourceState = {
+  kind: string; preset: string; min: number; max: number; periodText: string;
+  sourceUnitId: number; sourceConnectionKind: string; sourceFunctionCode: number;
+  sourceAddress: number; sourceScale: number; sourceOffset: number; sourceByteOrder: string;
+};
+
+function seedSource(register: PageRegister): SourceState {
+  const params = parseSourceParams(register.sourceParams);
+  return {
+    kind: params.kind ?? GENERATOR_KINDS[0],
+    preset: params.preset ?? DEVICE_PRESETS[0],
+    min: params.min ?? 0,
+    max: params.max ?? 100,
+    periodText: initialPeriodText(register.valueSource, params),
+    sourceUnitId: params.slaveUnitId ?? 1,
+    sourceConnectionKind: params.connectionKind ?? "tcp",
+    sourceFunctionCode: params.functionCode ?? 3,
+    sourceAddress: params.address ?? 1,
+    sourceScale: params.scale ?? 1,
+    sourceOffset: params.offset ?? 0,
+    // Empty string ⇒ "same as this register's byte order" (verbatim mirror).
+    sourceByteOrder: params.srcByteOrder ?? "",
+  };
+}
+
+/** True when two register records differ in any field other than sourceParams (null/""/undefined count as equal). */
+function registerFieldsDiffer(a: PageRegister, b: PageRegister): boolean {
+  const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
+  keys.delete("sourceParams");
+  for (const k of keys) {
+    const x = (a as Record<string, unknown>)[k] ?? "";
+    const y = (b as Record<string, unknown>)[k] ?? "";
+    if (x !== y) return true;
+  }
+  return false;
+}
+
 export type RegisterInspectorProps = {
+  /** A saved register, or a blank draft (id 0) for the "New register" panel. */
   register: PageRegister | null;
+  addrFmt?: AddrFmt;
+  /** All registers, used to flag an address that is already taken when creating. */
+  registers?: PageRegister[];
+  /** Save error to show inside the panel for a new draft (it stays open on failure). */
+  error?: string | null;
+  onCreate?: (reg: PageRegister) => void | boolean | Promise<void | boolean>;
+  onDirtyChange?: (dirty: boolean) => void;
   devices: SimDevice[];
   history: number[];
   liveValue: string;
@@ -57,12 +104,12 @@ function Sparkline({ history }: { history: number[] }) {
 }
 
 export default function RegisterInspector(props: RegisterInspectorProps) {
-  const { register, devices, history, liveValue, sourceStatus, running, onSave, onDuplicate, onDelete, onClose, onViewDevice } = props;
+  const { register, devices, history, liveValue, sourceStatus, running, onSave, onDuplicate, onDelete, onClose, onViewDevice, addrFmt = "dec", registers = [], error, onCreate, onDirtyChange } = props;
 
   const [tab, setTab] = useState<SubTab>("general");
   const [reg, setReg] = useState<PageRegister | null>(register);
 
-  // Source-param editor state (mirrors SimRegisterModal's per-source fields).
+  // Source-param editor state (per-source fields).
   const [kind, setKind] = useState(GENERATOR_KINDS[0]);
   const [preset, setPreset] = useState(DEVICE_PRESETS[0]);
   const [min, setMin] = useState(0);
@@ -75,6 +122,7 @@ export default function RegisterInspector(props: RegisterInspectorProps) {
   const [sourceScale, setSourceScale] = useState(1);
   const [sourceOffset, setSourceOffset] = useState(0);
   const [sourceByteOrder, setSourceByteOrder] = useState("");
+  const [addrText, setAddrText] = useState(() => (register ? fmtAddr(register.address, addrFmt) : ""));
 
   useEffect(() => {
     if (!register) {
@@ -83,29 +131,69 @@ export default function RegisterInspector(props: RegisterInspectorProps) {
     }
     setReg(register);
     setTab("general");
-    const params = parseSourceParams(register.sourceParams);
-    setKind(params.kind ?? GENERATOR_KINDS[0]);
-    setPreset(params.preset ?? DEVICE_PRESETS[0]);
-    setMin(params.min ?? 0);
-    setMax(params.max ?? 100);
-    setPeriodText(initialPeriodText(register.valueSource, params));
-    setSourceUnitId(params.slaveUnitId ?? 1);
-    setSourceConnectionKind(params.connectionKind ?? "tcp");
-    setSourceFunctionCode(params.functionCode ?? 3);
-    setSourceAddress(params.address ?? 1);
-    setSourceScale(params.scale ?? 1);
-    setSourceOffset(params.offset ?? 0);
-    // Empty string ⇒ "same as this register's byte order" (verbatim mirror).
-    setSourceByteOrder(params.srcByteOrder ?? "");
+    const seed = seedSource(register);
+    setKind(seed.kind);
+    setPreset(seed.preset);
+    setMin(seed.min);
+    setMax(seed.max);
+    setPeriodText(seed.periodText);
+    setSourceUnitId(seed.sourceUnitId);
+    setSourceConnectionKind(seed.sourceConnectionKind);
+    setSourceFunctionCode(seed.sourceFunctionCode);
+    setSourceAddress(seed.sourceAddress);
+    setSourceScale(seed.sourceScale);
+    setSourceOffset(seed.sourceOffset);
+    setSourceByteOrder(seed.sourceByteOrder);
+    setAddrText(fmtAddr(register.address, addrFmt));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [register?.id]);
 
+  const srcNow: SourceState = {
+    kind, preset, min, max, periodText, sourceUnitId, sourceConnectionKind,
+    sourceFunctionCode, sourceAddress, sourceScale, sourceOffset, sourceByteOrder,
+  };
+  const dirty =
+    !!register && !!reg && reg.id === register.id &&
+    (registerFieldsDiffer(reg, register) || JSON.stringify(srcNow) !== JSON.stringify(seedSource(register)));
+
+  // Tell the page whether there is anything to lose (and clear it on unmount).
+  const onDirtyRef = useRef(onDirtyChange);
+  onDirtyRef.current = onDirtyChange;
+  useEffect(() => {
+    onDirtyRef.current?.(dirty);
+    return () => onDirtyRef.current?.(false);
+  }, [dirty]);
+
+  // Esc closes the panel, unless a modal dialog (e.g. a confirm) is open on top.
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+  const open = !!register;
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape" || e.defaultPrevented) return;
+      if (document.querySelector('[role="dialog"][aria-modal="true"]')) return;
+      onCloseRef.current();
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [open]);
+
   if (!register || !reg) return null;
+
+  const isNew = reg.id === 0;
+  const parsedAddr = isNew ? parseAddressInput(addrText) : reg.address;
+  const addrError = isNew && parsedAddr === null ? "Enter an address from 0 to 65535 (decimal or 0x hex)." : null;
+  const conflict =
+    isNew && parsedAddr !== null
+      ? addressConflict(registers, reg.unitId, reg.functionCode, parsedAddr, reg.dataType, addrFmt)
+      : null;
+  const blocked = addrError !== null || conflict !== null;
 
   const set = (patch: Partial<PageRegister>) => setReg((r) => (r ? { ...r, ...patch } : r));
   const device = devices.find((d) => d.id === reg.deviceInstanceId);
 
-  // Mirror SimRegisterModal's constraints so the inspector can't produce a
+  // Mirror the backend's constraints so the inspector can't produce a
   // dataType/byteOrder/valueSource combo the backend rejects. Bit banks are
   // bool-only; hold registers only support u16/i16; single-word types must
   // carry ABCD byte order.
@@ -132,8 +220,15 @@ export default function RegisterInspector(props: RegisterInspectorProps) {
     }
   };
 
-  const handleSave = () => {
-    const sourceParams = JSON.stringify(
+  const handleFunctionCodeChange = (functionCode: number) => {
+    const bit = functionCode === 1 || functionCode === 2;
+    const patch: Partial<PageRegister> = { functionCode, dataType: bit ? "bool" : "u16", byteOrder: "ABCD" };
+    if (bit && reg.valueSource !== "hold") patch.valueSource = "hold";
+    set(patch);
+  };
+
+  const buildSourceParams = () =>
+    JSON.stringify(
       reg.valueSource === "generator" || reg.valueSource === "device"
         ? buildPeriodicParams(reg.valueSource, { kind, preset, min, max, periodText })
         : reg.valueSource === "route"
@@ -150,21 +245,36 @@ export default function RegisterInspector(props: RegisterInspectorProps) {
           }
         : {}
     );
+
+  const handleSave = () => {
+    const sourceParams = buildSourceParams();
     onSave({ ...reg, sourceParams });
   };
 
+  const handleCreate = () => {
+    if (blocked || parsedAddr === null) return;
+    void onCreate?.({ ...reg, address: parsedAddr, sourceParams: buildSourceParams() });
+  };
+
   return (
-    <div className="flex max-h-[calc(100vh-11rem)] min-h-0 flex-col rounded-2xl border border-slate-200 bg-white dark:border-slate-800 dark:bg-white/5">
+    <div className="flex max-h-screen min-h-0 flex-1 flex-col rounded-2xl lg:max-h-[calc(100vh-11rem)] border border-slate-200 bg-white dark:border-slate-800 dark:bg-white/5">
       {/* Header */}
       <div className="border-b border-slate-100 p-4 dark:border-slate-800">
         <div className="flex items-start justify-between gap-2">
           <div className="min-w-0">
             <div className="flex items-center gap-2">
-              <span className="truncate font-bold text-slate-900 dark:text-slate-100">{reg.alias}</span>
+              <span className="truncate font-bold text-slate-900 dark:text-slate-100">{isNew ? "New register" : reg.alias}</span>
+              {dirty && !isNew ? (
+                <span className="shrink-0 rounded-full bg-amber-500/15 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-amber-800 dark:text-amber-200">
+                  Unsaved changes
+                </span>
+              ) : null}
             </div>
-            <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
-              Unit {reg.unitId} · {FC_LABEL[reg.functionCode] ?? reg.functionCode} · {reg.address}
-            </p>
+            {isNew ? null : (
+              <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+                Unit {reg.unitId} · {FC_LABEL[reg.functionCode] ?? reg.functionCode} · {fmtAddr(reg.address, addrFmt)}
+              </p>
+            )}
           </div>
           <button
             type="button"
@@ -202,6 +312,51 @@ export default function RegisterInspector(props: RegisterInspectorProps) {
       <div className="min-h-0 flex-1 space-y-4 overflow-y-auto p-4">
         {tab === "general" && (
           <div className="grid grid-cols-2 gap-3">
+            {isNew && (
+              <>
+                <label className={LABEL_CLASS}>
+                  Unit ID
+                  <input
+                    aria-label="Unit ID"
+                    type="number"
+                    min={0}
+                    max={255}
+                    value={reg.unitId}
+                    onChange={(e) => set({ unitId: Number(e.target.value) })}
+                    className={INPUT_CLASS}
+                  />
+                </label>
+                <label className={LABEL_CLASS}>
+                  Register type
+                  <select
+                    aria-label="Register type"
+                    value={reg.functionCode}
+                    onChange={(e) => handleFunctionCodeChange(Number(e.target.value))}
+                    className={INPUT_CLASS}
+                  >
+                    <option value={1}>Coil (0x01)</option>
+                    <option value={2}>Discrete input (0x02)</option>
+                    <option value={3}>Holding (0x03)</option>
+                    <option value={4}>Input (0x04)</option>
+                  </select>
+                </label>
+                <label className={`col-span-2 ${LABEL_CLASS}`}>
+                  Address
+                  <input
+                    aria-label="Address"
+                    type="text"
+                    value={addrText}
+                    aria-invalid={blocked ? "true" : undefined}
+                    onChange={(e) => {
+                      setAddrText(e.target.value);
+                      const n = parseAddressInput(e.target.value);
+                      if (n !== null) set({ address: n });
+                    }}
+                    className={`${INPUT_CLASS} ${blocked ? "border-rose-500 dark:border-rose-500" : ""}`}
+                  />
+                </label>
+              </>
+            )}
             <label className={`col-span-2 ${LABEL_CLASS}`}>
               Alias
               <input value={reg.alias} onChange={(e) => set({ alias: e.target.value })} className={INPUT_CLASS} />
@@ -252,9 +407,9 @@ export default function RegisterInspector(props: RegisterInspectorProps) {
               Value source
               <select aria-label="Value source" value={reg.valueSource} onChange={(e) => handleValueSourceChange(e.target.value)} className={INPUT_CLASS}>
                 <option value="hold">Hold</option>
-                <option value="device">Device</option>
-                <option value="generator">Generator</option>
-                <option value="route">Route</option>
+                <option value="device" disabled={isBit}>Device</option>
+                <option value="generator" disabled={isBit}>Generator</option>
+                <option value="route" disabled={isBit}>Route</option>
               </select>
             </label>
 
@@ -426,8 +581,16 @@ export default function RegisterInspector(props: RegisterInspectorProps) {
           </div>
         )}
 
+        {blocked || error ? (
+          <div role="alert" className="space-y-1 rounded-lg border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-xs text-rose-800 dark:text-rose-200">
+            {addrError ? <p>{addrError}</p> : null}
+            {conflict ? <p>{conflict}</p> : null}
+            {error ? <p>{error}</p> : null}
+          </div>
+        ) : null}
+
         {/* Live Value card */}
-        <div className="rounded-2xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-white/5">
+        {isNew ? null : <div className="rounded-2xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-white/5">
           <div className="mb-2 flex items-center justify-between">
             <span className="text-xs font-semibold text-slate-500 dark:text-slate-400">Live Value</span>
             {sourceStatus ? (
@@ -440,51 +603,74 @@ export default function RegisterInspector(props: RegisterInspectorProps) {
             <span className="font-mono text-2xl font-bold text-slate-900 dark:text-slate-100">{running ? liveValue : "—"}</span>
             <Sparkline history={history} />
           </div>
-        </div>
+        </div>}
       </div>
 
       {/* Footer */}
-      <div className="space-y-2 border-t border-slate-100 p-4 text-xs text-slate-500 dark:border-slate-800 dark:text-slate-400">
-        <div className="flex items-center justify-between">
-          <span>
-            Device: <span className="font-semibold text-slate-700 dark:text-slate-200">{device ? device.name : "—"}</span>
-          </span>
-          {device ? (
-            <button
-              type="button"
-              onClick={() => onViewDevice(device.id)}
-              className="rounded-full border border-slate-300 px-2 py-1 text-xs font-semibold text-slate-700 dark:border-slate-700 dark:text-slate-200"
-            >
-              View Device
-            </button>
-          ) : null}
+      {isNew ? null : (
+        <div className="space-y-2 border-t border-slate-100 p-4 text-xs text-slate-500 dark:border-slate-800 dark:text-slate-400">
+          <div className="flex items-center justify-between">
+            <span>
+              Device: <span className="font-semibold text-slate-700 dark:text-slate-200">{device ? device.name : "—"}</span>
+            </span>
+            {device ? (
+              <button
+                type="button"
+                onClick={() => onViewDevice(device.id)}
+                className="rounded-full border border-slate-300 px-2 py-1 text-xs font-semibold text-slate-700 dark:border-slate-700 dark:text-slate-200"
+              >
+                View Device
+              </button>
+            ) : null}
+          </div>
         </div>
-        <div>Value Source: {reg.valueSource}</div>
-        <div>Interval: {reg.intervalMs} ms</div>
-      </div>
+      )}
 
       <div className="flex shrink-0 justify-end gap-2 border-t border-slate-100 p-4 dark:border-slate-800">
-        <button
-          type="button"
-          onClick={() => onDuplicate(reg)}
-          className="rounded-full border border-slate-300 bg-slate-100 px-4 py-2 text-sm font-semibold text-slate-700 dark:border-slate-700 dark:bg-white/5 dark:text-slate-100"
-        >
-          Duplicate
-        </button>
-        <button
-          type="button"
-          onClick={() => onDelete(reg.id)}
-          className="rounded-full border border-rose-500/60 bg-rose-500/10 px-4 py-2 text-sm font-semibold text-rose-700 dark:text-rose-200"
-        >
-          Delete
-        </button>
-        <button
-          type="button"
-          onClick={handleSave}
-          className="rounded-full border border-emerald-600/60 bg-emerald-500/10 px-4 py-2 text-sm font-semibold text-emerald-800 dark:border-emerald-500/60 dark:text-emerald-200"
-        >
-          Save
-        </button>
+        {isNew ? (
+          <>
+            <button
+              type="button"
+              onClick={onClose}
+              className="rounded-full border border-slate-300 bg-slate-100 px-4 py-2 text-sm font-semibold text-slate-700 dark:border-slate-700 dark:bg-white/5 dark:text-slate-100"
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              disabled={blocked}
+              onClick={handleCreate}
+              className="rounded-full border border-emerald-600/60 bg-emerald-500/10 px-4 py-2 text-sm font-semibold text-emerald-800 disabled:cursor-not-allowed disabled:opacity-50 dark:border-emerald-500/60 dark:text-emerald-200"
+            >
+              Create
+            </button>
+          </>
+        ) : (
+          <>
+            <button
+              type="button"
+              onClick={() => onDuplicate(reg)}
+              className="rounded-full border border-slate-300 bg-slate-100 px-4 py-2 text-sm font-semibold text-slate-700 dark:border-slate-700 dark:bg-white/5 dark:text-slate-100"
+            >
+              Duplicate
+            </button>
+            <button
+              type="button"
+              onClick={() => onDelete(reg.id)}
+              className="rounded-full border border-rose-500/60 bg-rose-500/10 px-4 py-2 text-sm font-semibold text-rose-700 dark:text-rose-200"
+            >
+              Delete
+            </button>
+            <button
+              type="button"
+              disabled={!dirty}
+              onClick={handleSave}
+              className="rounded-full border border-emerald-600/60 bg-emerald-500/10 px-4 py-2 text-sm font-semibold text-emerald-800 disabled:cursor-not-allowed disabled:opacity-50 dark:border-emerald-500/60 dark:text-emerald-200"
+            >
+              Save
+            </button>
+          </>
+        )}
       </div>
     </div>
   );
