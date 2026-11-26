@@ -1,7 +1,8 @@
 import { FiEdit2, FiTrash2 } from "react-icons/fi";
 
 import type { SimRule } from "../components/SimRuleModal";
-import type { SimDevice } from "./useSimulatorData";
+import { findTargetRegister, targetLabel, type AddrFmt } from "./ruleTargets";
+import type { PageRegister, SimDevice } from "./useSimulatorData";
 
 const BANK_LABEL: Record<number, string> = { 1: "coil", 2: "discrete", 3: "holding", 4: "input" };
 const bankLabel = (bank: number): string => BANK_LABEL[bank] ?? "reg";
@@ -71,6 +72,84 @@ export function actionsSummary(rule: SimRule): string {
     .join(" · ");
 }
 
+const OP_LABEL: Record<string, string> = { "==": "=", "!=": "≠", ">=": "≥", "<=": "≤" };
+
+type Piece = { text: string; missing: boolean };
+type Resolver = (unit: unknown, bank: unknown, address: unknown) => { label: string; missing: boolean };
+
+function makeResolver(registers: readonly PageRegister[] | undefined, fmt: AddrFmt): Resolver {
+  return (unit, bank, address) => {
+    const b = Number(bank);
+    const a = Number(address);
+    const reg = registers ? findTargetRegister(registers, Number(unit ?? 1), b, a) : undefined;
+    return { label: targetLabel(reg, b, a, fmt), missing: registers !== undefined && !reg };
+  };
+}
+
+function triggerPiece(rule: SimRule, resolve: Resolver): Piece {
+  try {
+    const t = JSON.parse(rule.trigger) as Record<string, unknown>;
+    switch (t.type) {
+      case "interval":
+        return { text: `Every ${t.ms} ms`, missing: false };
+      case "condition": {
+        const r = resolve(t.unit, t.bank, t.address);
+        const op = String(t.op);
+        const text = op === "changed" ? `${r.label} changed` : `${r.label} ${OP_LABEL[op] ?? op} ${t.value}`;
+        return { text, missing: r.missing };
+      }
+      case "onWrite": {
+        const r = resolve(t.unit, t.bank, t.address);
+        return { text: `On write to ${r.label}`, missing: r.missing };
+      }
+      default:
+        return { text: String(t.type ?? "unknown trigger"), missing: false };
+    }
+  } catch {
+    return { text: "invalid trigger", missing: false };
+  }
+}
+
+function actionPieces(rule: SimRule, resolve: Resolver): Piece[] {
+  let rows: Record<string, unknown>[];
+  try {
+    const parsed = JSON.parse(rule.actions);
+    if (!Array.isArray(parsed)) return [];
+    rows = parsed;
+  } catch {
+    return [];
+  }
+  return rows.map((a) => {
+    const dst = resolve(a.unit, a.bank, a.address);
+    switch (a.type) {
+      case "set":
+        return { text: `Set ${dst.label} = ${a.value}`, missing: dst.missing };
+      case "inc":
+        return { text: `Increment ${dst.label} by ${a.by}`, missing: dst.missing };
+      case "dec":
+        return { text: `Decrement ${dst.label} by ${a.by}`, missing: dst.missing };
+      case "toggle":
+        return { text: `Toggle ${dst.label}`, missing: dst.missing };
+      case "copy": {
+        const src = resolve(a.srcUnit, a.srcBank, a.srcAddr);
+        return { text: `Copy ${src.label} → ${dst.label}`, missing: dst.missing || src.missing };
+      }
+      case "randomize":
+        return { text: `Randomize ${dst.label} ${a.min}..${a.max}`, missing: dst.missing };
+      default:
+        return { text: String(a.type ?? "unknown action"), missing: false };
+    }
+  });
+}
+
+function PieceView({ piece }: { piece: Piece }) {
+  return piece.missing ? (
+    <span title="No such register" className="text-amber-700 dark:text-amber-300">{piece.text}</span>
+  ) : (
+    <span>{piece.text}</span>
+  );
+}
+
 /** Best-effort scope resolution: does the trigger target a unit that maps to a known device? */
 function ruleScope(rule: SimRule, devices: SimDevice[]): string {
   try {
@@ -87,12 +166,16 @@ function ruleScope(rule: SimRule, devices: SimDevice[]): string {
 export default function RulesTab(props: {
   rules: SimRule[];
   devices: SimDevice[];
+  /** Workspace registers: lets the table show aliases and flag missing targets. */
+  registers?: readonly PageRegister[];
+  addrFmt?: AddrFmt;
   onAdd: () => void;
   onEdit: (rule: SimRule) => void;
   onToggle: (rule: SimRule, enabled: boolean) => void;
   onDelete: (id: number) => void;
 }) {
-  const { rules, devices, onAdd, onEdit, onToggle, onDelete } = props;
+  const { rules, devices, registers, onAdd, onEdit, onToggle, onDelete } = props;
+  const resolve = makeResolver(registers, props.addrFmt ?? "dec");
 
   return (
     <div className="rounded-2xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-white/5">
@@ -107,7 +190,7 @@ export default function RulesTab(props: {
         </button>
       </div>
 
-      <p className="mb-2 text-xs text-slate-500 dark:text-slate-400">Rules apply on next Start.</p>
+      <p className="mb-2 text-xs text-slate-500 dark:text-slate-400">Rule changes apply immediately, even while the simulator is running.</p>
 
       {rules.length === 0 ? (
         <p className="text-sm text-slate-600 dark:text-slate-300">No rules yet. Click "Add Rule".</p>
@@ -119,7 +202,7 @@ export default function RulesTab(props: {
               <th>Scope</th>
               <th>Trigger</th>
               <th>Actions</th>
-              <th>Status</th>
+              <th>Enabled</th>
               <th></th>
             </tr>
           </thead>
@@ -128,12 +211,20 @@ export default function RulesTab(props: {
               <tr key={rule.id} className="border-t border-slate-100 dark:border-slate-800">
                 <td className="py-1 truncate">{rule.name}</td>
                 <td className="truncate text-xs">{ruleScope(rule, devices)}</td>
-                <td className="font-mono text-xs">{ruleSummary(rule)}</td>
-                <td className="truncate font-mono text-xs">{actionsSummary(rule)}</td>
+                <td className="font-mono text-xs"><PieceView piece={triggerPiece(rule, resolve)} /></td>
+                <td className="truncate font-mono text-xs">
+                  {(() => {
+                    const pieces = actionPieces(rule, resolve);
+                    if (pieces.length === 0) return "—";
+                    return pieces.map((p, i) => (
+                      <span key={i}>{i > 0 ? " · " : null}<PieceView piece={p} /></span>
+                    ));
+                  })()}
+                </td>
                 <td>
                   <input
                     type="checkbox"
-                    aria-label={rule.name}
+                    aria-label={rule.name.trim() ? `Enable ${rule.name.trim()}` : `Enable rule #${rule.id}`}
                     checked={rule.enabled}
                     onChange={(e) => onToggle(rule, e.target.checked)}
                   />

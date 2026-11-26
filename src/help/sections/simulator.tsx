@@ -167,7 +167,7 @@ const simulatorSection: HelpSectionDefinition = {
         </p>
         <ul className="list-disc space-y-1 pl-5">
           <li>The server starts asynchronously; the status updates within a moment.</li>
-          <li>You can add, edit, and remove registers, devices, and rules while running—most changes apply immediately; changing the port/Expose, or a register's source/type wiring, applies on the next Start (the table notes this).</li>
+          <li>You can add, edit, and remove registers, devices, and rules while running—edits apply immediately. The port, Expose, and Tick Interval are locked while running; changes apply on the next Start.</li>
           <li>Existing client connections are dropped on Stop.</li>
         </ul>
       </SectionBlock>

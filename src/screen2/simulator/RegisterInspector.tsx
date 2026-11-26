@@ -449,7 +449,7 @@ export default function RegisterInspector(props: RegisterInspectorProps) {
               />
             </label>
             <p className="text-xs text-slate-500 dark:text-slate-400">
-              Device/Generator/Route edits apply on the next Start.
+              Edits apply immediately, even while running.
             </p>
           </div>
         )}

@@ -116,9 +116,53 @@ describe("RulesTab", () => {
     expect(onDelete).toHaveBeenCalledWith(1);
   });
 
-  it("shows the next-Start note and an empty state when there are no rules", () => {
+  it("states that rule edits apply immediately and shows an empty state when there are no rules", () => {
     render(<RulesTab rules={[]} devices={[]} onAdd={vi.fn()} onEdit={vi.fn()} onToggle={vi.fn()} onDelete={vi.fn()} />);
-    expect(screen.getByText(/next start/i)).toBeInTheDocument();
+    expect(screen.queryByText(/next start/i)).toBeNull();
+    expect(screen.getByText(/apply immediately/i)).toBeInTheDocument();
     expect(screen.getByText(/no rules/i)).toBeInTheDocument();
+  });
+
+  describe("F6 readable summaries", () => {
+    const regs = [
+      { id: 1, unitId: 1, functionCode: 4, address: 1, alias: "Temperature", dataType: "u16" },
+      { id: 2, unitId: 1, functionCode: 1, address: 2, alias: "", dataType: "bool" },
+    ] as any[];
+    const r2 = {
+      id: 5, name: "Hot", enabled: true, sortOrder: 0,
+      trigger: JSON.stringify({ type: "condition", unit: 1, bank: 4, address: 1, op: ">=", value: 350 }),
+      actions: JSON.stringify([{ type: "set", unit: 1, bank: 1, address: 2, value: 1 }, { type: "set", unit: 1, bank: 1, address: 9, value: 1 }]),
+    };
+    const renderIt = (fmt: "dec" | "hex" = "dec") =>
+      render(<RulesTab rules={[r2 as any]} devices={[]} registers={regs} addrFmt={fmt} onAdd={vi.fn()} onEdit={vi.fn()} onToggle={vi.fn()} onDelete={vi.fn()} />);
+
+    it("shows the register alias and friendly operator", () => {
+      renderIt();
+      expect(screen.getByText("Temperature (input 1) ≥ 350")).toBeInTheDocument();
+    });
+
+    it("renders actions with the address and marks missing targets amber with a tooltip", () => {
+      renderIt();
+      expect(screen.getByText("Set coil 2 = 1")).toBeInTheDocument();
+      const missing = screen.getByText("Set coil 9 = 1");
+      expect(missing).toHaveAttribute("title", "No such register");
+      expect(missing.className).toMatch(/amber/);
+    });
+
+    it("honours the Hex address setting", () => {
+      renderIt("hex");
+      expect(screen.getByText("Temperature (input 0x0001) ≥ 350")).toBeInTheDocument();
+    });
+
+    it("names the Enabled column and labels the checkbox", () => {
+      renderIt();
+      expect(screen.getByRole("columnheader", { name: "Enabled" })).toBeInTheDocument();
+      expect(screen.getByRole("checkbox", { name: "Enable Hot" })).toBeInTheDocument();
+    });
+
+    it("falls back to the rule id for the checkbox label when the name is empty", () => {
+      render(<RulesTab rules={[{ ...r2, name: "" } as any]} devices={[]} onAdd={vi.fn()} onEdit={vi.fn()} onToggle={vi.fn()} onDelete={vi.fn()} />);
+      expect(screen.getByRole("checkbox", { name: "Enable rule #5" })).toBeInTheDocument();
+    });
   });
 });

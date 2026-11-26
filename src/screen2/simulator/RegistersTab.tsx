@@ -323,7 +323,7 @@ export default function RegistersTab(props: RegistersTabProps) {
       </div>
 
       <p className="text-xs text-slate-500 dark:text-slate-400">
-        Device/Generator registers begin updating after Start; changes apply on next Start.
+        Register edits apply immediately, even while running.
       </p>
 
       {registers.length === 0 ? (

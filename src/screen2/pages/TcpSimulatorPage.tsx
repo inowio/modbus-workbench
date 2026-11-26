@@ -220,6 +220,8 @@ export default function TcpSimulatorPage() {
             <RulesTab
               rules={sim.rules}
               devices={sim.devices}
+              registers={sim.registers}
+              addrFmt={addrFmt}
               onAdd={() => openDialog(() => { setModalRule(null); setRuleModalOpen(true); })}
               onEdit={(rule) => openDialog(() => { setModalRule(rule); setRuleModalOpen(true); })}
               onToggle={(rule, enabled) => void sim.updateRule({ ...rule, enabled })}
