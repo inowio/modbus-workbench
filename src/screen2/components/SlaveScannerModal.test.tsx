@@ -387,6 +387,89 @@ describe("SlaveScannerModal", () => {
     expect(cancelCalls()).toHaveLength(1);
   });
 
+  it("closing while start is pending cancels again once start resolves", async () => {
+    let resolveStart: (id: string) => void = () => {};
+    setup({ start: () => new Promise<string>((resolve) => (resolveStart = resolve)) });
+    renderModal();
+    await loaded();
+    fireEvent.click(screen.getByRole("button", { name: "Scan" }));
+    await waitFor(() => expect(startCalls()).toHaveLength(1));
+    const scanId = (startCalls()[0][1] as { request: ScanRequest }).request.scanId;
+
+    // The backend may not have registered the scan yet, so this cancel can be a no-op.
+    fireEvent.click(screen.getByRole("button", { name: "Close scanner" }));
+    expect(cancelCalls()).toHaveLength(1);
+
+    await act(async () => {
+      resolveStart(scanId);
+    });
+    expect(cancelCalls()).toEqual([
+      ["cancel_slave_scan", { name: WS, scanId }],
+      ["cancel_slave_scan", { name: WS, scanId }],
+    ]);
+  });
+
+  it("Cancel while start is pending cancels again once start resolves", async () => {
+    let resolveStart: (id: string) => void = () => {};
+    setup({ start: () => new Promise<string>((resolve) => (resolveStart = resolve)) });
+    renderModal();
+    await loaded();
+    fireEvent.click(screen.getByRole("button", { name: "Scan" }));
+    await waitFor(() => expect(startCalls()).toHaveLength(1));
+    const scanId = (startCalls()[0][1] as { request: ScanRequest }).request.scanId;
+
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(cancelCalls()).toHaveLength(1));
+
+    await act(async () => {
+      resolveStart(scanId);
+    });
+    expect(cancelCalls()).toEqual([
+      ["cancel_slave_scan", { name: WS, scanId }],
+      ["cancel_slave_scan", { name: WS, scanId }],
+    ]);
+  });
+
+  it("a scan that is neither cancelled nor closed sends no cancel", async () => {
+    let resolveStart: (id: string) => void = () => {};
+    setup({ start: () => new Promise<string>((resolve) => (resolveStart = resolve)) });
+    renderModal();
+    await loaded();
+    fireEvent.click(screen.getByRole("button", { name: "Scan" }));
+    await waitFor(() => expect(startCalls()).toHaveLength(1));
+    const scanId = (startCalls()[0][1] as { request: ScanRequest }).request.scanId;
+    await act(async () => {
+      resolveStart(scanId);
+    });
+    fire("slave_scan_done", { workspace: WS, scanId, reason: "completed", error: null, checked: 247, found: 0 });
+    expect(screen.getByText(/Scan complete/)).toBeInTheDocument();
+    expect(cancelCalls()).toHaveLength(0);
+  });
+
+  it("keeps a non-standard workspace baud in the sweep list, ticked and sorted", async () => {
+    setup({ settings: { ...SERIAL_SETTINGS, serialBaud: 230400 } });
+    renderModal();
+    await loaded();
+    await waitFor(() => expect(screen.getByRole("checkbox", { name: /COM3/ })).toBeChecked());
+    fireEvent.click(screen.getByRole("checkbox", { name: "Also try other baud rates & parity" }));
+
+    const baud230400 = screen.getByRole("checkbox", { name: "230400" });
+    expect(baud230400).toBeChecked();
+    expect(screen.getByRole("checkbox", { name: "9600" })).not.toBeChecked();
+    const order = screen
+      .getAllByRole("checkbox")
+      .map((c) => c.closest("label")?.textContent ?? "")
+      .filter((t) => /^\d+$/.test(t));
+    expect(order).toEqual(["1200", "2400", "4800", "9600", "19200", "38400", "57600", "115200", "230400"]);
+
+    fireEvent.click(screen.getByRole("checkbox", { name: "9600" }));
+    await startScan();
+    expect((startCalls()[0][1] as { request: ScanRequest }).request.sweep).toEqual({
+      bauds: [9600, 230400],
+      parities: ["none"],
+    });
+  });
+
   it("shows a start refusal inline and returns to the form", async () => {
     setup({ start: () => Promise.reject("A scan is already running in this workspace") });
     renderModal();

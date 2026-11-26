@@ -44,6 +44,13 @@ const checkCls = "h-4 w-4 accent-emerald-600";
 const pillCls =
   "inline-flex cursor-pointer items-center rounded-full px-3 py-1 text-xs font-semibold transition has-[:checked]:bg-emerald-500/15 has-[:checked]:text-emerald-800 has-[:focus-visible]:ring-2 has-[:focus-visible]:ring-emerald-500/40 dark:has-[:checked]:text-emerald-200";
 
+/** The sweep's baud choices: the standard list, plus the current baud in sorted position if it is not in it. */
+export function sweepBauds(baud: string): readonly number[] {
+  const b = Number(baud);
+  if (!Number.isInteger(b) || b <= 0 || SCAN_BAUDS.includes(b)) return SCAN_BAUDS;
+  return [...SCAN_BAUDS, b].sort((x, y) => x - y);
+}
+
 export function toParity(p: unknown): SerialParity {
   return p === "even" || p === "odd" ? p : "none";
 }
@@ -146,7 +153,7 @@ export function buildRequest(f: FormState, scanId: string): ScanRequest {
     },
     sweep: f.sweepOn
       ? {
-          bauds: SCAN_BAUDS.filter((b) => f.sweepBauds.includes(b)),
+          bauds: [...f.sweepBauds].sort((x, y) => x - y),
           parities: SCAN_PARITIES.filter((p) => f.sweepParities.includes(p)),
         }
       : null,
@@ -180,6 +187,8 @@ export default function SlaveScanForm({ form, setForm, portItems, disabled }: Sl
     const b = Number(form.baud);
     return BAUD_OPTIONS.includes(b) || !Number.isFinite(b) ? BAUD_OPTIONS : [...BAUD_OPTIONS, b].sort((x, y) => x - y);
   }, [form.baud]);
+
+  const sweepBaudOptions = useMemo(() => sweepBauds(form.baud), [form.baud]);
 
   const flowOptions = FLOW_OPTIONS.includes(form.flowControl) ? FLOW_OPTIONS : [...FLOW_OPTIONS, form.flowControl];
 
@@ -218,7 +227,7 @@ export default function SlaveScanForm({ form, setForm, portItems, disabled }: Sl
       ...prev,
       sweepOn: on,
       // Pre-tick the current baud and parity whenever the sweep is turned on.
-      sweepBauds: on ? SCAN_BAUDS.filter((b) => b === Number(prev.baud)) : prev.sweepBauds,
+      sweepBauds: on ? sweepBauds(prev.baud).filter((b) => b === Number(prev.baud)) : prev.sweepBauds,
       sweepParities: on ? [prev.parity] : prev.sweepParities,
     }));
   }
@@ -383,7 +392,7 @@ export default function SlaveScanForm({ form, setForm, portItems, disabled }: Sl
               <div className="ml-6 flex flex-col gap-2 rounded-xl border border-slate-200 bg-slate-50/70 p-3 dark:border-slate-800 dark:bg-slate-950/30">
                 <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
                   <span className={labelCls}>Baud rates</span>
-                  {SCAN_BAUDS.map((b) => (
+                  {sweepBaudOptions.map((b) => (
                     <label key={b} className="inline-flex items-center gap-1.5 text-sm">
                       <input
                         type="checkbox"

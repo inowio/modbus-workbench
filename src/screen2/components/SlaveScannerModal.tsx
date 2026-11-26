@@ -87,6 +87,8 @@ export default function SlaveScannerModal({ open, workspaceName, existingSlaves,
   const workspaceNameRef = useRef(workspaceName);
   workspaceNameRef.current = workspaceName;
   const listenersReadyRef = useRef<Promise<boolean> | null>(null);
+  /** The scan whose done event was seen most recently. */
+  const lastDoneScanIdRef = useRef<string | null>(null);
 
   function setPhase(next: Phase) {
     phaseRef.current = next;
@@ -165,6 +167,7 @@ export default function SlaveScannerModal({ open, workspaceName, existingSlaves,
       }),
       listen<ScanDoneEvent>(SLAVE_SCAN_EVENTS.done, ({ payload }) => {
         if (!accept(payload)) return;
+        lastDoneScanIdRef.current = payload.scanId;
         currentScanIdRef.current = null;
         phaseRef.current = "idle";
         setPhaseState("idle");
@@ -256,8 +259,17 @@ export default function SlaveScannerModal({ open, workspaceName, existingSlaves,
       return;
     }
 
+    const scanWorkspace = workspaceName;
     try {
-      await startSlaveScan(workspaceName, request);
+      await startSlaveScan(scanWorkspace, request);
+      // A close or Cancel that came before the backend registered the scan had nothing to cancel,
+      // so the scan would run on unseen. Cancel again now that it is registered (cancel is
+      // idempotent); not needed if its done event already arrived.
+      const abandoned =
+        currentScanIdRef.current !== request.scanId || (phaseRef.current as Phase) === "cancelling";
+      if (abandoned && lastDoneScanIdRef.current !== request.scanId) {
+        void cancelSlaveScan(scanWorkspace, request.scanId).catch(() => {});
+      }
     } catch (e) {
       if (currentScanIdRef.current === request.scanId) {
         currentScanIdRef.current = null;
