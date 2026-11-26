@@ -51,26 +51,31 @@ pub fn raw_from_eng(eng: f64, scale: f64, offset: f64, data_type: &str) -> f64 {
     }
 }
 
-/// Number of decimals to display: explicit (clamped 0..=6), else derived from
-/// the scale for integer types, 3 for float types.
-pub fn effective_decimals(decimals: Option<i64>, scale: f64, data_type: &str) -> u32 {
+/// Decimal places of the shortest round-trip representation of `|x|`.
+fn decimal_places(x: f64) -> usize {
+    let x = x.abs();
+    if !x.is_finite() {
+        return 0;
+    }
+    match format!("{}", x).split_once('.') {
+        Some((_, frac)) => frac.len(),
+        None => 0,
+    }
+}
+
+/// Number of decimals: explicit (clamped 0..=6), else for integer types the
+/// larger of the decimal places of |scale| and of the offset (max 6), and 6 for
+/// float types (display trims trailing zeros; this is the comparison precision).
+pub fn effective_decimals(decimals: Option<i64>, scale: f64, offset: f64, data_type: &str) -> u32 {
     if let Some(d) = decimals {
         return d.clamp(0, 6) as u32;
     }
     if !is_integer_type(data_type) {
-        return 3;
+        return 6;
     }
     let s = scale.abs();
-    if !s.is_finite() || s == 0.0 {
-        return 0;
-    }
-    // Shortest round-trip representation of |scale|.
-    let text = format!("{}", s);
-    let places = match text.split_once('.') {
-        Some((_, frac)) => frac.len(),
-        None => 0,
-    };
-    places.min(6) as u32
+    let places = if !s.is_finite() || s == 0.0 { 0 } else { decimal_places(s) };
+    places.max(decimal_places(offset)).min(6) as u32
 }
 
 pub fn round_to(value: f64, decimals: u32) -> f64 {
@@ -108,7 +113,7 @@ pub fn build_reg_meta(regs: &[SimRegister]) -> RegMetaMap {
                 byte_order: r.byte_order.clone(),
                 scale,
                 offset,
-                decimals: effective_decimals(r.decimals, scale, &r.data_type),
+                decimals: effective_decimals(r.decimals, scale, offset, &r.data_type),
             },
         );
     }
@@ -151,15 +156,21 @@ mod tests {
 
     #[test]
     fn effective_decimals_from_scale() {
-        assert_eq!(effective_decimals(None, 1.0, "u16"), 0);
-        assert_eq!(effective_decimals(None, 0.1, "u16"), 1);
-        assert_eq!(effective_decimals(None, 0.25, "i16"), 2);
-        assert_eq!(effective_decimals(None, 2.5, "u16"), 1);
-        assert_eq!(effective_decimals(None, 1.0, "f32"), 3);
-        assert_eq!(effective_decimals(Some(9), 1.0, "u16"), 6);
-        assert_eq!(effective_decimals(Some(2), 0.1, "u16"), 2);
-        assert_eq!(effective_decimals(None, -0.5, "u16"), 1);
-        assert_eq!(effective_decimals(None, 1e-9, "u16"), 6);
+        assert_eq!(effective_decimals(None, 1.0, 0.0, "u16"), 0);
+        assert_eq!(effective_decimals(None, 0.1, 0.0, "u16"), 1);
+        assert_eq!(effective_decimals(None, 0.25, 0.0, "i16"), 2);
+        assert_eq!(effective_decimals(None, 2.5, 0.0, "u16"), 1);
+        assert_eq!(effective_decimals(None, 1.0, 0.0, "f32"), 6);
+        assert_eq!(effective_decimals(None, 0.1, 0.0, "f64"), 6);
+        assert_eq!(effective_decimals(Some(9), 1.0, 0.0, "u16"), 6);
+        assert_eq!(effective_decimals(Some(2), 0.1, 0.0, "u16"), 2);
+        assert_eq!(effective_decimals(Some(2), 1.0, 0.0, "f32"), 2);
+        assert_eq!(effective_decimals(None, -0.5, 0.0, "u16"), 1);
+        assert_eq!(effective_decimals(None, 1e-9, 0.0, "u16"), 6);
+        // The offset counts too: scale 1, offset 0.25 needs 2 places.
+        assert_eq!(effective_decimals(None, 1.0, 0.25, "u16"), 2);
+        assert_eq!(effective_decimals(None, 0.1, -40.5, "i16"), 1);
+        assert_eq!(effective_decimals(None, 0.1, 0.125, "i16"), 3);
     }
 
     #[test]

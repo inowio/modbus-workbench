@@ -6359,7 +6359,7 @@ mod tests {
                 byte_order: "ABCD".into(),
                 scale,
                 offset: 0.0,
-                decimals: effective_decimals(None, scale, dt),
+                decimals: effective_decimals(None, scale, 0.0, dt),
             });
         }
         m

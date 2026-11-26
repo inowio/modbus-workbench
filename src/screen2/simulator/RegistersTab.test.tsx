@@ -188,6 +188,6 @@ describe("RegistersTab", () => {
         snapshotFor={(u, fc, a) => (a in words ? { unitId: u, functionCode: fc, address: a, valueWord: words[a], valueBit: null } : undefined)}
       />,
     );
-    expect(screen.getByText("35.500")).toBeInTheDocument();
+    expect(screen.getByText("35.5")).toBeInTheDocument();
   });
 });

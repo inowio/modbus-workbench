@@ -38,15 +38,20 @@ describe("rawFromEng", () => {
 
 describe("effectiveDecimals", () => {
   it("derives from scale for integers and 3 for floats", () => {
-    expect(effectiveDecimals(null, 1, "u16")).toBe(0);
-    expect(effectiveDecimals(undefined, 0.1, "u16")).toBe(1);
-    expect(effectiveDecimals(null, 0.25, "i16")).toBe(2);
-    expect(effectiveDecimals(null, 2.5, "u16")).toBe(1);
-    expect(effectiveDecimals(null, 1, "f32")).toBe(3);
-    expect(effectiveDecimals(9, 1, "u16")).toBe(6);
-    expect(effectiveDecimals(2, 0.1, "u16")).toBe(2);
-    expect(effectiveDecimals(null, -0.5, "u16")).toBe(1);
-    expect(effectiveDecimals(null, 1e-9, "u16")).toBe(6);
+    expect(effectiveDecimals(null, 1, 0, "u16")).toBe(0);
+    expect(effectiveDecimals(undefined, 0.1, 0, "u16")).toBe(1);
+    expect(effectiveDecimals(null, 0.25, 0, "i16")).toBe(2);
+    expect(effectiveDecimals(null, 2.5, 0, "u16")).toBe(1);
+    expect(effectiveDecimals(null, 1, 0, "f32")).toBe(6);
+    expect(effectiveDecimals(null, 0.1, 0, "f64")).toBe(6);
+    expect(effectiveDecimals(9, 1, 0, "u16")).toBe(6);
+    expect(effectiveDecimals(2, 0.1, 0, "u16")).toBe(2);
+    expect(effectiveDecimals(2, 1, 0, "f32")).toBe(2);
+    expect(effectiveDecimals(null, -0.5, 0, "u16")).toBe(1);
+    expect(effectiveDecimals(null, 1e-9, 0, "u16")).toBe(6);
+    expect(effectiveDecimals(null, 1, 0.25, "u16")).toBe(2);
+    expect(effectiveDecimals(null, 0.1, -40.5, "i16")).toBe(1);
+    expect(effectiveDecimals(null, 0.1, 0.125, "i16")).toBe(3);
   });
 });
 
@@ -55,10 +60,14 @@ describe("formatEng / registerScaling", () => {
     expect(formatEng(23.5, 1, "°C")).toBe("23.5 °C");
     expect(formatEng(300, 0)).toBe("300");
     expect(formatEng(-0.04, 1)).toBe("0.0");
+    expect(formatEng(35.5, 6, null, true)).toBe("35.5");
+    expect(formatEng(300, 6, "V", true)).toBe("300 V");
+    expect(formatEng(1.23456, 6, null, true)).toBe("1.23456");
+    expect(formatEng(35.5, 3)).toBe("35.500");
   });
   it("applies defaults", () => {
-    expect(registerScaling({ dataType: "u16" })).toEqual({ scale: 1, offset: 0, decimals: 0, unit: "" });
-    expect(registerScaling({ dataType: "i16", scale: 0.1, scaleOffset: -40, unit: "°C" })).toEqual({ scale: 0.1, offset: -40, decimals: 1, unit: "°C" });
+    expect(registerScaling({ dataType: "u16" })).toEqual({ scale: 1, offset: 0, decimals: 0, unit: "", trim: false });
+    expect(registerScaling({ dataType: "i16", scale: 0.1, scaleOffset: -40, unit: "°C" })).toEqual({ scale: 0.1, offset: -40, decimals: 1, unit: "°C", trim: false });
   });
 });
 
@@ -78,6 +87,17 @@ describe("decodeRegisterRaw / liveValueText", () => {
     const snap = () => ({ valueWord: 235, valueBit: null });
     expect(liveValueText(reg, snap)).toBe("23.5 °C");
     expect(liveValueText(reg, () => undefined)).toBe("—");
+    const at = (word: number) => () => ({ valueWord: word, valueBit: null });
+    // negative scale + offset: 100 * -0.5 + (-40) = -90 (integer type, 1 place)
+    expect(liveValueText({ ...reg, scale: -0.5, scaleOffset: -40, unit: "" }, at(100))).toBe("-90.0");
+    // fractional offset on an unscaled integer register: 23 + 0.25
+    expect(liveValueText({ ...reg, scale: 1, scaleOffset: 0.25, unit: "" }, at(23))).toBe("23.25");
+    // automatic float decimals trim trailing zeros; explicit ones stay fixed
+    const f32 = { unitId: 1, functionCode: 4, address: 1, dataType: "f32" };
+    const w: Record<number, number> = { 1: 0x420e, 2: 0 };
+    const snapF = (_u: number, _f: number, a: number) => (a in w ? { valueWord: w[a], valueBit: null } : undefined);
+    expect(liveValueText(f32, snapF)).toBe("35.5");
+    expect(liveValueText({ ...f32, decimals: 3 }, snapF)).toBe("35.500");
     expect(liveValueText({ ...reg, functionCode: 1 }, () => ({ valueWord: null, valueBit: true }))).toBe("ON");
   });
 });

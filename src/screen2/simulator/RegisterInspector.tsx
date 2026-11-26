@@ -321,6 +321,14 @@ export default function RegisterInspector(props: RegisterInspectorProps) {
   const handleFunctionCodeChange = (functionCode: number) => {
     const bit = functionCode === 1 || functionCode === 2;
     const patch: Partial<PageRegister> = { functionCode, dataType: bit ? "bool" : "u16", byteOrder: "ABCD" };
+    if (bit) {
+      // Bit banks carry no scaling; drop anything typed on a holding/input draft.
+      patch.scale = null;
+      patch.scaleOffset = null;
+      patch.decimals = null;
+      patch.unit = null;
+      setScalingText({ scale: "", offset: "", decimals: "" });
+    }
     if (bit && reg.valueSource !== "hold") patch.valueSource = "hold";
     set(patch);
   };
@@ -350,12 +358,15 @@ export default function RegisterInspector(props: RegisterInspectorProps) {
   const buildSourceParams = () => buildParamsJson(reg.valueSource, srcNow);
 
   // Unset scaling is stored as null so unscaled registers stay byte-identical.
-  const withScaling = (r: PageRegister): PageRegister => ({
+  const withScaling = (r: PageRegister): PageRegister =>
+    r.functionCode === 1 || r.functionCode === 2
+      ? { ...r, scale: null, scaleOffset: null, decimals: null }
+      : {
     ...r,
     scale: r.scale ?? null,
     scaleOffset: r.scaleOffset ?? null,
     decimals: r.decimals ?? null,
-  });
+    };
 
   const handleSave = () => {
     if (intervalError || scalingError) return;
@@ -558,7 +569,7 @@ export default function RegisterInspector(props: RegisterInspectorProps) {
                   </label>
                 </div>
                 <p className="text-[11px] text-slate-500 dark:text-slate-400">
-                  {scalingError ? "—" : `raw ${previewRaw} = ${formatEng(engFromRaw(previewRaw, sc.scale, sc.offset), sc.decimals, sc.unit)}`}
+                  {scalingError ? "—" : `raw ${previewRaw} = ${formatEng(engFromRaw(previewRaw, sc.scale, sc.offset), sc.decimals, sc.unit, sc.trim)}`}
                 </p>
                 <p className="text-[11px] text-slate-500 dark:text-slate-400">
                   Value = raw × scale + offset. Generator, preset and rule values are entered in these units.

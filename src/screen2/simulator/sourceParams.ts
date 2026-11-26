@@ -84,7 +84,7 @@ export function sourceSummary(
       const reg = { dataType: "u16", ...r };
       if (isIdentityScaling(reg)) return `hold ${r.holdValue}${unitSuffix}`;
       const sc = registerScaling(reg);
-      return `hold ${formatEng(engFromRaw(r.holdValue, sc.scale, sc.offset), sc.decimals, sc.unit)}`;
+      return `hold ${formatEng(engFromRaw(r.holdValue, sc.scale, sc.offset), sc.decimals, sc.unit, sc.trim)}`;
     }
     case "generator":
       // Generator min/max are engineering values already.

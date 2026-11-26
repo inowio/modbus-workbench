@@ -55,18 +55,26 @@ function decimalPlaces(s: number): number {
   return dot < 0 ? 0 : text.length - dot - 1;
 }
 
-export function effectiveDecimals(decimals: number | null | undefined, scale: number, dataType: string): number {
+/**
+ * Automatic (null) decimals: integer types use the larger of the decimal places
+ * of |scale| and of the offset (max 6); float types use 6 (display trims
+ * trailing zeros). Explicit decimals are clamped 0..6 and shown fixed.
+ */
+export function effectiveDecimals(decimals: number | null | undefined, scale: number, offset: number, dataType: string): number {
   if (decimals !== null && decimals !== undefined && Number.isFinite(decimals)) {
     return Math.min(6, Math.max(0, Math.trunc(decimals)));
   }
-  if (!INTEGER_TYPES.has(dataType)) return 3;
+  if (!INTEGER_TYPES.has(dataType)) return 6;
   const s = Math.abs(scale);
-  if (!Number.isFinite(s) || s === 0) return 0;
-  return Math.min(6, decimalPlaces(s));
+  const scalePlaces = !Number.isFinite(s) || s === 0 ? 0 : decimalPlaces(s);
+  const offsetPlaces = Number.isFinite(offset) ? decimalPlaces(Math.abs(offset)) : 0;
+  return Math.min(6, Math.max(scalePlaces, offsetPlaces));
 }
 
-export function formatEng(value: number, decimals: number, unit?: string | null): string {
+/** `trim` drops trailing zeros (used for automatic decimals on float types). */
+export function formatEng(value: number, decimals: number, unit?: string | null, trim = false): string {
   let text = value.toFixed(Math.min(100, Math.max(0, decimals)));
+  if (trim && text.includes(".")) text = text.replace(/\.?0+$/, "");
   if (/^-0(\.0*)?$/.test(text)) text = text.slice(1); // no "-0.0"
   return unit ? `${text} ${unit}` : text;
 }
@@ -80,10 +88,17 @@ export type ScalableRegister = {
   decimals?: number | null;
 };
 
-export function registerScaling(reg: ScalableRegister): { scale: number; offset: number; decimals: number; unit: string } {
+export function registerScaling(reg: ScalableRegister): { scale: number; offset: number; decimals: number; unit: string; trim: boolean } {
   const scale = reg.scale != null && reg.scale !== 0 && Number.isFinite(reg.scale) ? reg.scale : 1;
   const offset = reg.scaleOffset != null && Number.isFinite(reg.scaleOffset) ? reg.scaleOffset : 0;
-  return { scale, offset, decimals: effectiveDecimals(reg.decimals, scale, reg.dataType), unit: reg.unit ?? "" };
+  return {
+    scale,
+    offset,
+    decimals: effectiveDecimals(reg.decimals, scale, offset, reg.dataType),
+    unit: reg.unit ?? "",
+    // Automatic decimals on a float type: show only the digits that matter.
+    trim: reg.decimals == null && !INTEGER_TYPES.has(reg.dataType),
+  };
 }
 
 /** True when scale/offset are the defaults (engineering == raw). */
@@ -131,5 +146,5 @@ export function liveValueText(reg: LiveRegister, snapshotFor: SnapshotLookup): s
   const raw = liveRaw(reg, snapshotFor);
   if (raw === null) return "—";
   const sc = registerScaling(reg);
-  return formatEng(engFromRaw(raw, sc.scale, sc.offset), sc.decimals, sc.unit);
+  return formatEng(engFromRaw(raw, sc.scale, sc.offset), sc.decimals, sc.unit, sc.trim);
 }

@@ -479,4 +479,16 @@ describe("RegisterInspector scaling", () => {
     fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
     expect(p.onSave.mock.calls[0][0]).toMatchObject({ scale: 0.1, scaleOffset: -40, decimals: 2 });
   });
+
+  it("drops scaling typed on a holding draft when it is switched to a coil", () => {
+    const onCreate = vi.fn();
+    render(<RegisterInspector {...base()} register={blankRegister([])} onCreate={onCreate} />);
+    fireEvent.change(screen.getByLabelText("Scale"), { target: { value: "0" } });
+    fireEvent.change(screen.getByLabelText("Register type"), { target: { value: "1" } });
+    expect(screen.queryByLabelText("Scale")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /^create$/i }));
+    expect(onCreate.mock.calls[0][0]).toMatchObject({ functionCode: 1, scale: null, scaleOffset: null, decimals: null });
+    fireEvent.change(screen.getByLabelText("Register type"), { target: { value: "3" } });
+    expect((screen.getByLabelText("Scale") as HTMLInputElement).value).toBe("");
+  });
 });
