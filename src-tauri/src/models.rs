@@ -108,6 +108,9 @@ pub struct SlaveCreate {
     pub poll_interval_ms: Option<i64>,
     #[serde(default)]
     pub address_offset: Option<i64>,
+    /// "serial" (the default) or "tcp".
+    #[serde(default)]
+    pub connection_kind: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

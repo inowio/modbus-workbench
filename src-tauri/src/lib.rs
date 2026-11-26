@@ -136,6 +136,7 @@ pub fn run() {
         .manage(AnalyzerPollingState::default())
         .manage(ImportCache(Mutex::new(None)))
         .manage(simulator::SimulatorState::default())
+        .manage(slave_scan::SlaveScanState::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -278,6 +279,8 @@ pub fn run() {
             simulator::simulator_delete_device,
             simulator::simulator_update_device,
             simulator::simulator_rebase_device,
+            slave_scan::start_slave_scan,
+            slave_scan::cancel_slave_scan,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

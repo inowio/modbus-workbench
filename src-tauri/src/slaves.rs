@@ -61,7 +61,18 @@ pub fn create_slave(
     now_iso: String,
 ) -> Result<SlaveItem, String> {
     let conn = open_workspace_db(&app, &name)?;
+    create_slave_in_conn(&conn, slave, &now_iso)
+}
 
+pub(crate) fn create_slave_in_conn(
+    conn: &rusqlite::Connection,
+    slave: SlaveCreate,
+    now_iso: &str,
+) -> Result<SlaveItem, String> {
+    let connection_kind = slave.connection_kind.as_deref().unwrap_or("serial");
+    if !matches!(connection_kind, "serial" | "tcp") {
+        return Err("connectionKind must be \"serial\" or \"tcp\"".to_string());
+    }
     let poll_interval_ms = slave.poll_interval_ms.unwrap_or(1000);
     let address_offset = slave.address_offset.unwrap_or(0);
 
@@ -69,12 +80,12 @@ pub fn create_slave(
         "INSERT INTO slaves (name, unit_id, poll_interval_ms, connection_kind, address_offset, created_at, updated_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7);",
         (
-            slave.name,
+            slave.name.as_str(),
             slave.unit_id,
             poll_interval_ms,
-            "serial".to_string(),
+            connection_kind,
             address_offset,
-            now_iso.clone(),
+            now_iso,
             now_iso,
         ),
     )
@@ -82,7 +93,7 @@ pub fn create_slave(
 
     let id = conn.last_insert_rowid();
 
-    fetch_slave(&conn, id).map_err(|e| format!("failed to read created slave: {e}"))
+    fetch_slave(conn, id).map_err(|e| format!("failed to read created slave: {e}"))
 }
 
 #[tauri::command]
@@ -636,6 +647,38 @@ mod tests {
 
         assert!(err.contains("failed to copy register rows"), "unexpected error: {err}");
         assert_eq!(count_slaves(&conn), 1, "the slave insert must roll back");
+        cleanup(dir, conn);
+    }
+
+    fn new_slave(connection_kind: Option<&str>) -> SlaveCreate {
+        SlaveCreate {
+            name: "Found".to_string(),
+            unit_id: 7,
+            poll_interval_ms: None,
+            address_offset: None,
+            connection_kind: connection_kind.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn create_slave_with_tcp_kind() {
+        let (dir, conn) = temp_db();
+
+        let tcp = create_slave_in_conn(&conn, new_slave(Some("tcp")), NOW).expect("tcp slave");
+        assert_eq!(tcp.connection_kind, "tcp");
+        let stored: String = conn
+            .query_row("SELECT connection_kind FROM slaves WHERE id = ?1;", (tcp.id,), |r| r.get(0))
+            .expect("stored kind");
+        assert_eq!(stored, "tcp");
+
+        let default = create_slave_in_conn(&conn, new_slave(None), NOW).expect("default slave");
+        assert_eq!(default.connection_kind, "serial");
+        assert_eq!(default.poll_interval_ms, 1000);
+        assert_eq!(default.address_offset, 0);
+
+        let err = create_slave_in_conn(&conn, new_slave(Some("rtu")), NOW).expect_err("bad kind");
+        assert_eq!(err, "connectionKind must be \"serial\" or \"tcp\"");
+        assert_eq!(count_slaves(&conn), 2, "an invalid kind inserts nothing");
         cleanup(dir, conn);
     }
 

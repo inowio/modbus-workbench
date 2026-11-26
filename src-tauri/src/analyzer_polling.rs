@@ -26,6 +26,15 @@ pub struct AnalyzerPollingState {
     workers: Mutex<HashMap<String, JoinHandle<()>>>,
 }
 
+impl AnalyzerPollingState {
+    /// Whether a polling worker for `ws` exists and has not finished.
+    pub fn is_running(&self, ws: &str) -> bool {
+        // A poisoned map still holds valid handles; reading it is safe.
+        let workers = self.workers.lock().unwrap_or_else(|e| e.into_inner());
+        workers.get(ws.trim()).is_some_and(|h| !h.inner().is_finished())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct SignalPollSpec {
     signal_id: String,
@@ -865,6 +874,7 @@ pub async fn start_analyzer_polling(
 #[cfg(test)]
 mod tests {
     use super::{
+        AnalyzerPollingState, JoinHandle,
         build_batches, deterministic_jitter_ms, is_disconnected_error, max_qty_for_function,
         load_effective_signal_specs_in_conn, quantity_for_data_type, BatchItem, SignalPollSpec,
     };
@@ -953,6 +963,27 @@ mod tests {
             .collect();
         ids.sort();
         ids
+    }
+
+    #[tokio::test]
+    async fn is_running_tracks_live_workers() {
+        let state = AnalyzerPollingState::default();
+        assert!(!state.is_running("ws"));
+
+        let live = tokio::spawn(std::future::pending::<()>());
+        let done = tokio::spawn(async {});
+        while !done.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        {
+            let mut workers = state.workers.lock().unwrap();
+            workers.insert("ws".into(), JoinHandle::Tokio(live));
+            workers.insert("finished".into(), JoinHandle::Tokio(done));
+        }
+        assert!(state.is_running("ws"));
+        assert!(!state.is_running("finished"));
+        assert!(!state.is_running("other"));
+        state.workers.lock().unwrap().values().for_each(|h| h.abort());
     }
 
     #[test]
