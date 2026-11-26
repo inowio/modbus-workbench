@@ -20,6 +20,7 @@ mod analyzer;
 mod analyzer_polling;
 
 mod simulator;
+mod sim_scaling;
 
 mod modbus;
 mod slave_scan;

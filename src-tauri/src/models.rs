@@ -370,6 +370,15 @@ pub struct SimRegister {
     pub unit: Option<String>,
     #[serde(default)]
     pub display_format: Option<String>,
+    /// Engineering scale (eng = raw * scale + offset); `None` = 1.
+    #[serde(default)]
+    pub scale: Option<f64>,
+    /// Engineering offset; `None` = 0.
+    #[serde(default)]
+    pub offset: Option<f64>,
+    /// Display decimals; `None` = auto.
+    #[serde(default)]
+    pub decimals: Option<i64>,
 }
 
 fn default_u16_type() -> String { "u16".to_string() }
