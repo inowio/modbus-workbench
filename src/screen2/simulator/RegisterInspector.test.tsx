@@ -421,6 +421,19 @@ describe("RegisterInspector scaling", () => {
     expect(screen.queryByLabelText("Scale")).toBeNull();
   });
 
+  it("shows the raw word(s) small under the live engineering value while running", () => {
+    const { unmount } = render(<RegisterInspector {...base()} register={scaled} liveValue="23.5 °C" liveWords={[235]} />);
+    expect(screen.getByText("23.5 °C")).toBeInTheDocument();
+    expect(screen.getByText("raw 235")).toBeInTheDocument();
+    unmount();
+    const f = { ...scaled, id: 35, dataType: "f32", valueSource: "generator", sourceParams: "{}" };
+    const { unmount: u2 } = render(<RegisterInspector {...base()} register={f} liveValue="230.7" liveWords={[0x4366, 0xb333]} />);
+    expect(screen.getByText("raw 0x4366 0xB333")).toBeInTheDocument();
+    u2();
+    render(<RegisterInspector {...base()} register={f} running={false} liveValue="230.7" liveWords={[0x4366, 0xb333]} />);
+    expect(screen.queryByText("raw 0x4366 0xB333")).toBeNull();
+  });
+
   it("previews a sample raw for a stopped non-hold register instead of raw 0", () => {
     const gen = { ...scaled, id: 34, valueSource: "generator", sourceParams: JSON.stringify({ kind: "sine", min: 20, max: 30 }) };
     render(<RegisterInspector {...base()} running={false} liveRaw={null} register={gen} />);

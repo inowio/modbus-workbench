@@ -18,7 +18,7 @@ import RegistersTab from "../simulator/RegistersTab";
 import RulesTab from "../simulator/RulesTab";
 import SimFooterBar from "../simulator/SimFooterBar";
 import { fmtAddr } from "../simulator/ruleTargets";
-import { liveRaw, liveValueText } from "../simulator/scaling";
+import { liveRaw, liveValueText, liveWords } from "../simulator/scaling";
 import { blankRegister } from "../simulator/simRegister";
 import SimStatusDashboard from "../simulator/SimStatusDashboard";
 import SimTabBar, { type TabKey } from "../simulator/SimTabBar";
@@ -342,6 +342,7 @@ export default function TcpSimulatorPage() {
                 history={history}
                 liveValue={selectedRegister ? liveValueOf(selectedRegister) : "—"}
                 liveRaw={selectedRegister ? liveRaw(selectedRegister, sim.snapshotFor) : null}
+                liveWords={selectedRegister ? liveWords(selectedRegister, sim.snapshotFor) : null}
                 sourceStatus={selectedRegister ? sim.snapshotFor(selectedRegister.unitId, selectedRegister.functionCode, selectedRegister.address)?.sourceStatus : undefined}
                 running={sim.status.running}
                 error={draftOwnsError ? dialogError : null}

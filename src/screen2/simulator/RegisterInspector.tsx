@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 
 import { fmtAddr, type AddrFmt } from "./ruleTargets";
-import { engFromRaw, rawFromEng, registerScaling, roundHalfAway } from "./scaling";
+import { engFromRaw, rawFromEng, rawWordsText, registerScaling, roundHalfAway } from "./scaling";
 import ScalingFields, { EMPTY_SCALING_TEXT, parseOptionalNumber, scalingTexts, validateScaling, type ScalingText } from "./ScalingFields";
 import { rwLabel, type PageRegister } from "./simFilters";
 import { addressConflict, parseAddressInput } from "./simRegister";
@@ -118,6 +118,8 @@ export type RegisterInspectorProps = {
   liveValue: string;
   /** Decoded raw value of the live register (unscaled), for the preview line. */
   liveRaw?: number | null;
+  /** Live raw word(s) of the register's span, shown small under the live value. */
+  liveWords?: number[] | null;
   sourceStatus?: string | null;
   running: boolean;
   /** May report success (true/void) or failure (false), sync or async. */
@@ -150,7 +152,7 @@ function Sparkline({ history }: { history: number[] }) {
 }
 
 export default function RegisterInspector(props: RegisterInspectorProps) {
-  const { register, devices, history, liveValue, liveRaw = null, sourceStatus, running, onSave, onDuplicate, onDelete, onClose, onViewDevice, addrFmt = "dec", registers = [], error, onCreate, onDirtyChange } = props;
+  const { register, devices, history, liveValue, liveRaw = null, liveWords = null, sourceStatus, running, onSave, onDuplicate, onDelete, onClose, onViewDevice, addrFmt = "dec", registers = [], error, onCreate, onDirtyChange } = props;
 
   const [tab, setTab] = useState<SubTab>("general");
   const [reg, setReg] = useState<PageRegister | null>(register);
@@ -763,7 +765,12 @@ export default function RegisterInspector(props: RegisterInspectorProps) {
             ) : null}
           </div>
           <div className="flex items-center justify-between gap-3">
-            <span className="font-mono text-2xl font-bold text-slate-900 dark:text-slate-100">{running ? liveValue : "—"}</span>
+            <div className="min-w-0">
+              <div className="font-mono text-2xl font-bold text-slate-900 dark:text-slate-100">{running ? liveValue : "—"}</div>
+              {running && liveWords ? (
+                <div className="font-mono text-[11px] text-slate-500 dark:text-slate-400">{rawWordsText(liveWords)}</div>
+              ) : null}
+            </div>
             <Sparkline history={history} />
           </div>
         </div>}

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
-  decodeRegisterRaw, effectiveDecimals, engFromRaw, formatEng, liveValueText, rawFromEng, registerScaling,
+  decodeRegisterRaw, effectiveDecimals, liveWords, rawWordsText, engFromRaw, formatEng, liveValueText, rawFromEng, registerScaling,
 } from "./scaling";
 
 describe("rawFromEng", () => {
@@ -117,5 +117,21 @@ describe("decodeRegisterRaw / liveValueText", () => {
     expect(liveValueText(f32, snapF)).toBe("35.5");
     expect(liveValueText({ ...f32, decimals: 3 }, snapF)).toBe("35.500");
     expect(liveValueText({ ...reg, functionCode: 1 }, () => ({ valueWord: null, valueBit: true }))).toBe("ON");
+  });
+});
+
+describe("liveWords / rawWordsText", () => {
+  const snapOf = (w: Record<number, number>) => (_u: number, _f: number, a: number) =>
+    (a in w ? { valueWord: w[a], valueBit: null } : undefined);
+  it("returns the register's full word span, or null for bits / missing words", () => {
+    const f32 = { unitId: 1, functionCode: 3, address: 10, dataType: "f32" };
+    expect(liveWords(f32, snapOf({ 10: 0x4366, 11: 0xb333 }))).toEqual([0x4366, 0xb333]);
+    expect(liveWords(f32, snapOf({ 10: 0x4366 }))).toBeNull();
+    expect(liveWords({ ...f32, dataType: "u16" }, snapOf({ 10: 235 }))).toEqual([235]);
+    expect(liveWords({ ...f32, functionCode: 1, dataType: "bool" }, () => ({ valueWord: null, valueBit: true }))).toBeNull();
+  });
+  it("formats one word in decimal and several as hex", () => {
+    expect(rawWordsText([235])).toBe("raw 235");
+    expect(rawWordsText([0x4366, 0xb333])).toBe("raw 0x4366 0xB333");
   });
 });

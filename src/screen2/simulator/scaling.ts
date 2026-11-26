@@ -155,6 +155,24 @@ export function liveRaw(reg: LiveRegister, snapshotFor: SnapshotLookup): number 
   return decodeRegisterRaw(reg, (a) => snapshotFor(reg.unitId, reg.functionCode, a)?.valueWord ?? null);
 }
 
+/** The live raw word(s) of a register's full span (null for bit banks or missing words). */
+export function liveWords(reg: LiveRegister, snapshotFor: SnapshotLookup): number[] | null {
+  if (reg.functionCode === 1 || reg.functionCode === 2) return null;
+  const words: number[] = [];
+  for (let i = 0; i < spanOf(reg.dataType); i++) {
+    const w = snapshotFor(reg.unitId, reg.functionCode, reg.address + i)?.valueWord;
+    if (w === null || w === undefined) return null;
+    words.push(w);
+  }
+  return words;
+}
+
+/** "raw 235" for one word; "raw 0x4366 0xB333" (address order) for several. */
+export function rawWordsText(words: number[]): string {
+  if (words.length === 1) return `raw ${words[0]}`;
+  return `raw ${words.map((w) => `0x${w.toString(16).toUpperCase().padStart(4, "0")}`).join(" ")}`;
+}
+
 /** The one shared live-value text: "ON"/"OFF" for bits, else scaled "23.5 °C". */
 export function liveValueText(reg: LiveRegister, snapshotFor: SnapshotLookup): string {
   const row = snapshotFor(reg.unitId, reg.functionCode, reg.address);
