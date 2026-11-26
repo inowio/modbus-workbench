@@ -102,7 +102,7 @@ pub fn build_reg_meta(regs: &[SimRegister]) -> RegMetaMap {
             continue;
         }
         let scale = r.scale.filter(|s| *s != 0.0 && s.is_finite()).unwrap_or(1.0);
-        let offset = r.offset.filter(|o| o.is_finite()).unwrap_or(0.0);
+        let offset = r.scale_offset.filter(|o| o.is_finite()).unwrap_or(0.0);
         map.insert(
             (r.unit_id as u8, r.function_code as u8, r.address as u16),
             RegMeta {
@@ -176,7 +176,7 @@ mod tests {
             id: 1, unit_id: 3, function_code: 3, address: 10, alias: String::new(),
             data_type: "u16".into(), hold_value: 0, sort_order: 0, device_instance_id: None,
             value_source: "hold".into(), byte_order: "ABCD".into(), source_params: "{}".into(),
-            interval_ms: 1000, unit: None, display_format: None, scale, offset, decimals,
+            interval_ms: 1000, unit: None, display_format: None, scale, scale_offset: offset, decimals,
         };
         let m = build_reg_meta(&[mk(None, None, None)]);
         let v = m.get(&(3, 3, 10)).unwrap();

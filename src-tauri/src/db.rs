@@ -189,7 +189,7 @@ pub(crate) fn ensure_workspace_db(workspace_folder: &PathBuf, db_file: &str) -> 
             display_format TEXT,
             unit TEXT,
             scale REAL,
-            offset REAL,
+            scale_offset REAL,
             decimals INTEGER,
             value_source TEXT NOT NULL DEFAULT 'hold',
             source_params TEXT,
@@ -222,7 +222,7 @@ pub(crate) fn ensure_workspace_db(workspace_folder: &PathBuf, db_file: &str) -> 
     // Idempotent dev-DB migration: older workspace DBs were created before
     // `unit`/`display_format` existed on `sim_registers`. Ignore the error
     // when the column is already present.
-    for col in ["unit TEXT", "display_format TEXT", "scale REAL", "offset REAL", "decimals INTEGER"] {
+    for col in ["unit TEXT", "display_format TEXT", "scale REAL", "scale_offset REAL", "decimals INTEGER"] {
         let _ = conn.execute(&format!("ALTER TABLE sim_registers ADD COLUMN {col}"), []);
     }
 

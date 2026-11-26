@@ -375,7 +375,7 @@ pub struct SimRegister {
     pub scale: Option<f64>,
     /// Engineering offset; `None` = 0.
     #[serde(default)]
-    pub offset: Option<f64>,
+    pub scale_offset: Option<f64>,
     /// Display decimals; `None` = auto.
     #[serde(default)]
     pub decimals: Option<i64>,
