@@ -556,7 +556,10 @@ impl Service for SimService {
 impl SimService {
     fn handle(&self, unit: u8, req: Request<'static>) -> Result<Response, ExceptionCode> {
         let mut banks = self.banks.write().map_err(|_| ExceptionCode::ServerDeviceFailure)?;
-        let bank = banks.get_mut(&unit).ok_or(ExceptionCode::IllegalDataAddress)?;
+        // Unit IDs with no bank answer like a gateway (0x0B, target device failed
+        // to respond) so scanners can tell absent units from present ones; a
+        // missing register inside an existing unit still answers IllegalDataAddress.
+        let bank = banks.get_mut(&unit).ok_or(ExceptionCode::GatewayTargetDevice)?;
         match req {
             Request::ReadCoils(a, c) => Ok(Response::ReadCoils(bank.read_coils(a, c)?)),
             Request::ReadDiscreteInputs(a, c) => {
@@ -3341,6 +3344,27 @@ mod tests {
         for &(a, v) in holding { b.holding.insert(a, v); }
         for &(a, v) in coils { b.coils.insert(a, v); }
         b
+    }
+
+    #[test]
+    fn unknown_unit_replies_gateway_target() {
+        let mut map = HashMap::new();
+        map.insert(1u8, banks_with(&[(0, 5)], &[]));
+        let service = SimService {
+            banks: Arc::new(RwLock::new(map)),
+            clients: Arc::new(AtomicUsize::new(0)),
+            writes: Arc::new(Mutex::new(Vec::new())),
+        };
+        // No bank for unit 99: gateway "target device failed to respond".
+        assert_eq!(
+            service.handle(99, Request::ReadHoldingRegisters(0, 1)),
+            Err(ExceptionCode::GatewayTargetDevice)
+        );
+        // A known unit still answers a missing register with IllegalDataAddress.
+        assert_eq!(
+            service.handle(1, Request::ReadHoldingRegisters(50, 1)),
+            Err(ExceptionCode::IllegalDataAddress)
+        );
     }
 
     #[test]
