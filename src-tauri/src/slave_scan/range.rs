@@ -129,7 +129,7 @@ async fn find_hosts<H: HostProbe, S: ScanSink>(
         while set.len() < limit && !cancel.is_cancelled() {
             let Some(ip) = addresses.next() else { break };
             let addr = SocketAddrV4::new(ip, port);
-            set.spawn(reach_host(probe.clone(), addr, scan.connect_wait, scan.retries, cancel.clone()));
+            set.spawn(reach_host(probe.clone(), addr, scan.connect_wait, scan.retries.max(1), cancel.clone()));
         }
         if cancel.is_cancelled() {
             ctx.saw_cancel();
@@ -674,7 +674,7 @@ mod tests {
         scan.host_concurrency = 8;
         let r = run(scan, probe.clone(), Arc::new(FakeFactory::default())).await;
         assert_eq!(probe.max_in_flight.load(Ordering::SeqCst), 8);
-        assert!((1..=40).all(|d| probe.calls(d) == 1));
+        assert!((1..=40).all(|d| probe.calls(d) == 2));
         assert_eq!(probe.in_flight.load(Ordering::SeqCst), 0);
         assert_eq!(r.done.reason, "completed");
     }
@@ -688,6 +688,16 @@ mod tests {
         assert_eq!(probe.calls(1), 2, "timed out: tried again");
         assert_eq!(probe.calls(2), 1, "refused is final");
         assert_eq!(probe.calls(3), 1, "open at once");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stage_one_retries_timeouts_at_least_once_even_with_zero_retries() {
+        let probe = Arc::new(FakeProbe::default().with(2, Reach::Refused).open(3, 1));
+        let scan = range_scan(1..=3, 1..=2);
+        assert_eq!(scan.retries, 0);
+        run(scan, probe.clone(), Arc::new(FakeFactory::default())).await;
+        assert_eq!(probe.calls(1), 2, "timed out: tried once more");
+        assert_eq!(probe.calls(2), 1, "refused is final");
     }
 
     #[tokio::test(start_paused = true)]

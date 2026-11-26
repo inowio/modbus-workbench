@@ -15,6 +15,7 @@ export type ScanHostsListProps = {
 
 const noop = () => {};
 const never = () => false;
+const NONE: ScanFoundEvent[] = [];
 
 /** Orders "a.b.c.d:port" by address, then port. */
 function hostOrder(a: string, b: string): number {
@@ -48,7 +49,7 @@ function statusBadge(host: ScanHostEvent, scanning: boolean, cancelled: boolean)
     case "noModbus":
       return { text: "port open, no Modbus reply", cls: NEUTRAL };
     case "lost":
-      return { text: "connection lost during scan", cls: "border-rose-500/40 bg-rose-500/10 text-rose-800 dark:text-rose-200" };
+      return { text: host.found > 0 ? `connection lost during scan · ${host.found} device(s)` : "connection lost during scan", cls: "border-rose-500/40 bg-rose-500/10 text-rose-800 dark:text-rose-200" };
     default:
       if (scanning) return { text: "scanning…", cls: GOOD };
       return { text: cancelled ? "not scanned (cancelled)" : "port open", cls: NEUTRAL };
@@ -57,16 +58,16 @@ function statusBadge(host: ScanHostEvent, scanning: boolean, cancelled: boolean)
 
 function HostRow({
   host,
-  results,
+  own,
   scanning,
   cancelled,
 }: {
   host: ScanHostEvent;
-  results: ScanFoundEvent[];
+  /** This host's own found events. */
+  own: ScanFoundEvent[];
   scanning: boolean;
   cancelled: boolean;
 }) {
-  const own = useMemo(() => results.filter((r) => r.target === host.host), [results, host.host]);
   const collapsible = own.length > 0;
   const replies = Math.max(host.found, own.length);
   // Until the user toggles it, an answers-every-unit-ID host stays collapsed (even if it became one mid-scan).
@@ -109,6 +110,15 @@ function HostRow({
 /** Range scan results: one block per host that answered the connect, with its unit rows underneath. */
 export default function ScanHostsList({ hosts, results, scanning, cancelled }: ScanHostsListProps) {
   const sorted = useMemo(() => [...hosts].sort((a, b) => hostOrder(a.host, b.host)), [hosts]);
+  const byHost = useMemo(() => {
+    const m = new Map<string, ScanFoundEvent[]>();
+    for (const r of results) {
+      const list = m.get(r.target);
+      if (list) list.push(r);
+      else m.set(r.target, [r]);
+    }
+    return m;
+  }, [results]);
 
   if (sorted.length === 0) {
     return (
@@ -120,7 +130,7 @@ export default function ScanHostsList({ hosts, results, scanning, cancelled }: S
   return (
     <div className="flex flex-col gap-3">
       {sorted.map((h) => (
-        <HostRow key={h.host} host={h} results={results} scanning={scanning} cancelled={cancelled} />
+        <HostRow key={h.host} host={h} own={byHost.get(h.host) ?? NONE} scanning={scanning} cancelled={cancelled} />
       ))}
     </div>
   );

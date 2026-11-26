@@ -206,8 +206,9 @@ describe("parseIpRange (mirrors the Rust parser)", () => {
 
 describe("estimateRangeSeconds", () => {
   it("is addresses x connect wait x attempts / parallel hosts", () => {
-    expect(estimateRangeSeconds({ addresses: 254, connectWaitMs: 300, retries: 0, hostConcurrency: 64 })).toBe(2);
+    expect(estimateRangeSeconds({ addresses: 254, connectWaitMs: 300, retries: 0, hostConcurrency: 64 })).toBe(3);
     expect(estimateRangeSeconds({ addresses: 254, connectWaitMs: 300, retries: 1, hostConcurrency: 1 })).toBe(153);
+    expect(estimateRangeSeconds({ addresses: 254, connectWaitMs: 300, retries: 2, hostConcurrency: 1 })).toBe(229);
   });
 });
 
@@ -233,5 +234,9 @@ describe("simple range helpers", () => {
 
   it("builds the range text", () => {
     expect(simpleRangeText("192.168.68", "1", "254")).toBe("192.168.68.1-254");
+  });
+
+  it("normalises leading zeros", () => {
+    expect(simpleRangeText("192.168.68", "01", "020")).toBe("192.168.68.1-20");
   });
 });

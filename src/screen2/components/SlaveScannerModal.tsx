@@ -559,7 +559,7 @@ export default function SlaveScannerModal({ open, workspaceName, existingSlaves,
                   {rangeScan
                     ? stat(
                         "Hosts",
-                        `${hostList.length} / ${rangeAddresses}`,
+                        `${hostList.length} / ${progress?.phase === "hosts" ? progress.checked : rangeAddresses}`,
                         "text-slate-900 dark:text-slate-100",
                       )
                     : null}

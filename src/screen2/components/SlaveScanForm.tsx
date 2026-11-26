@@ -147,6 +147,11 @@ export function initialForm(ws: ConnectionSettings): FormState {
   };
 }
 
+/** Default Quantity in IP range mode: the rest of unit IDs 1-247 from `start`. */
+function rangeQuantity(start: number): number {
+  return Math.max(1, 247 - start + 1);
+}
+
 function intIn(value: string, min: number, max: number): number | null {
   if (!/^\d+$/.test(value.trim())) return null;
   const n = Number(value);
@@ -317,7 +322,10 @@ export default function SlaveScanForm({
         ...prev,
         kind,
         start,
-        quantity: prev.quantityEdited || startNum === null ? prev.quantity : String(defaultQuantity(kind, startNum)),
+        quantity:
+          prev.quantityEdited || startNum === null
+            ? prev.quantity
+            : String(kind === "tcp" && prev.tcpMode === "range" ? rangeQuantity(startNum) : defaultQuantity(kind, startNum)),
         waitMs: prev.waitEdited ? prev.waitMs : String(defaultWaitMs(kind)),
       };
     });
@@ -329,7 +337,12 @@ export default function SlaveScanForm({
       return {
         ...prev,
         start,
-        quantity: prev.quantityEdited || startNum === null ? prev.quantity : String(defaultQuantity(prev.kind, startNum)),
+        quantity:
+          prev.quantityEdited || startNum === null
+            ? prev.quantity
+            : String(
+                prev.kind === "tcp" && prev.tcpMode === "range" ? rangeQuantity(startNum) : defaultQuantity(prev.kind, startNum),
+              ),
       };
     });
   }
@@ -699,7 +712,7 @@ export default function SlaveScanForm({
                       <span className="text-rose-700 dark:text-rose-300">{simpleError}</span>
                     ) : (
                       <span className="text-slate-600 dark:text-slate-300">
-                        {`${form.net.trim()}.${form.fromHost.trim()} → ${form.net.trim()}.${form.toHost.trim()} · ${simpleCount} ${simpleCount === 1 ? "address" : "addresses"}`}
+                        {`${form.net.trim()}.${Number(form.fromHost)} → ${form.net.trim()}.${Number(form.toHost)} · ${simpleCount} ${simpleCount === 1 ? "address" : "addresses"}`}
                       </span>
                     )}
                   </p>

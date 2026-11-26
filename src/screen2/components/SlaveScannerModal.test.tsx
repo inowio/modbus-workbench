@@ -628,7 +628,7 @@ describe("SlaveScannerModal", () => {
       expect(screen.queryByLabelText("Host")).toBeNull();
       expect(screen.getByLabelText("Start")).toBeInTheDocument();
       expect(screen.getByLabelText("Check with")).toBeInTheDocument();
-      expect(screen.getByText(/Finding hosts: about 2 s, then about/)).toBeInTheDocument();
+      expect(screen.getByText(/Finding hosts: about 3 s, then about/)).toBeInTheDocument();
     });
 
     it("leaves the network empty when there is no default", async () => {
@@ -679,6 +679,15 @@ describe("SlaveScannerModal", () => {
         serial: null,
         sweep: null,
       });
+    });
+
+    it("accepts a From with a leading zero", async () => {
+      setupRange();
+      await openRangeMode();
+      await waitFor(() => expect(screen.getByLabelText("Network")).toHaveValue("192.168.68"));
+      fireEvent.change(screen.getByLabelText("From"), { target: { value: "01" } });
+      expect(screen.getByRole("button", { name: "Scan" })).toBeEnabled();
+      expect(screen.getByText(/^192\.168\.68\.1 → /)).toBeInTheDocument();
     });
 
     it("invalid simple input disables Scan", async () => {
@@ -766,6 +775,21 @@ describe("SlaveScannerModal", () => {
       expect(screen.getByLabelText("Quantity")).toHaveValue(255);
     });
 
+    it("range mode quantity follows the start within 1-247 while unedited", async () => {
+      setupRange();
+      renderModal();
+      await loaded();
+      fireEvent.click(screen.getByRole("radio", { name: "TCP" }));
+      fireEvent.click(screen.getByRole("radio", { name: "IP range" }));
+      fireEvent.change(screen.getByLabelText("Start"), { target: { value: "10" } });
+      expect(screen.getByLabelText("Quantity")).toHaveValue(238);
+      fireEvent.change(screen.getByLabelText("Start"), { target: { value: "1" } });
+      fireEvent.click(screen.getByRole("radio", { name: "Serial (RTU)" }));
+      fireEvent.click(screen.getByRole("radio", { name: "TCP" }));
+      expect(screen.getByLabelText("Start")).toHaveValue(1);
+      expect(screen.getByLabelText("Quantity")).toHaveValue(247);
+    });
+
     it("keeps an edited quantity when switching modes", async () => {
       setupRange();
       renderModal();
@@ -826,6 +850,52 @@ describe("SlaveScannerModal", () => {
         expect(screen.queryByRole("button", { name: "Add" })).toBeNull();
         expect(screen.getByText("Hosts")).toBeInTheDocument();
         expect(screen.getByText("2 / 254")).toBeInTheDocument();
+      });
+
+      it("a lost host keeps its device count", async () => {
+        const scanId = await startRangeScan();
+        fire("slave_scan_host", hostEvent(scanId, T3, "lost", { found: 2 }));
+        expect(screen.getByText("connection lost during scan · 2 device(s)")).toBeInTheDocument();
+      });
+
+      it("Hosts counter counts addresses tried during stage 1", async () => {
+        const scanId = await startRangeScan();
+        fire("slave_scan_host", hostEvent(scanId, T3, "open"));
+        fire("slave_scan_progress", {
+          workspace: WS, scanId, checked: 50, total: 254, phase: "hosts", hostIndex: null, hostCount: null,
+          current: { target: "192.168.68.50:502", unitId: 1, settings: null },
+        });
+        expect(screen.getByText("1 / 50")).toBeInTheDocument();
+        fire("slave_scan_done", { workspace: WS, scanId, reason: "completed", checked: 3, found: 0, error: null });
+        expect(screen.getByText("1 / 254")).toBeInTheDocument();
+      });
+
+      it("each host shows only its own interleaved units", async () => {
+        const scanId = await startRangeScan();
+        fire("slave_scan_found", tcpFound(scanId, T3, 1));
+        fire("slave_scan_found", tcpFound(scanId, T7, 2));
+        fire("slave_scan_found", tcpFound(scanId, T3, 3));
+        fire("slave_scan_found", tcpFound(scanId, T7, 4));
+        fire("slave_scan_host", hostEvent(scanId, T3, "devices", { found: 2 }));
+        fire("slave_scan_host", hostEvent(scanId, T7, "devices", { found: 2 }));
+        const h3 = within(screen.getByRole("region", { name: `Host ${T3}` }));
+        const h7 = within(screen.getByRole("region", { name: `Host ${T7}` }));
+        expect(h3.getByLabelText("Unit 1 on " + T3)).toBeInTheDocument();
+        expect(h3.getByLabelText("Unit 3 on " + T3)).toBeInTheDocument();
+        expect(h3.queryByLabelText("Unit 2 on " + T7)).toBeNull();
+        expect(h7.getByLabelText("Unit 2 on " + T7)).toBeInTheDocument();
+        expect(h7.getByLabelText("Unit 4 on " + T7)).toBeInTheDocument();
+        expect(h7.queryByLabelText("Unit 1 on " + T3)).toBeNull();
+      });
+
+      it("Cancel during stage 2 calls cancel_slave_scan once", async () => {
+        const scanId = await startRangeScan();
+        fire("slave_scan_progress", {
+          workspace: WS, scanId, checked: 5, total: 20, phase: "units", hostIndex: 1, hostCount: 2,
+          current: { target: T3, unitId: 5, settings: null },
+        });
+        fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+        await waitFor(() => expect(cancelCalls()).toEqual([["cancel_slave_scan", { name: WS, scanId }]]));
       });
 
       it("progress shows both phases", async () => {

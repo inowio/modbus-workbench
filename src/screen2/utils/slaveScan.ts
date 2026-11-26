@@ -187,7 +187,7 @@ export function parseIpRange(input: string): { count: number } | { error: string
   return { count };
 }
 
-/** Worst-case time for stage 1 (finding hosts): every address times out on every attempt. */
+/** Worst-case time for stage 1 (finding hosts): every address times out on every attempt (stage 1 retries at least once). */
 export function estimateRangeSeconds(args: {
   addresses: number;
   connectWaitMs: number;
@@ -195,7 +195,7 @@ export function estimateRangeSeconds(args: {
   hostConcurrency: number;
 }): number {
   const { addresses, connectWaitMs, retries, hostConcurrency } = args;
-  return Math.ceil((addresses * connectWaitMs * (retries + 1)) / Math.max(1, hostConcurrency) / 1000);
+  return Math.ceil((addresses * connectWaitMs * (Math.max(retries, 1) + 1)) / Math.max(1, hostConcurrency) / 1000);
 }
 
 /** Splits a default range such as `192.168.68.1-254` into network, first and last host. */
@@ -222,5 +222,6 @@ export function simpleRangeProblem(net: string, from: string, to: string): strin
 }
 
 export function simpleRangeText(net: string, from: string, to: string): string {
-  return `${net.trim()}.${from.trim()}-${to.trim()}`;
+  const norm = (v: string) => (/^\d+$/.test(v.trim()) ? String(Number(v)) : v.trim());
+  return `${net.trim()}.${norm(from)}-${norm(to)}`;
 }
