@@ -4,6 +4,7 @@ import { RiCloseLine } from "react-icons/ri";
 
 import { useAppAddressFormat } from "../utils/addressFormatPref";
 import { GENERATOR_DEFAULT_PERIOD_MS, initialPeriodText, periodPlaceholder } from "../simulator/sourceParams";
+import ScalingFields, { parseOptionalNumber, scalingTexts, validateScaling, type ScalingText } from "../simulator/ScalingFields";
 import type { DeviceTemplate, TemplateRegister } from "./AddDeviceModal";
 import {
   categoryOptions, findOverlaps, formatOffset, nextFreeOffset, normalizeCategory, parseOffset, regLabel,
@@ -159,6 +160,8 @@ export default function TemplateEditorModal(props: {
   const [typingCategory, setTypingCategory] = useState(false);
   const [sel, setSel] = useState(0);
   const [focusTick, setFocusTick] = useState(0);
+  // Reason the selected register's scaling can't be saved (null = fine).
+  const [scalingError, setScalingError] = useState<string | null>(null);
   const aliasRef = useRef<HTMLInputElement>(null);
   const [addrFmt] = useAppAddressFormat();
 
@@ -197,8 +200,17 @@ export default function TemplateEditorModal(props: {
       name,
       ...(!isEdit && !keyTouched ? { templateKey: slugKey(name, props.takenKeys) } : {}),
     }));
+  // An undefined patch value removes the key, so cleared optional fields stay absent.
   const setReg = (i: number, patch: Partial<TemplateRegister>) =>
-    setT((prev) => ({ ...prev, registers: prev.registers.map((r, idx) => (idx === i ? { ...r, ...patch } : r)) }));
+    setT((prev) => ({
+      ...prev,
+      registers: prev.registers.map((r, idx) => {
+        if (idx !== i) return r;
+        const next: Record<string, unknown> = { ...r, ...patch };
+        for (const k of Object.keys(patch)) if (next[k] === undefined) delete next[k];
+        return next as TemplateRegister;
+      }),
+    }));
 
   const addReg = () => {
     const last = t.registers[t.registers.length - 1];
@@ -242,13 +254,13 @@ export default function TemplateEditorModal(props: {
   const keyTrim = t.templateKey.trim();
   const keyClashes = !isEdit && props.takenKeys.includes(keyTrim);
   const overlaps = findOverlaps(t.registers);
-  const valid = keyTrim !== "" && t.name.trim() !== "" && !keyClashes && overlaps.size === 0;
+  const valid = keyTrim !== "" && t.name.trim() !== "" && !keyClashes && overlaps.size === 0 && scalingError === null;
   const blocker =
     t.name.trim() === "" ? "Enter a name to save."
       : keyTrim === "" ? "Enter a key (Advanced) to save."
         : keyClashes ? "Choose a different key (Advanced)."
           : overlaps.size > 0 ? `Fix overlapping registers to save (${overlaps.size}).`
-            : null;
+            : scalingError;
   const selIdx = Math.min(sel, t.registers.length - 1);
   const selected = selIdx >= 0 ? t.registers[selIdx] : null;
 
@@ -392,8 +404,8 @@ export default function TemplateEditorModal(props: {
             {/* Editor pane */}
             <div className="@container min-h-0 min-w-0 overflow-y-auto rounded-xl border border-slate-200 p-4 dark:border-slate-700">
               {selected ? (
-                <RegisterEditor key={selIdx} index={selIdx} reg={selected} addrFmt={addrFmt} aliasRef={aliasRef}
-                  onChange={(patch) => setReg(selIdx, patch)} />
+                <RegisterEditor key={`${selIdx}:${t.registers.length}`} index={selIdx} reg={selected} addrFmt={addrFmt} aliasRef={aliasRef}
+                  onChange={(patch) => setReg(selIdx, patch)} onScalingError={setScalingError} />
               ) : (
                 <div className="py-10 text-center text-xs text-slate-500 dark:text-slate-400">
                   Select a register to edit it.
@@ -535,11 +547,29 @@ function RegisterEditor(props: {
   addrFmt: "dec" | "hex";
   aliasRef: RefObject<HTMLInputElement | null>;
   onChange: (patch: Partial<TemplateRegister>) => void;
+  onScalingError: (error: string | null) => void;
 }) {
-  const { index: i, reg: r, addrFmt, aliasRef, onChange } = props;
+  const { index: i, reg: r, addrFmt, aliasRef, onChange, onScalingError } = props;
   const isBit = r.bank === 1 || r.bank === 2;
   const isMulti = MULTI_WORD.has(r.dataType);
   const typeOptions = r.valueSource === "hold" ? ["u16", "i16"] : NUMERIC_TYPES;
+
+  // Scaling is typed as text; invalid text keeps the stored value and blocks Save.
+  const [scalingText, setScalingText] = useState<ScalingText>(() => scalingTexts(r));
+  const scalingCheck = validateScaling(scalingText, isBit);
+  const scalingError = scalingCheck.error;
+  useEffect(() => {
+    onScalingError(scalingError);
+    return () => onScalingError(null);
+  }, [scalingError, onScalingError]);
+  const editScaling = (field: keyof ScalingText, text: string) => {
+    setScalingText((prev) => ({ ...prev, [field]: text }));
+    const n = parseOptionalNumber(text);
+    if (n === undefined) return;
+    if (field === "scale") onChange({ scale: n ?? undefined });
+    else if (field === "offset") onChange({ scaleOffset: n ?? undefined });
+    else if (n === null || Number.isInteger(n)) onChange({ decimals: n ?? undefined });
+  };
 
   const changeBank = (bank: number) => {
     const patch: Partial<TemplateRegister> = { bank };
@@ -547,6 +577,9 @@ function RegisterEditor(props: {
       // Bit banks only carry a boolean, driven by a fixed value.
       patch.dataType = "bool";
       patch.byteOrder = "ABCD";
+      // Bit banks carry no scaling.
+      Object.assign(patch, { scale: undefined, scaleOffset: undefined, decimals: undefined, unit: undefined });
+      setScalingText({ scale: "", offset: "", decimals: "" });
       if (r.valueSource !== "hold") { patch.valueSource = "hold"; patch.sourceParams = "{}"; }
     } else if (r.dataType === "bool") {
       patch.dataType = "u16";
@@ -612,6 +645,24 @@ function RegisterEditor(props: {
           </select>
         </label>
       </div>
+
+      {isBit ? null : (
+        <ScalingFields
+          dataType={r.dataType}
+          unit={r.unit}
+          onUnitChange={(u) => onChange({ unit: u === "" ? undefined : u })}
+          text={scalingText}
+          onTextChange={editScaling}
+          check={scalingCheck}
+          previewRaw={r.valueSource === "hold" ? r.holdValue ?? 0 : 0}
+          nameSuffix={` ${i}`}
+          offsetName="Scaling offset"
+          unitInputId={`template-unit-${i}`}
+          labelClass={labelCls}
+          inputClass={inputCls}
+          className="space-y-2 rounded-lg border border-slate-200 p-3 dark:border-slate-800"
+        />
+      )}
 
       <ParamsEditor index={i} reg={r} isMulti={isMulti} onChange={(sourceParams) => onChange({ sourceParams })} />
     </div>

@@ -80,7 +80,8 @@ export function sourceSummary(r: TemplateRegister): string {
     case "generator": {
       const range = typeof p.min === "number" && typeof p.max === "number" ? ` ${p.min}–${p.max}` : "";
       const per = typeof p.periodMs === "number" ? ` · ${periodText(p.periodMs)}` : "";
-      return `${p.kind ?? "sine"}${range}${per}`;
+      const unit = range && r.unit?.trim() ? ` ${r.unit.trim()}` : "";
+      return `${p.kind ?? "sine"}${range}${unit}${per}`;
     }
     case "device":
       return `preset ${p.preset ?? "temperature"}`;

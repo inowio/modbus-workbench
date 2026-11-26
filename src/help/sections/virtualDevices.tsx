@@ -129,6 +129,7 @@ const virtualDevicesSection: HelpSectionDefinition = {
           <li><strong>Type</strong> — <code>u16/i16</code> for single-word, <code>u32/i32/f32</code> and <code>u64/i64/f64</code> for multi-word (bit banks are always <code>bool</code>).</li>
           <li><strong>Byte order</strong> — <code>ABCD/BADC/CDAB/DCBA</code> for multi-word types (see the <HelpAnchorLink section="simulator" anchor="value-sources">simulator value-sources</HelpAnchorLink> reference).</li>
           <li><strong>Value source</strong> — Hold, Device preset, Generator, or Route, each with its own parameters (below).</li>
+          <li><strong>Scaling</strong> (numeric registers) — a unit label plus <strong>Scale</strong>, <strong>Offset</strong> and <strong>Decimals</strong>, so a raw 235 can read as 23.5 °C (value = raw × scale + offset). Scale can't be zero. Empty fields mean the defaults (scale 1, offset 0, automatic decimals). Generator and preset min/max are entered in these units, and the unit shows in the register list (for example "sine 20–30 °C"). Bit banks have no scaling.</li>
         </ul>
         <div className="rounded-xl border border-slate-200 bg-slate-50 p-4 dark:border-slate-800/60 dark:bg-slate-900/30">
           <p className="text-sm font-semibold uppercase tracking-wide text-emerald-700 dark:text-emerald-300">Example — build a power meter</p>

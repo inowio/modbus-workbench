@@ -74,6 +74,8 @@ describe("templateEditorUtils", () => {
     expect(sourceSummary(reg(0, "u16", 3, { valueSource: "generator", sourceParams: '{"kind":"ramp","min":0,"max":5,"periodMs":1500}' }))).toBe("ramp 0–5 · 1500 ms");
     expect(sourceSummary(reg(0, "u16", 3, { valueSource: "device", sourceParams: '{"preset":"temperature","min":0,"max":100}' }))).toBe("preset temperature");
     expect(sourceSummary(reg(0, "u16", 3, { valueSource: "route", sourceParams: '{"slaveUnitId":3,"functionCode":3,"address":257}' }))).toBe("route → unit 3 · FC3 @257");
+    expect(sourceSummary(reg(0, "u16", 3, { unit: "°C", valueSource: "generator", sourceParams: '{"kind":"sine","min":20,"max":30}' }))).toBe("sine 20–30 °C");
+    expect(sourceSummary(reg(0, "u16", 3, { unit: "°C", valueSource: "generator", sourceParams: '{"kind":"sine","min":20,"max":30,"periodMs":4000}' }))).toBe("sine 20–30 °C · 4 s");
   });
 });
 

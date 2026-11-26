@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 
-import UnitPicker from "../pages/analyzer/signalEditor/UnitPicker";
 import { fmtAddr, type AddrFmt } from "./ruleTargets";
-import { engFromRaw, formatEng, rawFromEng, registerScaling } from "./scaling";
+import { engFromRaw, rawFromEng, registerScaling } from "./scaling";
+import ScalingFields, { EMPTY_SCALING_TEXT, parseOptionalNumber, scalingTexts, validateScaling, type ScalingText } from "./ScalingFields";
 import { rwLabel, type PageRegister } from "./simFilters";
 import { addressConflict, parseAddressInput } from "./simRegister";
 import { buildPeriodicParams, initialPeriodText, parseSourceParams, periodPlaceholder } from "./sourceParams";
@@ -78,24 +78,6 @@ function parseIntText(text: string, min: number, max: number): number | null {
   if (!/^\d+$/.test(t)) return null;
   const n = Number(t);
   return n >= min && n <= max ? n : null;
-}
-
-type ScalingText = { scale: string; offset: string; decimals: string };
-
-function scalingTexts(r: PageRegister): ScalingText {
-  return {
-    scale: r.scale == null ? "" : String(r.scale),
-    offset: r.scaleOffset == null ? "" : String(r.scaleOffset),
-    decimals: r.decimals == null ? "" : String(r.decimals),
-  };
-}
-
-/** Empty = default (null); otherwise a finite number, else undefined (invalid). */
-function parseOptionalNumber(text: string): number | null | undefined {
-  const t = text.trim();
-  if (t === "") return null;
-  const n = Number(t);
-  return Number.isFinite(n) ? n : undefined;
 }
 
 /** Engineering text for a raw value, trimmed of float noise. */
@@ -185,7 +167,7 @@ export default function RegisterInspector(props: RegisterInspectorProps) {
   // Whether the user typed a period themselves (so switching source keeps it).
   const [periodTouched, setPeriodTouched] = useState(false);
   // Scaling fields are typed as text; empty means "default" (stored as null).
-  const [scalingText, setScalingText] = useState<ScalingText>(() => (register ? scalingTexts(register) : { scale: "", offset: "", decimals: "" }));
+  const [scalingText, setScalingText] = useState<ScalingText>(() => (register ? scalingTexts(register) : EMPTY_SCALING_TEXT));
   // Hold value as typed in engineering units (null = derive from the raw value).
   const [holdText, setHoldText] = useState<string | null>(null);
 
@@ -267,22 +249,11 @@ export default function RegisterInspector(props: RegisterInspectorProps) {
       ? "Enter the update interval as a whole number of milliseconds (0 = default)."
       : null;
   const isBitBank = reg.functionCode === 1 || reg.functionCode === 2;
-  const scaleParsed = parseOptionalNumber(scalingText.scale);
-  const offsetParsed = parseOptionalNumber(scalingText.offset);
-  const decimalsParsed = parseOptionalNumber(scalingText.decimals);
-  const scaleError = isBitBank
-    ? null
-    : scaleParsed === undefined
-      ? "Scale must be a number."
-      : scaleParsed === 0
-        ? "Scale can't be zero."
-        : null;
-  const offsetError = !isBitBank && offsetParsed === undefined ? "Offset must be a number." : null;
-  const decimalsError =
-    !isBitBank && (decimalsParsed === undefined || (decimalsParsed !== null && (!Number.isInteger(decimalsParsed) || decimalsParsed < 0 || decimalsParsed > 6)))
-      ? "Decimals must be a whole number from 0 to 6 (or empty for automatic)."
-      : null;
-  const scalingError = scaleError ?? offsetError ?? decimalsError;
+  const scalingCheck = validateScaling(scalingText, isBitBank);
+  const scaleParsed = scalingCheck.scale;
+  const offsetParsed = scalingCheck.offset;
+  const decimalsParsed = scalingCheck.decimals;
+  const scalingError = scalingCheck.error;
   const blocked = addrError !== null || unitError !== null || conflict !== null || intervalError !== null || scalingError !== null;
 
   const set = (patch: Partial<PageRegister>) => setReg((r) => (r ? { ...r, ...patch } : r));
@@ -327,7 +298,7 @@ export default function RegisterInspector(props: RegisterInspectorProps) {
       patch.scaleOffset = null;
       patch.decimals = null;
       patch.unit = null;
-      setScalingText({ scale: "", offset: "", decimals: "" });
+      setScalingText(EMPTY_SCALING_TEXT);
     }
     if (bit && reg.valueSource !== "hold") patch.valueSource = "hold";
     set(patch);
@@ -521,60 +492,17 @@ export default function RegisterInspector(props: RegisterInspectorProps) {
               <span className="py-1 text-sm text-slate-700 dark:text-slate-200">{accessLabel(reg.functionCode)}</span>
             </div>
             {isBitBank ? null : (
-              <fieldset className="col-span-2 space-y-2 rounded-lg border border-slate-200 p-3 dark:border-slate-800">
-                <legend className="px-1 text-xs font-semibold text-slate-600 dark:text-slate-300">Scaling</legend>
-                <div className="grid grid-cols-2 gap-2">
-                  <div className={`col-span-2 ${LABEL_CLASS}`}>
-                    <label htmlFor="register-unit">Unit</label>
-                    <UnitPicker id="register-unit" value={reg.unit ?? ""} onChange={(u) => set({ unit: u })} />
-                  </div>
-                  <label className={LABEL_CLASS}>
-                    Scale
-                    <input
-                      aria-label="Scale"
-                      type="text"
-                      inputMode="decimal"
-                      value={scalingText.scale}
-                      placeholder="1"
-                      aria-invalid={scaleError ? "true" : undefined}
-                      onChange={(e) => editScaling("scale", e.target.value)}
-                      className={`${INPUT_CLASS} ${scaleError ? "border-rose-500 dark:border-rose-500" : ""}`}
-                    />
-                  </label>
-                  <label className={LABEL_CLASS}>
-                    Offset
-                    <input
-                      aria-label="Offset"
-                      type="text"
-                      inputMode="decimal"
-                      value={scalingText.offset}
-                      placeholder="0"
-                      aria-invalid={offsetError ? "true" : undefined}
-                      onChange={(e) => editScaling("offset", e.target.value)}
-                      className={`${INPUT_CLASS} ${offsetError ? "border-rose-500 dark:border-rose-500" : ""}`}
-                    />
-                  </label>
-                  <label className={LABEL_CLASS}>
-                    Decimals
-                    <input
-                      aria-label="Decimals"
-                      type="text"
-                      inputMode="numeric"
-                      value={scalingText.decimals}
-                      placeholder="auto"
-                      aria-invalid={decimalsError ? "true" : undefined}
-                      onChange={(e) => editScaling("decimals", e.target.value)}
-                      className={`${INPUT_CLASS} ${decimalsError ? "border-rose-500 dark:border-rose-500" : ""}`}
-                    />
-                  </label>
-                </div>
-                <p className="text-[11px] text-slate-500 dark:text-slate-400">
-                  {scalingError ? "—" : `raw ${previewRaw} = ${formatEng(engFromRaw(previewRaw, sc.scale, sc.offset), sc.decimals, sc.unit, sc.trim)}`}
-                </p>
-                <p className="text-[11px] text-slate-500 dark:text-slate-400">
-                  Value = raw × scale + offset. Generator, preset and rule values are entered in these units.
-                </p>
-              </fieldset>
+              <ScalingFields
+                dataType={reg.dataType}
+                unit={reg.unit}
+                onUnitChange={(u) => set({ unit: u })}
+                text={scalingText}
+                onTextChange={editScaling}
+                check={scalingCheck}
+                previewRaw={previewRaw}
+                labelClass={LABEL_CLASS}
+                inputClass={INPUT_CLASS}
+              />
             )}
           </div>
         )}

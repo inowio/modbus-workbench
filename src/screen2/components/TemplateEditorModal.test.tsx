@@ -231,5 +231,69 @@ describe("TemplateEditorModal", () => {
     fireEvent.click(screen.getByRole("button", { name: /^Register 2: r1, offset 1, holding$/ }));
     expect(screen.getByLabelText("Alias 1")).toHaveValue("r1");
   });
-});
 
+  describe("scaling", () => {
+    const scaled = { scale: 0.1, scaleOffset: -40, decimals: 1, unit: "°C" };
+    const save = () => fireEvent.click(screen.getByRole("button", { name: /save device/i }));
+
+    it("shows the Scaling block for a numeric register and hides it for a bit bank", () => {
+      render(<TemplateEditorModal open initial={withRegs([reg(0, scaled), reg(1, { bank: 1, dataType: "bool" })])} takenKeys={[]} onClose={vi.fn()} onSave={vi.fn()} />);
+      expect(screen.getByLabelText("Scale 0")).toHaveValue("0.1");
+      expect(screen.getByLabelText("Scaling offset 0")).toHaveValue("-40");
+      expect(screen.getByLabelText("Decimals 0")).toHaveValue("1");
+      expect(screen.getByText("raw 0 = -40.0 °C")).toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: /^Register 2:/ }));
+      expect(screen.queryByLabelText("Scale 1")).not.toBeInTheDocument();
+    });
+
+    it("round-trips scaling unchanged through edit and save", () => {
+      const onSave = vi.fn();
+      render(<TemplateEditorModal open initial={withRegs([reg(0, scaled)])} takenKeys={[]} onClose={vi.fn()} onSave={onSave} />);
+      fireEvent.change(screen.getByLabelText("Alias 0"), { target: { value: "Temp" } });
+      save();
+      expect(onSave.mock.calls[0][0].registers[0]).toMatchObject(scaled);
+    });
+
+    it("edits scale, offset and decimals and clears them back to absent", () => {
+      const onSave = vi.fn();
+      render(<TemplateEditorModal open initial={withRegs([reg(0, scaled)])} takenKeys={[]} onClose={vi.fn()} onSave={onSave} />);
+      fireEvent.change(screen.getByLabelText("Scale 0"), { target: { value: "0.5" } });
+      save();
+      expect(onSave.mock.calls[0][0].registers[0]).toMatchObject({ scale: 0.5, scaleOffset: -40, decimals: 1 });
+      for (const f of ["Scale 0", "Scaling offset 0", "Decimals 0"]) fireEvent.change(screen.getByLabelText(f), { target: { value: "" } });
+      save();
+      const out = onSave.mock.calls[1][0].registers[0];
+      expect(out).not.toHaveProperty("scale");
+      expect(out).not.toHaveProperty("scaleOffset");
+      expect(out).not.toHaveProperty("decimals");
+    });
+
+    it("saves an unscaled template without adding scaling fields or nulls", () => {
+      const onSave = vi.fn();
+      render(<TemplateEditorModal open initial={withRegs([reg(0)])} takenKeys={[]} onClose={vi.fn()} onSave={onSave} />);
+      fireEvent.change(screen.getByLabelText("Alias 0"), { target: { value: "Temp" } });
+      save();
+      const out = onSave.mock.calls[0][0].registers[0];
+      for (const k of ["scale", "scaleOffset", "decimals", "unit"]) expect(out).not.toHaveProperty(k);
+    });
+
+    it("blocks Save with a reason while Scale is 0", () => {
+      const onSave = vi.fn();
+      render(<TemplateEditorModal open initial={withRegs([reg(0, scaled)])} takenKeys={[]} onClose={vi.fn()} onSave={onSave} />);
+      fireEvent.change(screen.getByLabelText("Scale 0"), { target: { value: "0" } });
+      expect(screen.getByRole("button", { name: /save device/i })).toBeDisabled();
+      expect(screen.getAllByText("Scale can't be zero.").length).toBeGreaterThan(0);
+      fireEvent.change(screen.getByLabelText("Scale 0"), { target: { value: "2" } });
+      expect(screen.getByRole("button", { name: /save device/i })).toBeEnabled();
+    });
+
+    it("drops scaling when the register becomes a bit bank", () => {
+      const onSave = vi.fn();
+      render(<TemplateEditorModal open initial={withRegs([reg(0, scaled)])} takenKeys={[]} onClose={vi.fn()} onSave={onSave} />);
+      fireEvent.change(screen.getByLabelText("Bank 0"), { target: { value: "1" } });
+      save();
+      const out = onSave.mock.calls[0][0].registers[0];
+      for (const k of ["scale", "scaleOffset", "decimals", "unit"]) expect(out).not.toHaveProperty(k);
+    });
+  });
+});

@@ -14,6 +14,10 @@ export type TemplateRegister = {
   displayFormat?: string | null;
   intervalMs?: number;
   holdValue?: number;
+  // Engineering-unit scaling (value = raw * scale + scaleOffset); absent = defaults.
+  scale?: number;
+  scaleOffset?: number;
+  decimals?: number;
 };
 
 export type DeviceTemplate = {
