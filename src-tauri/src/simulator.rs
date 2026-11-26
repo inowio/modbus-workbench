@@ -307,6 +307,11 @@ pub struct DynReg {
     pub byte_order: String,
     pub kind: DynKind,
     pub interval_ms: f64,
+    /// Engineering scale/offset of the register (engineering = raw * scale +
+    /// scale_offset). Generators/presets produce engineering values; routes
+    /// keep their own source-side transform inside `DynKind::Route`.
+    pub scale: f64,
+    pub scale_offset: f64,
 }
 
 fn json_f64(v: &serde_json::Value, key: &str, default: f64) -> f64 {
@@ -353,6 +358,7 @@ pub fn parse_dynamic(reg: &SimRegister) -> Option<DynReg> {
     Some(DynReg {
         unit: reg.unit_id as u8, bank: reg.function_code as u8, address: reg.address as u16,
         data_type: reg.data_type.clone(), byte_order: reg.byte_order.clone(), kind, interval_ms,
+        scale: reg.scale.unwrap_or(1.0), scale_offset: reg.scale_offset.unwrap_or(0.0),
     })
 }
 
@@ -369,6 +375,13 @@ pub fn dyn_value(d: &DynReg, elapsed_ms: f64) -> f64 {
         // by `dyn_value`; this arm only exists to keep the match exhaustive.
         DynKind::Route { .. } => 0.0,
     }
+}
+
+/// Raw register value of a generator/preset register: the engineering value
+/// from `dyn_value` converted through the register's scale/offset and clamped
+/// to its data type (`raw_from_eng`; identity at scale 1 / offset 0).
+pub fn dyn_raw_value(d: &DynReg, elapsed_ms: f64) -> f64 {
+    crate::sim_scaling::raw_from_eng(dyn_value(d, elapsed_ms), d.scale, d.scale_offset, &d.data_type)
 }
 
 /// Overwrite `words` at consecutive addresses starting at `address`, but ONLY
@@ -1148,7 +1161,7 @@ impl SimEngine {
                         for d in dynamics.iter() {
                             if matches!(d.kind, DynKind::Route { .. }) { continue; }
                             if !take_due(&mut next_due, d, elapsed) { continue; }
-                            if let Ok(words) = encode_value(&d.data_type, &d.byte_order, dyn_value(d, elapsed)) {
+                            if let Ok(words) = encode_value(&d.data_type, &d.byte_order, dyn_raw_value(d, elapsed)) {
                                 updates.push((d.unit, d.bank, d.address, words));
                             }
                         }
@@ -2972,7 +2985,7 @@ pub fn registers_to_banks(regs: &[SimRegister]) -> HashMap<u8, SimBanks> {
         let addr = reg.address as u16;
         if let Some(d) = parse_dynamic(reg) {
             // device/generator: place the t=0 value
-            let val = dyn_value(&d, 0.0);
+            let val = dyn_raw_value(&d, 0.0);
             match encode_value(&d.data_type, &d.byte_order, val) {
                 Ok(words) => place_words(&mut out, unit, bank, addr, &words),
                 Err(e) => log::warn!(
@@ -3106,7 +3119,7 @@ fn validate_register(reg: &SimRegister) -> Result<(), String> {
     }
     if let Some(off) = reg.scale_offset {
         if !off.is_finite() {
-            return Err("offset must be a finite number".into());
+            return Err("scale offset must be a finite number".into());
         }
     }
     if !matches!(
@@ -3367,7 +3380,7 @@ fn apply_to_running(state: &tauri::State<'_, SimulatorState>, ws: &str, reg: &Si
             // there's no illegal-address gap before the next tick.
             // `refresh_running_config` updates the tick's live list so it then
             // animates without a Stop/Start.
-            if let Ok(words) = encode_value(&d.data_type, &d.byte_order, dyn_value(&d, 0.0)) {
+            if let Ok(words) = encode_value(&d.data_type, &d.byte_order, dyn_raw_value(&d, 0.0)) {
                 engine.apply_words(unit, bank, addr, &words);
             }
         }
@@ -4687,7 +4700,7 @@ mod tests {
         let d = DynReg {
             unit: 1, bank: 3, address: 0, data_type: "u16".into(), byte_order: "ABCD".into(),
             kind: DynKind::Route { slave_unit: 1, connection_kind: "tcp".into(), src_fc: 3, src_addr: 0, count: 1, scale: 0.1, offset: -40.0, src_byte_order: "ABCD".into() },
-            interval_ms: 1000.0,
+            interval_ms: 1000.0, scale: 1.0, scale_offset: 0.0,
         };
         assert_eq!(transform_route_words(&d, &[700], 0.1, -40.0, "ABCD"), vec![30]);
         // Identity transform mirrors verbatim.
@@ -4821,7 +4834,7 @@ mod tests {
         // register's t=0 words (the only path that creates addresses), then
         // hand the tick its new live list.
         let d = parse_dynamic(&reg).unwrap();
-        engine.apply_words(1, 4, 0, &encode_value(&d.data_type, &d.byte_order, dyn_value(&d, 0.0)).unwrap());
+        engine.apply_words(1, 4, 0, &encode_value(&d.data_type, &d.byte_order, dyn_raw_value(&d, 0.0)).unwrap());
         engine.set_dynamics(vec![d]);
 
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
@@ -4979,6 +4992,7 @@ mod tests {
         let route = DynReg {
             unit: 1, bank: 3, address: 0, data_type: "u16".into(), byte_order: "ABCD".into(), interval_ms: 50.0,
             kind: DynKind::Route { slave_unit: 7, connection_kind: "tcp".into(), src_fc: 3, src_addr: 0, count: 1, scale: 1.0, offset: 0.0, src_byte_order: "ABCD".into() },
+            scale: 1.0, scale_offset: 0.0,
         };
         // Start seeds every configured register (route ones at 0), as
         // `registers_to_banks` does; the route only ever updates it.
@@ -5340,7 +5354,7 @@ mod tests {
         let mk = |addr: u16, interval: f64| DynReg {
             unit: 1, bank: 3, address: addr, data_type: "u16".into(), byte_order: "ABCD".into(),
             kind: DynKind::Generator { kind: "sine".into(), params: GenParams { min: 0.0, max: 1.0, period_ms: 1000.0 }, seed: 0 },
-            interval_ms: interval,
+            interval_ms: interval, scale: 1.0, scale_offset: 0.0,
         };
         let mut due: HashMap<(u8, u8, u16), Due> = HashMap::new();
         due.insert((1, 3, 0), Due { at: 500.0, period: 100.0 }); // unchanged → kept
@@ -5484,6 +5498,7 @@ mod tests {
         let route = DynReg {
             unit: 1, bank: 3, address: 0, data_type: "u16".into(), byte_order: "ABCD".into(), interval_ms: 50.0,
             kind: DynKind::Route { slave_unit: 7, connection_kind: "rtu".into(), src_fc: 3, src_addr: 0, count: 1, scale: 1.0, offset: 0.0, src_byte_order: "ABCD".into() },
+            scale: 1.0, scale_offset: 0.0,
         };
         let mut bbanks = HashMap::new();
         place_words(&mut bbanks, 1, 3, 0, &[0]);
@@ -5839,6 +5854,7 @@ mod tests {
         DynReg {
             unit: 1, bank: 4, address, data_type: "u16".into(), byte_order: "ABCD".into(), interval_ms: 20.0,
             kind: DynKind::Route { slave_unit: 7, connection_kind: "tcp".into(), src_fc: 3, src_addr, count: 1, scale: 1.0, offset: 0.0, src_byte_order: "ABCD".into() },
+            scale: 1.0, scale_offset: 0.0,
         }
     }
 
@@ -5972,5 +5988,127 @@ mod tests {
         let err = validate_register(&SimRegister { scale: Some(0.0), ..ok.clone() }).unwrap_err();
         assert!(err.contains("scale"));
         assert!(validate_register(&SimRegister { scale: None, scale_offset: None, ..ok }).is_ok());
+    }
+
+    // ── engineering units: generators and presets ────────────────────────
+
+    fn gen_reg(data_type: &str, value_source: &str, params: &str, scale: Option<f64>, scale_offset: Option<f64>) -> SimRegister {
+        SimRegister {
+            id: 1, unit_id: 1, function_code: 4, address: 0, alias: "".into(), data_type: data_type.into(),
+            hold_value: 0, value_source: value_source.into(), byte_order: "ABCD".into(),
+            source_params: params.into(), interval_ms: 100, sort_order: 0, device_instance_id: None,
+            unit: None, display_format: None, scale, scale_offset, decimals: None,
+        }
+    }
+
+    fn raw_words(reg: &SimRegister, t: f64) -> Vec<u16> {
+        let d = parse_dynamic(reg).unwrap();
+        encode_value(&d.data_type, &d.byte_order, dyn_raw_value(&d, t)).unwrap()
+    }
+
+    #[test]
+    fn generators_with_default_scaling_are_unchanged() {
+        let gens = ["sine", "ramp", "decrement", "step", "random", "toggle"];
+        let presets = ["temperature", "humidity", "vibration", "discrete", "counter", "analog"];
+        for dt in ["u16", "i16", "u32", "f32"] {
+            let mut cases: Vec<SimRegister> = Vec::new();
+            for g in gens {
+                let p = format!("{{\"kind\":\"{g}\",\"min\":0,\"max\":50,\"periodMs\":1000}}");
+                cases.push(gen_reg(dt, "generator", &p, None, None));
+            }
+            for pr in presets {
+                let p = format!("{{\"preset\":\"{pr}\",\"min\":20,\"max\":30}}");
+                cases.push(gen_reg(dt, "device", &p, None, None));
+            }
+            for reg in cases {
+                let d = parse_dynamic(&reg).unwrap();
+                for t in [0.0, 137.0, 250.0, 999.0, 1500.0, 7777.0, 30000.0] {
+                    let before = encode_value(&d.data_type, &d.byte_order, dyn_value(&d, t)).unwrap();
+                    assert_eq!(raw_words(&reg, t), before, "{dt} {} at t={t}", reg.source_params);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sine_in_engineering_units_maps_to_raw_range() {
+        let reg = gen_reg("u16", "generator", "{\"kind\":\"sine\",\"min\":20,\"max\":30,\"periodMs\":1000}", Some(0.1), None);
+        let (mut lo, mut hi) = (u16::MAX, 0u16);
+        for t in 0..1000 {
+            let w = raw_words(&reg, t as f64)[0];
+            assert!((200..=300).contains(&w), "raw {w} out of range at t={t}");
+            lo = lo.min(w);
+            hi = hi.max(w);
+        }
+        assert!(hi >= 299, "max {hi}");
+        assert!(lo <= 201, "min {lo}");
+    }
+
+    #[test]
+    fn step_counts_one_engineering_unit_per_period() {
+        let reg = gen_reg("u16", "generator", "{\"kind\":\"step\",\"min\":20,\"max\":30,\"periodMs\":1000}", Some(0.1), None);
+        assert_eq!(raw_words(&reg, 0.0), vec![200]);
+        assert_eq!(raw_words(&reg, 1000.0), vec![210]);
+        assert_eq!(raw_words(&reg, 2000.0), vec![220]);
+    }
+
+    #[test]
+    fn f32_generator_with_scale_is_not_rounded() {
+        let reg = gen_reg("f32", "generator", "{\"kind\":\"ramp\",\"min\":0,\"max\":10,\"periodMs\":1000}", Some(0.5), None);
+        let at = |t: f64| decode_value("f32", "ABCD", &raw_words(&reg, t)).unwrap();
+        assert_eq!(at(250.0), 5.0); // eng 2.5
+        assert_eq!(at(275.0), 5.5); // eng 2.75
+    }
+
+    #[test]
+    fn scale_offset_flows_into_generators() {
+        // eng = raw * 0.5 - 40 → raw = (eng + 40) / 0.5; eng 0 → 80.
+        let reg = gen_reg("u16", "generator", "{\"kind\":\"ramp\",\"min\":0,\"max\":10,\"periodMs\":1000}", Some(0.5), Some(-40.0));
+        assert_eq!(raw_words(&reg, 0.0), vec![80]);
+        assert_eq!(raw_words(&reg, 500.0), vec![90]);
+    }
+
+    #[test]
+    fn upgrade_from_db_without_scale_columns_keeps_values() {
+        let dir = temp_dir("upgrade-scale");
+        let db = dir.join("workspace.db");
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sim_devices (id INTEGER PRIMARY KEY AUTOINCREMENT, template_key TEXT, name TEXT NOT NULL,
+                    unit_id INTEGER NOT NULL, base_address INTEGER, params TEXT, enabled INTEGER NOT NULL DEFAULT 1,
+                    sort_order INTEGER NOT NULL DEFAULT 0);
+                 CREATE TABLE sim_registers (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    device_instance_id INTEGER REFERENCES sim_devices(id) ON DELETE CASCADE,
+                    unit_id INTEGER NOT NULL, function_code INTEGER NOT NULL, address INTEGER NOT NULL,
+                    alias TEXT NOT NULL DEFAULT '', data_type TEXT NOT NULL DEFAULT 'u16', byte_order TEXT,
+                    display_format TEXT, unit TEXT,
+                    value_source TEXT NOT NULL DEFAULT 'hold', source_params TEXT, interval_ms INTEGER,
+                    hold_value INTEGER NOT NULL DEFAULT 0, sort_order INTEGER NOT NULL DEFAULT 0,
+                    UNIQUE(unit_id, function_code, address));
+                 INSERT INTO sim_registers (unit_id, function_code, address, data_type, byte_order, value_source, source_params, interval_ms)
+                    VALUES (1, 4, 0, 'u16', 'ABCD', 'generator', '{\"kind\":\"ramp\",\"min\":0,\"max\":100,\"periodMs\":1000}', 100);",
+            ).unwrap();
+        }
+        crate::db::ensure_workspace_db(&dir, "workspace.db").unwrap();
+        let conn = Connection::open(&db).unwrap();
+        for col in ["scale", "scale_offset", "decimals"] {
+            let n: i64 = conn
+                .query_row("SELECT COUNT(*) FROM pragma_table_info('sim_registers') WHERE name = ?1", [col], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n, 1, "column {col} added");
+        }
+        let regs = db_list_registers(&conn).unwrap();
+        assert_eq!(regs.len(), 1);
+        assert_eq!((regs[0].scale, regs[0].scale_offset, regs[0].decimals), (None, None, None));
+        let d = parse_dynamic(&regs[0]).unwrap();
+        assert_eq!((d.scale, d.scale_offset), (1.0, 0.0));
+        for t in [0.0, 250.0, 500.0, 999.0] {
+            let before = encode_value("u16", "ABCD", dyn_value(&d, t)).unwrap();
+            assert_eq!(raw_words(&regs[0], t), before, "t={t}");
+        }
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

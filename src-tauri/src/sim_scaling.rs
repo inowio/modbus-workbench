@@ -1,4 +1,5 @@
-// Helpers are consumed by the generator/rule tasks that follow; drop this allow then.
+// Only `raw_from_eng` is consumed so far; the rest (eng_from_raw, effective_decimals,
+// round_to, RegMeta*, build_reg_meta) is used by the rule/value-display tasks that follow.
 #![allow(dead_code)]
 
 //! Engineering-unit scaling helpers for simulator registers.
@@ -39,6 +40,7 @@ fn type_range(data_type: &str) -> Option<(f64, f64)> {
 /// offset == 0, where the identity is preserved) and clamped to the type's
 /// range; float types are left unrounded. Scale 0 is treated as 1.
 pub fn raw_from_eng(eng: f64, scale: f64, offset: f64, data_type: &str) -> f64 {
+    let eng = if eng.is_finite() { eng } else { 0.0 };
     let scale = if scale == 0.0 { 1.0 } else { scale };
     let identity = scale == 1.0 && offset == 0.0;
     let mut raw = (eng - offset) / scale;
@@ -184,5 +186,16 @@ mod tests {
         let m = build_reg_meta(&[mk(Some(0.1), Some(-40.0), None)]);
         let v = m.get(&(3, 3, 10)).unwrap();
         assert_eq!((v.scale, v.offset, v.decimals), (0.1, -40.0, 1));
+    }
+
+    #[test]
+    fn raw_from_eng_maps_non_finite_to_zero() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(raw_from_eng(bad, 0.1, 0.0, "u16"), 0.0);
+            assert_eq!(raw_from_eng(bad, 1.0, 0.0, "u16"), 0.0);
+            assert_eq!(raw_from_eng(bad, 0.5, 0.0, "f32"), 0.0);
+        }
+        // eng 0 with offset 40, scale 0.5: (0 - 40) / 0.5 = -80.
+        assert_eq!(raw_from_eng(f64::NAN, 0.5, 40.0, "i16"), -80.0);
     }
 }
