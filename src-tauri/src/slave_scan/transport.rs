@@ -1,6 +1,7 @@
 //! Real transports for the scan engine: serial RTU through `tokio_serial`
 //! and Modbus TCP through `tokio_modbus`.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
@@ -19,7 +20,7 @@ use tokio_modbus::{Error, ProtocolError, Slave};
 use tokio_serial::SerialPortBuilderExt;
 
 use super::engine::{Connector, OpenError, Opener, Prober};
-use super::types::{ProbeOutcome, SerialParams};
+use super::types::{format_settings, ProbeOutcome, SerialParams};
 use crate::modbus::{
     parse_serial_data_bits, parse_serial_flow_control, parse_serial_parity,
     parse_serial_stop_bits,
@@ -267,8 +268,47 @@ where
     }
 }
 
-/// Opens serial ports for the scan, one per settings combination.
-pub struct SerialOpener;
+/// Opens the scan's serial ports: each port once, re-configured for every
+/// further sweep setting (see [`PortCache`]). Dropping it closes the ports.
+pub struct SerialOpener {
+    cache: PortCache<tokio_serial::SerialStream>,
+}
+
+impl SerialOpener {
+    pub fn new() -> Self {
+        Self { cache: PortCache::new() }
+    }
+}
+
+impl Default for SerialOpener {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Opens `port` at `params` on the blocking pool, retrying while Windows still reports it busy.
+async fn open_serial(port: String, params: SerialParams) -> Result<tokio_serial::SerialStream, OpenError> {
+    let builder = serial_builder(&port, &params).map_err(OpenError::Failed)?;
+    retry_while_busy(
+        || {
+            let builder = builder.clone();
+            let port = port.clone();
+            async move {
+                // If the wait runs out, the blocking open still finishes on
+                // its own and the stream it returns is dropped, closing the port.
+                timeout(
+                    OPEN_TIMEOUT,
+                    tokio::task::spawn_blocking(move || builder.open_native_async()),
+                )
+                .await
+                .map_err(|_| OpenError::TimedOut(format!("timed out opening {port}")))?
+                .map_err(|e| OpenError::Failed(format!("port open task failed: {e}")))
+            }
+        },
+        &BUSY_PORT_RETRY,
+    )
+    .await
+}
 
 impl Opener for SerialOpener {
     type P = SerialProber;
@@ -281,27 +321,15 @@ impl Opener for SerialOpener {
         let port = port.to_string();
         let params = params.clone();
         async move {
-            let builder = serial_builder(&port, &params).map_err(OpenError::Failed)?;
-            let stream = retry_while_busy(
-                || {
-                    let builder = builder.clone();
-                    let port = port.clone();
-                    async move {
-                        // If the wait runs out, the blocking open still finishes on
-                        // its own and the stream it returns is dropped, closing the port.
-                        timeout(
-                            OPEN_TIMEOUT,
-                            tokio::task::spawn_blocking(move || builder.open_native_async()),
-                        )
-                        .await
-                        .map_err(|_| OpenError::TimedOut(format!("timed out opening {port}")))?
-                        .map_err(|e| OpenError::Failed(format!("port open task failed: {e}")))
-                    }
-                },
-                &BUSY_PORT_RETRY,
-            )
-            .await?;
-            Ok(SerialProber::attach(stream))
+            let reconfig_params = params.clone();
+            let open_port = port.clone();
+            self.cache
+                .prober(
+                    &port,
+                    move |stream| reconfigure_serial(stream, &reconfig_params),
+                    move || open_serial(open_port, params),
+                )
+                .await
         }
     }
 }
@@ -314,15 +342,101 @@ pub struct SerialProber {
 
 impl SerialProber {
     /// Speaks Modbus RTU over `stream`, counting the bytes that come back.
+    #[cfg(test)]
     pub fn attach<T>(stream: T) -> Self
     where
         T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let bytes_read = Arc::new(AtomicU64::new(0));
         let shared = SharedStream::new(CountingStream::new(stream, bytes_read.clone()));
+        Self::over(shared, bytes_read)
+    }
+
+    /// Speaks Modbus RTU over an already shared stream (a port kept open across sweep settings).
+    fn over<T>(shared: SharedStream<CountingStream<T>>, bytes_read: Arc<AtomicU64>) -> Self
+    where
+        T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         let attach = move || client::rtu::attach_slave(shared.clone(), Slave(1));
         Self { session: Session::new(Box::new(attach)), bytes_read }
     }
+}
+
+/// A port the scanner opened, kept until the scan ends.
+type OpenPort<T> = (SharedStream<CountingStream<T>>, Arc<AtomicU64>);
+
+/// Hands out probers for serial ports. The first setting opens the port; every
+/// later setting on the same port re-configures the open port instead of
+/// closing and re-opening it. On Windows a closed COM port is released
+/// asynchronously (and some USB adapters take seconds), so an immediate
+/// re-open is refused with "Access is denied". Ports close when the opener is
+/// dropped, i.e. when the scan ends.
+struct PortCache<T> {
+    ports: Mutex<HashMap<String, OpenPort<T>>>,
+}
+
+impl<T> PortCache<T>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    fn new() -> Self {
+        Self { ports: Mutex::new(HashMap::new()) }
+    }
+
+    fn cached(&self, port: &str) -> Option<OpenPort<T>> {
+        let ports = self.ports.lock().unwrap_or_else(|e| e.into_inner());
+        ports.get(port).map(|(s, b)| (s.clone(), b.clone()))
+    }
+
+    fn keep(&self, port: &str, open: OpenPort<T>) {
+        let mut ports = self.ports.lock().unwrap_or_else(|e| e.into_inner());
+        ports.insert(port.to_string(), open);
+    }
+
+    /// A prober for `port` at `params`: re-configures a port already open
+    /// (via `reconfigure`), otherwise opens it (via `open`) and keeps it.
+    async fn prober<R, O, Fut>(
+        &self,
+        port: &str,
+        reconfigure: R,
+        open: O,
+    ) -> Result<SerialProber, OpenError>
+    where
+        R: FnOnce(&mut T) -> Result<(), String>,
+        O: FnOnce() -> Fut,
+        Fut: Future<Output = Result<T, OpenError>>,
+    {
+        if let Some((shared, bytes_read)) = self.cached(port) {
+            reconfigure(&mut shared.lock().inner).map_err(OpenError::Failed)?;
+            return Ok(SerialProber::over(shared, bytes_read));
+        }
+        let stream = open().await?;
+        let bytes_read = Arc::new(AtomicU64::new(0));
+        let shared = SharedStream::new(CountingStream::new(stream, bytes_read.clone()));
+        self.keep(port, (shared.clone(), bytes_read.clone()));
+        Ok(SerialProber::over(shared, bytes_read))
+    }
+}
+
+/// Applies `params` to an open port and drops anything still buffered from the previous setting.
+fn reconfigure_serial(stream: &mut tokio_serial::SerialStream, params: &SerialParams) -> Result<(), String> {
+    use tokio_serial::SerialPort;
+    let setting = |e: tokio_serial::Error| format!("could not apply {}: {e}", format_settings(params));
+    stream.set_baud_rate(params.baud).map_err(setting)?;
+    stream
+        .set_parity(parse_serial_parity(Some(params.parity.clone()))?)
+        .map_err(setting)?;
+    stream
+        .set_data_bits(parse_serial_data_bits(Some(i64::from(params.data_bits)))?)
+        .map_err(setting)?;
+    stream
+        .set_stop_bits(parse_serial_stop_bits(Some(i64::from(params.stop_bits)))?)
+        .map_err(setting)?;
+    stream
+        .set_flow_control(parse_serial_flow_control(Some(params.flow_control.clone()))?)
+        .map_err(setting)?;
+    stream.clear(tokio_serial::ClearBuffer::All).map_err(setting)?;
+    Ok(())
 }
 
 impl Prober for SerialProber {
@@ -500,6 +614,61 @@ mod tests {
             tokio_serial::ErrorKind::Io(io::ErrorKind::PermissionDenied),
             "Access is denied.",
         )
+    }
+
+    #[tokio::test]
+    async fn a_port_is_opened_once_and_reconfigured_for_later_settings() {
+        // A sweep must not close and re-open the port between settings (Windows
+        // refuses the re-open while the old handle is still being released).
+        let cache: PortCache<tokio::io::DuplexStream> = PortCache::new();
+        let opens = Arc::new(AtomicU64::new(0));
+        let reconfigs = Arc::new(AtomicU64::new(0));
+        let mut ends = Vec::new();
+        for _ in 0..3 {
+            let (o, r) = (opens.clone(), reconfigs.clone());
+            let (a, b) = tokio::io::duplex(64);
+            ends.push(b);
+            let prober = cache
+                .prober(
+                    "COM14",
+                    move |_s| {
+                        r.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    },
+                    move || {
+                        o.fetch_add(1, Ordering::SeqCst);
+                        async move { Ok(a) }
+                    },
+                )
+                .await;
+            assert!(prober.is_ok());
+            drop(prober); // the engine drops each setting's prober before the next
+        }
+        assert_eq!(opens.load(Ordering::SeqCst), 1);
+        assert_eq!(reconfigs.load(Ordering::SeqCst), 2);
+
+        // A different port is opened on its own.
+        let (a, _b) = tokio::io::duplex(64);
+        let other = cache.prober("COM5", |_s| Ok(()), move || async move { Ok(a) }).await;
+        assert!(other.is_ok());
+        assert_eq!(cache.ports.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_setting_the_port_rejects_is_an_open_error() {
+        let cache: PortCache<tokio::io::DuplexStream> = PortCache::new();
+        let (a, _b) = tokio::io::duplex(64);
+        assert!(cache.prober("COM14", |_s| Ok(()), move || async move { Ok(a) }).await.is_ok());
+        let second = cache
+            .prober(
+                "COM14",
+                |_s| Err("could not apply 1200 8N1: unsupported".to_string()),
+                || async { Err::<tokio::io::DuplexStream, _>(OpenError::Failed("must not reopen".into())) },
+            )
+            .await;
+        assert!(matches!(second, Err(OpenError::Failed(ref m)) if m.contains("could not apply 1200 8N1")));
+        // The port stays open for the next setting.
+        assert_eq!(cache.ports.lock().unwrap().len(), 1);
     }
 
     #[tokio::test(start_paused = true)]
@@ -907,7 +1076,7 @@ mod tests {
         let done = run_scan(
             scan,
             "ws".into(),
-            Arc::new(SerialOpener),
+            Arc::new(SerialOpener::new()),
             Some(Arc::new(connector(addr))),
             sink.clone(),
             cancel,

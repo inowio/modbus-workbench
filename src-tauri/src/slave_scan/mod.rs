@@ -275,7 +275,7 @@ pub async fn start_slave_scan(
         (flag, entry),
         scan,
         ws,
-        Arc::new(SerialOpener),
+        Arc::new(SerialOpener::new()),
         connector,
         sink,
         cancel,
