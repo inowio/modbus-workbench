@@ -32,6 +32,8 @@ use tokio_modbus::prelude::*;
 use tokio_modbus::server::tcp::{accept_tcp_connection, Server};
 use tokio_modbus::server::Service;
 
+use crate::sim_scaling::{build_reg_meta, eng_from_raw, round_to, RegMetaMap};
+
 /// Number of 16-bit words a data type occupies (1-, 2- and 4-word types).
 pub fn word_count(data_type: &str) -> usize {
     match data_type {
@@ -777,7 +779,8 @@ pub struct PendingAction {
 
 /// Bring per-rule runtime state in line with a hot-applied rule list: a rule
 /// that was removed, disabled, or changed in any way loses its `RuleState`
-/// (interval due time, last condition/value) and its queued delayed actions;
+/// (interval due time, last combined condition/value, per-condition deadband
+/// latches) and its queued delayed actions;
 /// an identical rule keeps both.
 pub fn reconcile_rules(
     prev: &[RuleDef],
@@ -896,6 +899,11 @@ pub struct SimEngine {
     // device) take effect immediately without a Stop/Start.
     dynamics: Arc<Mutex<Vec<DynReg>>>,
     rules: Arc<Mutex<Vec<RuleDef>>>,
+    // Register metadata (type/byte order/scale/decimals by unit, bank, start
+    // address) that rule conditions decode with. The tick clones the inner
+    // `Arc` under a short lock each iteration. Unlike dynamics/rules this is
+    // not replaced by `start`, so it can be set before the first tick.
+    reg_meta: Arc<Mutex<Arc<RegMetaMap>>>,
     // Observability: live client registry + event ring, and the wall-clock
     // start time (for uptime). `observer` persists across Start/Stop so the
     // event log is history; `started_at_ms` is set on Start, cleared on Stop.
@@ -1024,6 +1032,15 @@ impl SimEngine {
         }
     }
 
+    /// Replace the register metadata rule conditions decode with (built by
+    /// `build_reg_meta`). Takes effect on the next tick. Call it before
+    /// `start` so the first tick already sees it.
+    pub fn set_register_meta(&self, meta: RegMetaMap) {
+        if let Ok(mut g) = self.reg_meta.lock() {
+            *g = Arc::new(meta);
+        }
+    }
+
     pub async fn start<S: ValuesSink>(
         &mut self,
         app: S,
@@ -1126,6 +1143,7 @@ impl SimEngine {
         let tick_writes = writes.clone();
         let tick_dynamics = dynamics_arc.clone();
         let tick_rules = rules_arc.clone();
+        let tick_meta = self.reg_meta.clone();
         let tick_handle = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_millis(tick_ms.max(10)));
             // A late tick (busy runtime, suspended laptop) runs once, not as a
@@ -1150,6 +1168,7 @@ impl SimEngine {
                         // Read the live config under a short lock, cloned.
                         let dynamics: Vec<DynReg> = tick_dynamics.lock().map(|g| g.clone()).unwrap_or_default();
                         let rules: Vec<RuleDef> = tick_rules.lock().map(|g| g.clone()).unwrap_or_default();
+                        let meta: Arc<RegMetaMap> = tick_meta.lock().map(|g| Arc::clone(&g)).unwrap_or_default();
                         if rules != prev_rules {
                             reconcile_rules(&prev_rules, &rules, &mut rule_states, &mut pending_actions);
                             prev_rules = rules.clone();
@@ -1187,7 +1206,7 @@ impl SimEngine {
                                     true
                                 }
                             });
-                            let acts = eval_rules(&rules, &mut rule_states, &guard, elapsed, &drained);
+                            let acts = eval_rules(&rules, &mut rule_states, &guard, &meta, elapsed, &drained);
                             for (id, ta) in acts {
                                 let seed = elapsed as u64 ^ id as u64;
                                 if ta.delay_ms <= 0.0 {
@@ -2605,11 +2624,35 @@ pub fn simulator_rebase_device(
 pub enum Trigger {
     /// Fires every `ms` milliseconds.
     Interval { ms: f64 },
-    /// Fires (edge-triggered) when `register op value` transitions to true.
-    Condition { unit: u8, bank: u8, address: u16, op: String, value: i64 },
+    /// Fires (edge-triggered) when the combined result of `conds` (all of /
+    /// any of, per `join`) transitions to true. Each condition compares the
+    /// register's decoded, scaled engineering value.
+    Condition { join: Join, conds: Vec<Cond> },
     /// Fires when a client writes to `(unit, bank, address)`; `address: None`
     /// matches any address in that unit/bank.
     OnWrite { unit: u8, bank: u8, address: Option<u16> },
+}
+
+/// One comparison of a `Condition` trigger: `register op value`, where the
+/// register is `(unit, bank, address)` (its START address for multi-word
+/// types) and `value`/`deadband` are in the register's engineering units.
+/// `deadband` (≥ 0) only affects `>`, `>=`, `<`, `<=`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Cond {
+    pub unit: u8,
+    pub bank: u8,
+    pub address: u16,
+    pub op: String,
+    pub value: f64,
+    pub deadband: f64,
+}
+
+/// How a `Condition` trigger combines its conditions: all of them (AND) or any
+/// of them (OR).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Join {
+    All,
+    Any,
 }
 
 /// A rule's action, parsed from an entry in the `SimRule.actions` JSON array.
@@ -2719,6 +2762,51 @@ fn parse_action(v: &serde_json::Value) -> Option<TimedAction> {
     })
 }
 
+/// A finite JSON number at `key`, else `default` (absent, null, non-numeric,
+/// or non-finite).
+fn json_finite_f64(v: &serde_json::Value, key: &str, default: f64) -> f64 {
+    v.get(key).and_then(|x| x.as_f64()).filter(|x| x.is_finite()).unwrap_or(default)
+}
+
+/// Parse one condition object (`unit`/`bank`/`address`/`op`/`value`/
+/// `deadband`). An out-of-range unit/bank/address → `None` (rejects the rule).
+/// `value` may be any JSON number; a negative or invalid deadband becomes 0.
+fn parse_cond(v: &serde_json::Value) -> Option<Cond> {
+    Some(Cond {
+        unit: json_u8(v, "unit", 1)?,
+        bank: json_u8(v, "bank", 1)?,
+        address: json_u16(v, "address", 0)?,
+        op: v.get("op").and_then(|x| x.as_str()).unwrap_or("==").to_string(),
+        value: json_finite_f64(v, "value", 0.0),
+        deadband: json_finite_f64(v, "deadband", 0.0).max(0.0),
+    })
+}
+
+/// Parse a `condition` trigger in either shape:
+/// - legacy `{"type":"condition","unit","bank","address","op","value"}` →
+///   one condition, `Join::All`, deadband 0;
+/// - `{"type":"condition","join":"all"|"any","conditions":[{…}, …]}` (join
+///   defaults to all).
+/// Any out-of-range condition, a non-array `conditions`, or an empty list
+/// rejects the rule.
+fn parse_condition_trigger(tv: &serde_json::Value) -> Option<Trigger> {
+    match tv.get("conditions") {
+        None | Some(serde_json::Value::Null) => Some(Trigger::Condition { join: Join::All, conds: vec![parse_cond(tv)?] }),
+        Some(serde_json::Value::Array(arr)) => {
+            let conds: Vec<Cond> = arr.iter().map(parse_cond).collect::<Option<_>>()?;
+            if conds.is_empty() {
+                return None;
+            }
+            let join = match tv.get("join").and_then(|x| x.as_str()) {
+                Some("any") => Join::Any,
+                _ => Join::All,
+            };
+            Some(Trigger::Condition { join, conds })
+        }
+        Some(_) => None,
+    }
+}
+
 /// Parse a `SimRule`'s `trigger`/`actions` JSON into a `RuleDef`. Returns
 /// `None` if the rule is disabled, or its `trigger`/`actions` JSON is
 /// malformed, has an unrecognized trigger `type`, or an out-of-range trigger
@@ -2731,13 +2819,7 @@ pub fn parse_rule(rule: &SimRule) -> Option<RuleDef> {
     let tv: serde_json::Value = serde_json::from_str(&rule.trigger).ok()?;
     let trigger = match tv.get("type").and_then(|x| x.as_str()).unwrap_or("") {
         "interval" => Trigger::Interval { ms: tv.get("ms").and_then(|x| x.as_f64()).unwrap_or(1000.0) },
-        "condition" => Trigger::Condition {
-            unit: json_u8(&tv, "unit", 1)?,
-            bank: json_u8(&tv, "bank", 1)?,
-            address: json_u16(&tv, "address", 0)?,
-            op: tv.get("op").and_then(|x| x.as_str()).unwrap_or("==").to_string(),
-            value: json_i64(&tv, "value", 0),
-        },
+        "condition" => parse_condition_trigger(&tv)?,
         "onWrite" => {
             // A negative/absent address means "any address"; one past 65535
             // is invalid (not wrapped).
@@ -2876,25 +2958,70 @@ pub fn apply_timed_action(banks: &mut HashMap<u8, SimBanks>, ta: &TimedAction, r
 }
 
 /// Per-rule runtime state carried across ticks, keyed by `RuleDef.id`.
+///
+/// For `Condition` triggers: `last_condition` is the previous combined
+/// (all/any) result, used for edge-firing; `last_value` is the previous
+/// rounded engineering value, used by single-condition `changed`;
+/// `cond_armed[i]` is true while condition `i` is latched true — with a
+/// deadband it then stays true until the value moves back past
+/// `value ∓ deadband`.
 #[derive(Debug, Clone, Default)]
 pub struct RuleState {
     pub next_due: f64,
     pub last_condition: bool,
-    pub last_value: Option<i64>,
+    pub last_value: Option<f64>,
+    pub cond_armed: Vec<bool>,
 }
 
-/// Evaluate a `Condition` trigger's comparison operator. `changed` compares
-/// `cur` against the rule's previously-seen value rather than the trigger's
-/// configured `value`.
-fn compare(cur: i64, op: &str, value: i64, last_value: Option<i64>) -> bool {
+/// A register's current engineering value. Bit banks (1=coil, 2=discrete
+/// input) read as `0`/`1` (present bit required). Word banks (3=holding,
+/// 4=input) need the register's metadata (keyed by its start address): the
+/// full span is decoded with its data type/byte order, then scaled with
+/// `eng_from_raw`. A hold `bool` on a word bank reads its word as-is. No meta
+/// entry, or any word of the span absent → `None`.
+pub fn read_eng(banks: &HashMap<u8, SimBanks>, meta: &RegMetaMap, unit: u8, bank: u8, addr: u16) -> Option<f64> {
+    match bank {
+        1 | 2 => read_word(banks, unit, bank, addr).map(f64::from),
+        3 | 4 => {
+            let m = meta.get(&(unit, bank, addr))?;
+            let raw = if m.data_type == "bool" {
+                f64::from(read_word(banks, unit, bank, addr)?)
+            } else {
+                read_typed(banks, unit, bank, addr, &m.data_type, &m.byte_order)?
+            };
+            Some(eng_from_raw(raw, m.scale, m.offset))
+        }
+        _ => None,
+    }
+}
+
+/// Decimals a condition compares at: the register's effective decimals for
+/// word banks, 0 for bits (and for a register without metadata, which reads
+/// as not met anyway).
+fn cond_decimals(meta: &RegMetaMap, c: &Cond) -> u32 {
+    match c.bank {
+        3 | 4 => meta.get(&(c.unit, c.bank, c.address)).map(|m| m.decimals).unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// Evaluate one level comparison. Both sides are rounded to the register's
+/// `decimals` first (so `== 23.5` matches a 0.1-scaled register reading
+/// 23.5). While the condition is latched (`armed`), `deadband` widens the
+/// threshold: `>`/`>=` hold until the value drops below `value − deadband`,
+/// `<`/`<=` until it rises above `value + deadband`. Deadband 0 is the plain
+/// comparison. `changed` and unknown operators are not levels → `false`.
+fn compare(eng: f64, op: &str, value: f64, deadband: f64, armed: bool, decimals: u32) -> bool {
+    let cur = round_to(eng, decimals);
+    let hold = if armed { deadband } else { 0.0 };
+    let at = |x: f64| round_to(x, decimals);
     match op {
-        "==" => cur == value,
-        "!=" => cur != value,
-        "<" => cur < value,
-        ">" => cur > value,
-        ">=" => cur >= value,
-        "<=" => cur <= value,
-        "changed" => Some(cur) != last_value,
+        "==" => cur == at(value),
+        "!=" => cur != at(value),
+        ">" => cur > at(value - hold),
+        ">=" => cur >= at(value - hold),
+        "<" => cur < at(value + hold),
+        "<=" => cur <= at(value + hold),
         _ => false,
     }
 }
@@ -2906,15 +3033,21 @@ fn compare(cur: i64, op: &str, value: i64, last_value: Option<i64>) -> bool {
 ///
 /// - `Interval`: fires when `elapsed_ms >= next_due`, then reschedules on the
 ///   `next_due + ms` grid (no drift; resyncs via `advance_due` when far behind).
-/// - `Condition`: edge-fired — reads the current word/bit, compares it, and
-///   fires only on the false→true transition; `last_condition`/`last_value`
-///   are updated every call (fired or not). A missing register is "not met".
+/// - `Condition`: each condition reads its register's engineering value via
+///   `read_eng` (current type/byte order/scale from `meta`) and compares it
+///   (`compare`, with deadband latching); the results combine by `join`, and
+///   the rule fires only on the combined false→true transition. A missing
+///   register (or one without metadata, or a NaN float) is "not met". A single
+///   `changed` condition instead fires on every change of the rounded value
+///   (not on the first observation); `changed` inside a multi-condition rule
+///   is never met.
 /// - `OnWrite`: fires if any drained write matches `unit`/`bank`, and either
 ///   `address` is `None` (match-any) or equals the write's address.
 pub fn eval_rules(
     rules: &[RuleDef],
     states: &mut HashMap<i64, RuleState>,
     banks: &HashMap<u8, SimBanks>,
+    meta: &RegMetaMap,
     elapsed_ms: f64,
     writes: &[(u8, u8, u16)],
 ) -> Vec<(i64, TimedAction)> {
@@ -2930,29 +3063,48 @@ pub fn eval_rules(
                     false
                 }
             }
-            Trigger::Condition { unit, bank, address, op, value } => {
-                // A condition on a register that doesn't exist is "not met"
-                // (it never fires) rather than reading as 0. Its history is
-                // reset so `changed` treats a later appearance as a first
-                // observation.
-                let Some(cur) = read_word(banks, *unit, *bank, *address) else {
-                    state.last_condition = false;
-                    state.last_value = None;
-                    continue;
-                };
-                let cur = cur as i64;
-                let c = compare(cur, op, *value, state.last_value);
-                let fired = if op == "changed" {
+            Trigger::Condition { join, conds } => {
+                if state.cond_armed.len() != conds.len() {
+                    state.cond_armed = vec![false; conds.len()];
+                }
+                let eng_of = |c: &Cond| read_eng(banks, meta, c.unit, c.bank, c.address).filter(|v| !v.is_nan());
+                if conds.len() == 1 && conds[0].op == "changed" {
                     // `changed` is itself a transition, not a level to be
                     // edge-gated: fire on every real change (but not on the
-                    // very first observation, when there's no prior value).
-                    state.last_value.is_some() && Some(cur) != state.last_value
+                    // very first observation, when there's no prior value). A
+                    // missing register resets the history so a later
+                    // appearance is a first observation.
+                    let c = &conds[0];
+                    match eng_of(c) {
+                        None => {
+                            state.last_condition = false;
+                            state.last_value = None;
+                            false
+                        }
+                        Some(eng) => {
+                            let cur = round_to(eng, cond_decimals(meta, c));
+                            let fired = matches!(state.last_value, Some(prev) if prev != cur);
+                            state.last_condition = fired;
+                            state.last_value = Some(cur);
+                            fired
+                        }
+                    }
                 } else {
-                    c && !state.last_condition
-                };
-                state.last_condition = c;
-                state.last_value = Some(cur);
-                fired
+                    for (i, c) in conds.iter().enumerate() {
+                        let met = match eng_of(c) {
+                            Some(eng) => compare(eng, &c.op, c.value, c.deadband, state.cond_armed[i], cond_decimals(meta, c)),
+                            None => false,
+                        };
+                        state.cond_armed[i] = met;
+                    }
+                    let combined = match join {
+                        Join::All => state.cond_armed.iter().all(|&m| m),
+                        Join::Any => state.cond_armed.iter().any(|&m| m),
+                    };
+                    let fired = combined && !state.last_condition;
+                    state.last_condition = combined;
+                    fired
+                }
             }
             Trigger::OnWrite { unit, bank, address } => writes
                 .iter()
@@ -3401,22 +3553,38 @@ fn refresh_running_config(
     if !engine.is_running() {
         return;
     }
-    if let Ok(regs) = db_list_registers(conn) {
+    let regs = db_list_registers(conn).ok();
+    let rules = db_list_rules(conn).ok();
+    apply_live_config(engine, regs.as_deref(), rules.as_deref(), |slave_unit, kind| {
+        crate::modbus::lookup_slave_id_and_address_offset(app, ws, slave_unit, slave_table_kind(kind)).1
+    });
+}
+
+/// Push a register list and/or rule list (each `None` = left as is, e.g. its
+/// DB read failed) to an engine's live config: the generator/route list (with
+/// each route's source address shifted by `route_offset(slave_unit,
+/// connection_kind)`, mirroring Start), the register metadata rule conditions
+/// decode with, and the parsed rules. The hot-apply half of
+/// `refresh_running_config`, split out so the engine harness can drive it.
+fn apply_live_config(
+    engine: &SimEngine,
+    regs: Option<&[SimRegister]>,
+    rules: Option<&[SimRule]>,
+    route_offset: impl Fn(i64, &str) -> i64,
+) {
+    if let Some(regs) = regs {
         let mut dynamics: Vec<DynReg> = regs.iter().filter_map(parse_dynamic).collect();
-        // Resolve each route register's on-wire source address, mirroring Start.
         for d in dynamics.iter_mut() {
             if let DynKind::Route { slave_unit, connection_kind, src_addr, .. } = &mut d.kind {
-                let (_id, offset) = crate::modbus::lookup_slave_id_and_address_offset(
-                    app, ws, *slave_unit as i64, slave_table_kind(connection_kind),
-                );
+                let offset = route_offset(*slave_unit as i64, connection_kind);
                 *src_addr = (*src_addr as i64 + offset).clamp(0, 65535) as u16;
             }
         }
         engine.set_dynamics(dynamics);
+        engine.set_register_meta(build_reg_meta(regs));
     }
-    if let Ok(rules_raw) = db_list_rules(conn) {
-        let rules: Vec<RuleDef> = rules_raw.iter().filter_map(parse_rule).collect();
-        engine.set_rules(rules);
+    if let Some(rules_raw) = rules {
+        engine.set_rules(rules_raw.iter().filter_map(parse_rule).collect());
     }
 }
 
@@ -3491,6 +3659,8 @@ pub async fn simulator_start(
         let mut map = state.0.lock().unwrap();
         map.remove(&ws).unwrap_or_default()
     };
+    // Before `start`, so the first tick's rule conditions already decode with it.
+    engine.set_register_meta(build_reg_meta(&regs));
     let result = engine.start(
         app.clone(),
         ws.clone(),
@@ -3807,6 +3977,7 @@ pub async fn route_read_words(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sim_scaling::{effective_decimals, RegMeta};
 
     /// No-op `ValuesSink` for tests: `SimEngine::start` requires a sink, but
     /// most tests only care about server/tick bank behavior, not the emitted
@@ -4278,7 +4449,7 @@ mod tests {
             sort_order: 0,
         };
         let d = parse_rule(&r).unwrap();
-        assert!(matches!(d.trigger, Trigger::Condition { value: 100, .. }));
+        assert!(matches!(&d.trigger, Trigger::Condition { join: Join::All, conds } if conds.len() == 1 && conds[0].value == 100.0));
         assert_eq!(d.actions.len(), 2);
         // disabled → None
         let off = SimRule { enabled: false, ..r.clone() };
@@ -4302,39 +4473,41 @@ mod tests {
         let rules = vec![rule(1, Trigger::Interval { ms: 100.0 }, vec![Action::Toggle{unit:1,bank:1,address:0}])];
         let mut st = HashMap::new();
         let b = HashMap::new();
-        assert_eq!(eval_rules(&rules, &mut st, &b, 0.0, &[]).len(), 1);   // due at t=0
-        assert_eq!(eval_rules(&rules, &mut st, &b, 50.0, &[]).len(), 0);  // not yet
-        assert_eq!(eval_rules(&rules, &mut st, &b, 100.0, &[]).len(), 1); // next period
+        assert_eq!(eval_rules(&rules, &mut st, &b, &RegMetaMap::new(), 0.0, &[]).len(), 1);   // due at t=0
+        assert_eq!(eval_rules(&rules, &mut st, &b, &RegMetaMap::new(), 50.0, &[]).len(), 0);  // not yet
+        assert_eq!(eval_rules(&rules, &mut st, &b, &RegMetaMap::new(), 100.0, &[]).len(), 1); // next period
     }
     #[test]
     fn condition_is_edge_fired() {
-        let rules = vec![rule(1, Trigger::Condition{unit:1,bank:3,address:0,op:">=".into(),value:100}, vec![Action::Set{unit:1,bank:1,address:0,value:1}])];
+        let rules = vec![rule(1, Trigger::Condition{join:Join::All,conds:vec![cnd(1,3,0,">=",100.0,0.0)]}, vec![Action::Set{unit:1,bank:1,address:0,value:1}])];
         let mut st = HashMap::new();
+        let meta = cmeta(&[(1,3,0,"u16",1.0)]);
         let below = banks1(&[(1,3,0,50)]);
         let above = banks1(&[(1,3,0,150)]);
-        assert_eq!(eval_rules(&rules, &mut st, &below, 0.0, &[]).len(), 0);   // false
-        assert_eq!(eval_rules(&rules, &mut st, &above, 10.0, &[]).len(), 1);  // false→true edge
-        assert_eq!(eval_rules(&rules, &mut st, &above, 20.0, &[]).len(), 0);  // stays true, no re-fire
+        assert_eq!(eval_rules(&rules, &mut st, &below, &meta, 0.0, &[]).len(), 0);   // false
+        assert_eq!(eval_rules(&rules, &mut st, &above, &meta, 10.0, &[]).len(), 1);  // false→true edge
+        assert_eq!(eval_rules(&rules, &mut st, &above, &meta, 20.0, &[]).len(), 0);  // stays true, no re-fire
     }
     #[test]
     fn changed_fires_on_each_change() {
-        let rules = vec![rule(1, Trigger::Condition{unit:1,bank:3,address:0,op:"changed".into(),value:0}, vec![Action::Inc{unit:1,bank:3,address:1,by:1}])];
+        let rules = vec![rule(1, Trigger::Condition{join:Join::All,conds:vec![cnd(1,3,0,"changed",0.0,0.0)]}, vec![Action::Inc{unit:1,bank:3,address:1,by:1}])];
         let mut st = HashMap::new();
+        let meta = cmeta(&[(1,3,0,"u16",1.0)]);
         let v10 = banks1(&[(1,3,0,10)]);
         let v20 = banks1(&[(1,3,0,20)]);
         let v30 = banks1(&[(1,3,0,30)]);
-        assert_eq!(eval_rules(&rules, &mut st, &v10, 0.0, &[]).len(), 0);  // first observation, no prior
-        assert_eq!(eval_rules(&rules, &mut st, &v20, 10.0, &[]).len(), 1); // 10 -> 20: fires
-        assert_eq!(eval_rules(&rules, &mut st, &v20, 20.0, &[]).len(), 0); // unchanged: no fire
-        assert_eq!(eval_rules(&rules, &mut st, &v30, 30.0, &[]).len(), 1); // 20 -> 30: fires
+        assert_eq!(eval_rules(&rules, &mut st, &v10, &meta, 0.0, &[]).len(), 0);  // first observation, no prior
+        assert_eq!(eval_rules(&rules, &mut st, &v20, &meta, 10.0, &[]).len(), 1); // 10 -> 20: fires
+        assert_eq!(eval_rules(&rules, &mut st, &v20, &meta, 20.0, &[]).len(), 0); // unchanged: no fire
+        assert_eq!(eval_rules(&rules, &mut st, &v30, &meta, 30.0, &[]).len(), 1); // 20 -> 30: fires
     }
     #[test]
     fn on_write_matches_drained_write() {
         let rules = vec![rule(1, Trigger::OnWrite{unit:1,bank:3,address:Some(5)}, vec![Action::Inc{unit:1,bank:3,address:6,by:1}])];
         let mut st = HashMap::new();
         let b = HashMap::new();
-        assert_eq!(eval_rules(&rules, &mut st, &b, 0.0, &[(1,3,5)]).len(), 1);
-        assert_eq!(eval_rules(&rules, &mut st, &b, 0.0, &[(1,3,9)]).len(), 0);
+        assert_eq!(eval_rules(&rules, &mut st, &b, &RegMetaMap::new(), 0.0, &[(1,3,5)]).len(), 1);
+        assert_eq!(eval_rules(&rules, &mut st, &b, &RegMetaMap::new(), 0.0, &[(1,3,9)]).len(), 0);
     }
 
     #[test]
@@ -5019,10 +5192,11 @@ mod tests {
         place_words(&mut banks, 1, 1, 0, &[0]);
         let rules = vec![RuleDef {
             id: 1, enabled: true, sort_order: 0,
-            trigger: Trigger::Condition { unit: 1, bank: 3, address: 0, op: ">=".into(), value: 100 },
+            trigger: Trigger::Condition { join: Join::All, conds: vec![cnd(1, 3, 0, ">=", 100.0, 0.0)] },
             actions: vec![timed(Action::Set { unit: 1, bank: 1, address: 0, value: 1 })],
         }];
         let mut engine = SimEngine::new();
+        engine.set_register_meta(cmeta(&[(1, 3, 0, "u16", 1.0)]));
         // match the REAL start signature; rules is the new trailing arg
         let info = engine.start(NoopSink, "ws".into(), "127.0.0.1", 0, 100, banks, Vec::new(), Default::default(), Default::default(), rules).await.unwrap();
         let addr: std::net::SocketAddr = info.bound.parse().unwrap();
@@ -5290,19 +5464,29 @@ mod tests {
     }
 
     #[test]
-    fn condition_on_missing_register_never_fires() {
+    fn condition_on_missing_register_is_not_met() {
         // `holding[5] == 0` on a register that doesn't exist must not read as
         // 0 and fire; it is simply "not met".
-        let rules = vec![rule(1, Trigger::Condition { unit: 1, bank: 3, address: 5, op: "==".into(), value: 0 }, vec![Action::Set { unit: 1, bank: 3, address: 0, value: 1 }])];
+        let rules = vec![rule(1, Trigger::Condition { join: Join::All, conds: vec![cnd(1, 3, 5, "==", 0.0, 0.0)] }, vec![Action::Set { unit: 1, bank: 3, address: 0, value: 1 }])];
+        let meta = cmeta(&[(1, 3, 5, "u16", 1.0)]);
         let mut st = HashMap::new();
         let b = banks1(&[(1, 3, 0, 0)]);
-        assert!(eval_rules(&rules, &mut st, &b, 0.0, &[]).is_empty());
-        assert!(eval_rules(&rules, &mut st, &b, 10.0, &[]).is_empty());
+        assert!(eval_rules(&rules, &mut st, &b, &meta, 0.0, &[]).is_empty());
+        assert!(eval_rules(&rules, &mut st, &b, &meta, 10.0, &[]).is_empty());
         let empty = HashMap::new();
-        assert!(eval_rules(&rules, &mut st, &empty, 20.0, &[]).is_empty());
-        // Once the register exists and the condition holds, it fires.
+        assert!(eval_rules(&rules, &mut st, &empty, &meta, 20.0, &[]).is_empty());
+        // The word is present but the register has no metadata: still not met.
         let present = banks1(&[(1, 3, 5, 0)]);
-        assert_eq!(eval_rules(&rules, &mut st, &present, 30.0, &[]).len(), 1);
+        assert!(eval_rules(&rules, &mut st, &present, &RegMetaMap::new(), 25.0, &[]).is_empty());
+        // Once the register exists (words + metadata) and the condition holds, it fires.
+        assert_eq!(eval_rules(&rules, &mut st, &present, &meta, 30.0, &[]).len(), 1);
+        // A multi-word register with half its span missing is not met either.
+        let rules = vec![cond_rule(2, Join::All, vec![cnd(1, 4, 0, ">=", 0.0, 0.0)])];
+        let half = banks1(&[(1, 4, 0, 0)]);
+        assert!(eval_rules(&rules, &mut st, &half, &cmeta(&[(1, 4, 0, "f32", 1.0)]), 40.0, &[]).is_empty());
+        // A missing register on one side of an Any join doesn't block the other.
+        let rules = vec![cond_rule(3, Join::Any, vec![cnd(1, 3, 9, "==", 0.0, 0.0), cnd(1, 3, 5, "==", 0.0, 0.0)])];
+        assert_eq!(eval_rules(&rules, &mut st, &present, &meta, 50.0, &[]).len(), 1);
     }
 
     #[tokio::test]
@@ -5333,13 +5517,13 @@ mod tests {
         let rules = vec![rule(1, Trigger::Interval { ms: 100.0 }, vec![Action::Toggle { unit: 1, bank: 1, address: 0 }])];
         let mut st = HashMap::new();
         let b = HashMap::new();
-        assert_eq!(eval_rules(&rules, &mut st, &b, 0.0, &[]).len(), 1);   // t=0 → next 100
-        assert_eq!(eval_rules(&rules, &mut st, &b, 150.0, &[]).len(), 1); // late fire → next 200 (not 250)
-        assert_eq!(eval_rules(&rules, &mut st, &b, 210.0, &[]).len(), 1); // on the 200 grid
+        assert_eq!(eval_rules(&rules, &mut st, &b, &RegMetaMap::new(), 0.0, &[]).len(), 1);   // t=0 → next 100
+        assert_eq!(eval_rules(&rules, &mut st, &b, &RegMetaMap::new(), 150.0, &[]).len(), 1); // late fire → next 200 (not 250)
+        assert_eq!(eval_rules(&rules, &mut st, &b, &RegMetaMap::new(), 210.0, &[]).len(), 1); // on the 200 grid
         // Far behind (> one period): fire once, then resync — no burst.
-        assert_eq!(eval_rules(&rules, &mut st, &b, 650.0, &[]).len(), 1);
-        assert_eq!(eval_rules(&rules, &mut st, &b, 660.0, &[]).len(), 0, "no catch-up burst");
-        assert_eq!(eval_rules(&rules, &mut st, &b, 750.0, &[]).len(), 1, "resynced to elapsed + period");
+        assert_eq!(eval_rules(&rules, &mut st, &b, &RegMetaMap::new(), 650.0, &[]).len(), 1);
+        assert_eq!(eval_rules(&rules, &mut st, &b, &RegMetaMap::new(), 660.0, &[]).len(), 0, "no catch-up burst");
+        assert_eq!(eval_rules(&rules, &mut st, &b, &RegMetaMap::new(), 750.0, &[]).len(), 1, "resynced to elapsed + period");
     }
 
     #[test]
@@ -5378,7 +5562,7 @@ mod tests {
         let mut states: HashMap<i64, RuleState> = HashMap::new();
         let mut pending: Vec<PendingAction> = Vec::new();
         for id in 1..=4 {
-            states.insert(id, RuleState { next_due: 900.0, last_condition: true, last_value: Some(1) });
+            states.insert(id, RuleState { next_due: 900.0, last_condition: true, last_value: Some(1.0), cond_armed: vec![true] });
             pending.push(PendingAction { due: 1000.0, rule_id: id, action: keep.actions[0].clone(), seed: 0 });
         }
         reconcile_rules(&prev, &next, &mut states, &mut pending);
@@ -6110,5 +6294,284 @@ mod tests {
         }
         drop(conn);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── engineering units: typed, scaled rule conditions ─────────────────
+
+    fn cmeta(entries: &[(u8, u8, u16, &str, f64)]) -> RegMetaMap {
+        let mut m = RegMetaMap::new();
+        for &(u, b, a, dt, scale) in entries {
+            m.insert((u, b, a), RegMeta {
+                data_type: dt.into(),
+                byte_order: "ABCD".into(),
+                scale,
+                offset: 0.0,
+                decimals: effective_decimals(None, scale, dt),
+            });
+        }
+        m
+    }
+
+    fn cnd(unit: u8, bank: u8, address: u16, op: &str, value: f64, deadband: f64) -> Cond {
+        Cond { unit, bank, address, op: op.into(), value, deadband }
+    }
+
+    fn cond_rule(id: i64, join: Join, conds: Vec<Cond>) -> RuleDef {
+        rule(id, Trigger::Condition { join, conds }, vec![Action::Inc { unit: 1, bank: 3, address: 99, by: 1 }])
+    }
+
+    fn sim_rule(trigger: &str) -> SimRule {
+        SimRule {
+            id: 1, name: "r".into(), enabled: true, trigger: trigger.into(),
+            actions: "[{\"type\":\"inc\",\"unit\":1,\"bank\":3,\"address\":99,\"by\":1}]".into(),
+            sort_order: 0,
+        }
+    }
+
+    #[test]
+    fn legacy_condition_json_parses_and_fires_as_before() {
+        let r = parse_rule(&sim_rule(
+            "{\"type\":\"condition\",\"unit\":1,\"bank\":3,\"address\":0,\"op\":\">=\",\"value\":350}",
+        ))
+        .unwrap();
+        assert_eq!(r.trigger, Trigger::Condition { join: Join::All, conds: vec![cnd(1, 3, 0, ">=", 350.0, 0.0)] });
+        let rules = vec![r];
+        let meta = cmeta(&[(1, 3, 0, "u16", 1.0)]);
+        let mut st = HashMap::new();
+        assert_eq!(eval_rules(&rules, &mut st, &banks1(&[(1, 3, 0, 349)]), &meta, 0.0, &[]).len(), 0);
+        assert_eq!(eval_rules(&rules, &mut st, &banks1(&[(1, 3, 0, 350)]), &meta, 10.0, &[]).len(), 1);
+        assert_eq!(eval_rules(&rules, &mut st, &banks1(&[(1, 3, 0, 351)]), &meta, 20.0, &[]).len(), 0);
+    }
+
+    #[test]
+    fn new_condition_shape_parses_and_rejects_out_of_range() {
+        let r = parse_rule(&sim_rule(
+            "{\"type\":\"condition\",\"join\":\"any\",\"conditions\":[\
+               {\"unit\":2,\"bank\":4,\"address\":7,\"op\":\">=\",\"value\":35.5,\"deadband\":1.5},\
+               {\"unit\":1,\"bank\":1,\"address\":3,\"op\":\"==\",\"value\":1}]}",
+        ))
+        .unwrap();
+        assert_eq!(
+            r.trigger,
+            Trigger::Condition {
+                join: Join::Any,
+                conds: vec![cnd(2, 4, 7, ">=", 35.5, 1.5), cnd(1, 1, 3, "==", 1.0, 0.0)],
+            }
+        );
+        // Join defaults to All; a negative deadband is clamped to 0.
+        let r = parse_rule(&sim_rule(
+            "{\"type\":\"condition\",\"conditions\":[{\"unit\":1,\"bank\":3,\"address\":0,\"op\":\"<\",\"value\":-2.5,\"deadband\":-3}]}",
+        ))
+        .unwrap();
+        assert_eq!(r.trigger, Trigger::Condition { join: Join::All, conds: vec![cnd(1, 3, 0, "<", -2.5, 0.0)] });
+        // Out-of-range unit/address anywhere rejects the rule (legacy and new shapes).
+        assert!(parse_rule(&sim_rule("{\"type\":\"condition\",\"unit\":300,\"bank\":3,\"address\":0,\"op\":\"==\",\"value\":1}")).is_none());
+        assert!(parse_rule(&sim_rule(
+            "{\"type\":\"condition\",\"join\":\"all\",\"conditions\":[\
+               {\"unit\":1,\"bank\":3,\"address\":0,\"op\":\"==\",\"value\":1},\
+               {\"unit\":1,\"bank\":3,\"address\":70000,\"op\":\"==\",\"value\":1}]}",
+        ))
+        .is_none());
+        // An empty condition list can never be met → rejected.
+        assert!(parse_rule(&sim_rule("{\"type\":\"condition\",\"join\":\"all\",\"conditions\":[]}")).is_none());
+    }
+
+    #[test]
+    fn i16_condition_sees_negative_values() {
+        let rules = vec![cond_rule(1, Join::All, vec![cnd(1, 3, 0, "<", 0.0, 0.0)])];
+        let b = banks1(&[(1, 3, 0, 0xFFFF)]);
+        let mut st = HashMap::new();
+        assert_eq!(eval_rules(&rules, &mut st, &b, &cmeta(&[(1, 3, 0, "i16", 1.0)]), 0.0, &[]).len(), 1);
+        // The same word on a u16 register is 65535, not negative.
+        let mut st = HashMap::new();
+        assert_eq!(eval_rules(&rules, &mut st, &b, &cmeta(&[(1, 3, 0, "u16", 1.0)]), 0.0, &[]).len(), 0);
+    }
+
+    #[test]
+    fn f32_and_u32_conditions_decode_full_register() {
+        let mut b = HashMap::new();
+        place_words(&mut b, 1, 4, 0, &encode_value("f32", "ABCD", 35.5).unwrap());
+        place_words(&mut b, 1, 4, 10, &encode_value("u32", "ABCD", 70000.0).unwrap());
+        let meta = cmeta(&[(1, 4, 0, "f32", 1.0), (1, 4, 10, "u32", 1.0)]);
+        let rules = vec![
+            cond_rule(1, Join::All, vec![cnd(1, 4, 0, ">=", 35.0, 0.0)]),
+            cond_rule(2, Join::All, vec![cnd(1, 4, 10, ">", 65535.0, 0.0)]),
+        ];
+        let mut st = HashMap::new();
+        let fired: Vec<i64> = eval_rules(&rules, &mut st, &b, &meta, 0.0, &[]).into_iter().map(|(id, _)| id).collect();
+        assert_eq!(fired, vec![1, 2]);
+        assert_eq!(read_eng(&b, &meta, 1, 4, 0), Some(35.5));
+        assert_eq!(read_eng(&b, &meta, 1, 4, 10), Some(70000.0));
+    }
+
+    #[test]
+    fn scaled_equality_uses_register_decimals() {
+        let meta = cmeta(&[(1, 3, 0, "u16", 0.1)]);
+        let rules = vec![cond_rule(1, Join::All, vec![cnd(1, 3, 0, "==", 23.5, 0.0)])];
+        let mut st = HashMap::new();
+        assert_eq!(eval_rules(&rules, &mut st, &banks1(&[(1, 3, 0, 234)]), &meta, 0.0, &[]).len(), 0);
+        assert_eq!(eval_rules(&rules, &mut st, &banks1(&[(1, 3, 0, 235)]), &meta, 10.0, &[]).len(), 1);
+        assert_eq!(eval_rules(&rules, &mut st, &banks1(&[(1, 3, 0, 236)]), &meta, 20.0, &[]).len(), 0);
+    }
+
+    #[test]
+    fn deadband_holds_until_value_moves_back() {
+        let meta = cmeta(&[(1, 3, 0, "u16", 0.1)]);
+        let rules = vec![cond_rule(1, Join::All, vec![cnd(1, 3, 0, ">=", 35.0, 1.0)])];
+        let mut st = HashMap::new();
+        let mut step = |raw: u16, t: f64| eval_rules(&rules, &mut st, &banks1(&[(1, 3, 0, raw)]), &meta, t, &[]).len();
+        assert_eq!(step(340, 0.0), 0, "34.0: below threshold");
+        assert_eq!(step(350, 10.0), 1, "35.0: fires");
+        assert_eq!(step(345, 20.0), 0, "34.5: inside the deadband, still true");
+        assert_eq!(step(352, 30.0), 0, "35.2: still true, no re-fire");
+        assert_eq!(step(340, 40.0), 0, "34.0: exactly threshold - deadband, still true");
+        assert_eq!(step(339, 50.0), 0, "33.9: released");
+        assert_eq!(step(350, 60.0), 1, "35.0 again: fires again");
+
+        // `<=` mirrors it: holds until above value + deadband.
+        let rules = vec![cond_rule(1, Join::All, vec![cnd(1, 3, 0, "<=", 10.0, 2.0)])];
+        let mut st = HashMap::new();
+        let mut step = |raw: u16, t: f64| eval_rules(&rules, &mut st, &banks1(&[(1, 3, 0, raw)]), &meta, t, &[]).len();
+        assert_eq!(step(100, 0.0), 1, "10.0: fires");
+        assert_eq!(step(115, 10.0), 0, "11.5: held");
+        assert_eq!(step(125, 20.0), 0, "12.5: released");
+        assert_eq!(step(110, 30.0), 0, "11.0: not re-armed yet (above 10)");
+        assert_eq!(step(100, 40.0), 1, "10.0: fires again");
+    }
+
+    #[test]
+    fn zero_deadband_matches_plain_comparison() {
+        // `>` with deadband 0 must not latch at the threshold (today's behaviour).
+        let meta = cmeta(&[(1, 3, 0, "u16", 1.0)]);
+        let rules = vec![cond_rule(1, Join::All, vec![cnd(1, 3, 0, ">", 100.0, 0.0)])];
+        let mut st = HashMap::new();
+        let mut step = |raw: u16, t: f64| eval_rules(&rules, &mut st, &banks1(&[(1, 3, 0, raw)]), &meta, t, &[]).len();
+        assert_eq!(step(101, 0.0), 1);
+        assert_eq!(step(100, 10.0), 0);
+        assert_eq!(step(101, 20.0), 1, "100 was false, so 101 is a new edge");
+    }
+
+    #[test]
+    fn all_and_any_joins() {
+        let meta = cmeta(&[(1, 3, 0, "u16", 1.0), (1, 3, 1, "u16", 1.0)]);
+        let both = |join| vec![cond_rule(1, join, vec![cnd(1, 3, 0, ">=", 10.0, 0.0), cnd(1, 3, 1, ">=", 10.0, 0.0)])];
+        let neither = banks1(&[(1, 3, 0, 0), (1, 3, 1, 0)]);
+        let first = banks1(&[(1, 3, 0, 10), (1, 3, 1, 0)]);
+        let all = banks1(&[(1, 3, 0, 10), (1, 3, 1, 10)]);
+
+        let rules = both(Join::All);
+        let mut st = HashMap::new();
+        assert_eq!(eval_rules(&rules, &mut st, &neither, &meta, 0.0, &[]).len(), 0);
+        assert_eq!(eval_rules(&rules, &mut st, &first, &meta, 10.0, &[]).len(), 0, "All: one of two is not enough");
+        assert_eq!(eval_rules(&rules, &mut st, &all, &meta, 20.0, &[]).len(), 1, "All: both true fires");
+        assert_eq!(eval_rules(&rules, &mut st, &all, &meta, 30.0, &[]).len(), 0, "edge only");
+
+        let rules = both(Join::Any);
+        let mut st = HashMap::new();
+        assert_eq!(eval_rules(&rules, &mut st, &neither, &meta, 0.0, &[]).len(), 0);
+        assert_eq!(eval_rules(&rules, &mut st, &first, &meta, 10.0, &[]).len(), 1, "Any: first true fires");
+        assert_eq!(eval_rules(&rules, &mut st, &all, &meta, 20.0, &[]).len(), 0, "Any: second also true, no re-fire");
+    }
+
+    #[test]
+    fn changed_in_multi_condition_rule_is_not_met() {
+        let r = parse_rule(&sim_rule(
+            "{\"type\":\"condition\",\"join\":\"any\",\"conditions\":[\
+               {\"unit\":1,\"bank\":3,\"address\":0,\"op\":\"changed\",\"value\":0},\
+               {\"unit\":1,\"bank\":3,\"address\":1,\"op\":\"==\",\"value\":999}]}",
+        ))
+        .expect("a multi-condition rule containing `changed` still parses");
+        let rules = vec![r];
+        let meta = cmeta(&[(1, 3, 0, "u16", 1.0), (1, 3, 1, "u16", 1.0)]);
+        let mut st = HashMap::new();
+        for (t, v) in [(0.0, 1u16), (10.0, 2), (20.0, 3), (30.0, 4)] {
+            let b = banks1(&[(1, 3, 0, v), (1, 3, 1, 0)]);
+            assert!(eval_rules(&rules, &mut st, &b, &meta, t, &[]).is_empty(), "changed must not fire inside a multi-condition rule (t={t})");
+        }
+        // The other condition still works.
+        let b = banks1(&[(1, 3, 0, 4), (1, 3, 1, 999)]);
+        assert_eq!(eval_rules(&rules, &mut st, &b, &meta, 40.0, &[]).len(), 1);
+    }
+
+    #[test]
+    fn changed_compares_rounded_engineering_value() {
+        // Single-condition `changed` fires on each change of the rounded value.
+        let meta = cmeta(&[(1, 3, 0, "u16", 0.1)]);
+        let rules = vec![cond_rule(1, Join::All, vec![cnd(1, 3, 0, "changed", 0.0, 0.0)])];
+        let mut st = HashMap::new();
+        assert_eq!(eval_rules(&rules, &mut st, &banks1(&[(1, 3, 0, 10)]), &meta, 0.0, &[]).len(), 0, "first observation");
+        assert_eq!(eval_rules(&rules, &mut st, &banks1(&[(1, 3, 0, 11)]), &meta, 10.0, &[]).len(), 1);
+        assert_eq!(eval_rules(&rules, &mut st, &banks1(&[(1, 3, 0, 11)]), &meta, 20.0, &[]).len(), 0);
+    }
+
+    #[test]
+    fn read_eng_bits_words_and_missing() {
+        let mut b = banks1(&[(1, 3, 0, 235), (1, 3, 1, 7)]);
+        place_words(&mut b, 1, 1, 4, &[1]);
+        let meta = cmeta(&[(1, 3, 0, "u16", 0.1), (1, 1, 4, "bool", 1.0)]);
+        assert!((read_eng(&b, &meta, 1, 3, 0).unwrap() - 23.5).abs() < 1e-9);
+        assert_eq!(read_eng(&b, &meta, 1, 1, 4), Some(1.0));
+        assert_eq!(read_eng(&b, &meta, 1, 3, 1), None, "word present but no register metadata");
+        assert_eq!(read_eng(&b, &meta, 1, 1, 5), None, "bit absent");
+        // A hold "bool" on a word bank reads its word as-is.
+        let meta = cmeta(&[(1, 3, 1, "bool", 1.0)]);
+        assert_eq!(read_eng(&b, &meta, 1, 3, 1), Some(7.0));
+    }
+
+    #[tokio::test]
+    async fn condition_follows_register_scale_change_while_running() {
+        let hold = |addr: i64, hold_value: i64| SimRegister {
+            id: addr + 1, unit_id: 1, function_code: 3, address: addr, alias: "".into(), data_type: "u16".into(),
+            hold_value, value_source: "hold".into(), byte_order: "ABCD".into(), source_params: "{}".into(),
+            interval_ms: 1000, sort_order: 0, device_instance_id: None,
+            unit: None, display_format: None, scale: None, scale_offset: None, decimals: None,
+        };
+        let temp = hold(0, 300);
+        let count = hold(1, 0);
+        // Constant 50 (engineering): raw 50 at scale 1, raw 500 at scale 0.1.
+        let generator = SimRegister {
+            id: 10, unit_id: 1, function_code: 4, address: 0, alias: "".into(), data_type: "u16".into(),
+            hold_value: 0, value_source: "generator".into(), byte_order: "ABCD".into(),
+            source_params: "{\"kind\":\"ramp\",\"min\":50,\"max\":50,\"periodMs\":1000}".into(),
+            interval_ms: 20, sort_order: 0, device_instance_id: None,
+            unit: None, display_format: None, scale: None, scale_offset: None, decimals: None,
+        };
+        let rules_raw = vec![SimRule {
+            id: 1, name: "hot".into(), enabled: true,
+            trigger: "{\"type\":\"condition\",\"join\":\"all\",\"conditions\":[{\"unit\":1,\"bank\":3,\"address\":0,\"op\":\">=\",\"value\":35.0}]}".into(),
+            actions: "[{\"type\":\"inc\",\"unit\":1,\"bank\":3,\"address\":1,\"by\":1}]".into(),
+            sort_order: 0,
+        }];
+        let regs = vec![temp.clone(), count.clone(), generator.clone()];
+        let banks = registers_to_banks(&regs);
+        let dynamics: Vec<DynReg> = regs.iter().filter_map(parse_dynamic).collect();
+        let rules: Vec<RuleDef> = rules_raw.iter().filter_map(parse_rule).collect();
+
+        let mut engine = SimEngine::new();
+        // Mirror `simulator_start`: metadata is in place before the first tick.
+        engine.set_register_meta(build_reg_meta(&regs));
+        let info = engine.start(NoopSink, "ws".into(), "127.0.0.1", 0, 20, banks, dynamics, Default::default(), Default::default(), rules).await.unwrap();
+        let addr: std::net::SocketAddr = info.bound.parse().unwrap();
+        let mut c = tokio_modbus::client::tcp::connect_slave(addr, tokio_modbus::prelude::Slave(1)).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(c.read_holding_registers(1, 1).await.unwrap().unwrap(), vec![1], "eng 300 >= 35 fires once");
+        assert_eq!(c.read_input_registers(0, 1).await.unwrap().unwrap(), vec![50], "generator at scale 1");
+
+        // Hot-apply: the same registers, now scaled 0.1 (rule unchanged).
+        let scaled = vec![
+            SimRegister { scale: Some(0.1), ..temp.clone() },
+            count.clone(),
+            SimRegister { scale: Some(0.1), ..generator.clone() },
+        ];
+        apply_live_config(&engine, Some(&scaled), Some(&rules_raw), |_, _| 0);
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(c.read_holding_registers(1, 1).await.unwrap().unwrap(), vec![1], "eng 30.0 < 35: no fire");
+        assert_eq!(c.read_input_registers(0, 1).await.unwrap().unwrap(), vec![500], "generator output follows the new scale on the next tick");
+
+        c.write_single_register(0, 360).await.unwrap().unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(c.read_holding_registers(1, 1).await.unwrap().unwrap(), vec![2], "eng 36.0 >= 35 fires");
+        engine.stop().await;
     }
 }

@@ -1,7 +1,3 @@
-// Only `raw_from_eng` is consumed so far; the rest (eng_from_raw, effective_decimals,
-// round_to, RegMeta*, build_reg_meta) is used by the rule/value-display tasks that follow.
-#![allow(dead_code)]
-
 //! Engineering-unit scaling helpers for simulator registers.
 //!
 //! Engineering value = raw * scale + offset. Defaults (scale 1, offset 0)
