@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, it, expect } from "vitest";
 
 import LiveValuesTab from "./LiveValuesTab";
@@ -58,5 +58,15 @@ describe("LiveValuesTab", () => {
     expect(screen.getByText("ON")).toBeInTheDocument();
     expect(screen.getByText(/stale/i)).toBeInTheDocument();
     expect(screen.getByText("NoData")).toBeInTheDocument();
+  });
+
+  it("shows addresses in hex and searches hex when the Hex toggle is on (F10)", () => {
+    const running = { running: true, listen: null, clientCount: 0 };
+    const regs = [reg({ id: 1, address: 257, alias: "A" }), reg({ id: 2, address: 5, alias: "B" })];
+    render(<LiveValuesTab registers={regs} snapshotFor={() => undefined} status={running} addrFmt="hex" />);
+    expect(screen.getByText("0x0101")).toBeInTheDocument();
+    fireEvent.change(screen.getByPlaceholderText(/search/i), { target: { value: "0x101" } });
+    expect(screen.getByText("A")).toBeInTheDocument();
+    expect(screen.queryByText("B")).toBeNull();
   });
 });

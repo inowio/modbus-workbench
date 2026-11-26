@@ -107,7 +107,7 @@ export default function RegistersTab(props: RegistersTabProps) {
     [registers]
   );
 
-  const filtered = useMemo(() => filterRegisters(registers, filter), [registers, filter]);
+  const filtered = useMemo(() => filterRegisters(registers, filter, addrFmt), [registers, filter, addrFmt]);
   const total = filtered.length;
   const pageCount = Math.max(1, Math.ceil(total / pageSize));
   const clampedPage = Math.min(page, pageCount - 1);

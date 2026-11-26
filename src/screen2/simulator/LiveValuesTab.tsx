@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 
-import type { PageRegister } from "./simFilters";
+import { fmtAddr } from "./ruleTargets";
+import { addressMatches, type PageRegister } from "./simFilters";
 
 export type SnapshotRow = {
   unitId: number;
@@ -21,6 +22,7 @@ type Props = {
   registers: PageRegister[];
   snapshotFor: (unitId: number, functionCode: number, address: number) => SnapshotRow | undefined;
   status: SimStatus;
+  addrFmt?: "dec" | "hex";
 };
 
 const FC_LABEL: Record<number, string> = { 1: "Coil", 2: "Discrete", 3: "Holding", 4: "Input" };
@@ -37,16 +39,16 @@ function liveValueText(row: SnapshotRow | undefined): string {
   return row.valueWord === null ? "—" : String(row.valueWord);
 }
 
-export default function LiveValuesTab({ registers, snapshotFor, status }: Props) {
+export default function LiveValuesTab({ registers, snapshotFor, status, addrFmt = "dec" }: Props) {
   const [search, setSearch] = useState("");
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
     if (!q) return registers;
     return registers.filter(
-      (r) => `${r.alias}`.toLowerCase().includes(q) || `${r.address}`.includes(q) || `${r.unitId}`.includes(q)
+      (r) => `${r.alias}`.toLowerCase().includes(q) || addressMatches(r.address, q, addrFmt) || `${r.unitId}`.includes(q)
     );
-  }, [registers, search]);
+  }, [registers, search, addrFmt]);
 
   if (!status.running) {
     return (
@@ -92,7 +94,7 @@ export default function LiveValuesTab({ registers, snapshotFor, status }: Props)
                 <tr key={r.id} className="border-t border-slate-100 dark:border-slate-800">
                   <td className="py-1">{r.unitId}</td>
                   <td>{FC_LABEL[r.functionCode] ?? r.functionCode}</td>
-                  <td>{r.address}</td>
+                  <td>{fmtAddr(r.address, addrFmt)}</td>
                   <td className="truncate">{r.alias}</td>
                   <td className="font-mono">{liveValueText(row)}</td>
                   <td>
