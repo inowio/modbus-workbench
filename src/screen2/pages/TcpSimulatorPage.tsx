@@ -18,6 +18,7 @@ import RegistersTab from "../simulator/RegistersTab";
 import RulesTab from "../simulator/RulesTab";
 import SimFooterBar from "../simulator/SimFooterBar";
 import { fmtAddr } from "../simulator/ruleTargets";
+import { liveRaw, liveValueText } from "../simulator/scaling";
 import { blankRegister } from "../simulator/simRegister";
 import SimStatusDashboard from "../simulator/SimStatusDashboard";
 import SimTabBar, { type TabKey } from "../simulator/SimTabBar";
@@ -178,11 +179,7 @@ export default function TcpSimulatorPage() {
   const history = useValueHistory(sim.snapshot, selectedKey);
 
   const liveValueOf = useCallback((r: PageRegister): string => {
-    const row = sim.snapshotFor(r.unitId, r.functionCode, r.address);
-    if (!row) return "—";
-    if (row.valueBit !== null && row.valueBit !== undefined) return row.valueBit ? "ON" : "OFF";
-    if (row.valueWord === null || row.valueWord === undefined) return "—";
-    return r.unit ? `${row.valueWord} ${r.unit}` : String(row.valueWord);
+    return liveValueText(r, sim.snapshotFor);
   }, [sim.snapshotFor]);
 
   const deleteRegister = useCallback(async (id: number) => {
@@ -344,6 +341,7 @@ export default function TcpSimulatorPage() {
                 addrFmt={addrFmt}
                 history={history}
                 liveValue={selectedRegister ? liveValueOf(selectedRegister) : "—"}
+                liveRaw={selectedRegister ? liveRaw(selectedRegister, sim.snapshotFor) : null}
                 sourceStatus={selectedRegister ? sim.snapshotFor(selectedRegister.unitId, selectedRegister.functionCode, selectedRegister.address)?.sourceStatus : undefined}
                 running={sim.status.running}
                 error={draftOwnsError ? dialogError : null}

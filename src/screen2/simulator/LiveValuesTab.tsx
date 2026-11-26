@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 
 import { fmtAddr } from "./ruleTargets";
+import { liveValueText } from "./scaling";
 import { addressMatches, type PageRegister } from "./simFilters";
 
 export type SnapshotRow = {
@@ -35,12 +36,6 @@ const SOURCE_STATUS_STYLE: Record<string, string> = {
   stale: "bg-amber-500/15 text-amber-800 dark:text-amber-200",
   missing: "bg-rose-500/15 text-rose-800 dark:text-rose-200",
 };
-
-function liveValueText(row: SnapshotRow | undefined): string {
-  if (!row) return "—";
-  if (row.valueBit !== null) return row.valueBit ? "ON" : "OFF";
-  return row.valueWord === null ? "—" : String(row.valueWord);
-}
 
 export default function LiveValuesTab({ registers, snapshotFor, status, addrFmt = "dec", onStart, busy = false }: Props) {
   const [search, setSearch] = useState("");
@@ -109,7 +104,7 @@ export default function LiveValuesTab({ registers, snapshotFor, status, addrFmt 
                   <td>{FC_LABEL[r.functionCode] ?? r.functionCode}</td>
                   <td>{fmtAddr(r.address, addrFmt)}</td>
                   <td className="truncate">{r.alias}</td>
-                  <td className="font-mono">{liveValueText(row)}</td>
+                  <td className="font-mono">{liveValueText(r, snapshotFor)}</td>
                   <td>
                     {sourceStatus ? (
                       <span className={`inline-block rounded-full px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${cls}`}>

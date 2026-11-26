@@ -16,6 +16,11 @@ export type SimRegister = {
   intervalMs: number;
   unit?: string | null;
   displayFormat?: string | null;
+  /** Engineering value = raw × scale + scaleOffset. Null/absent = defaults (1 / 0). */
+  scale?: number | null;
+  scaleOffset?: number | null;
+  /** Display decimals; null/absent = automatic. */
+  decimals?: number | null;
 };
 
 /** Parses a user-typed address: decimal ("257") or hex ("0x101"). Null if invalid / out of 0–65535. */
@@ -65,6 +70,9 @@ export function blankRegister(registers: readonly SimRegister[]): SimRegister {
     intervalMs: 1000,
     unit: null,
     displayFormat: null,
+    scale: null,
+    scaleOffset: null,
+    decimals: null,
   };
 }
 

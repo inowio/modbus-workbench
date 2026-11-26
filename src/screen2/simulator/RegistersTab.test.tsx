@@ -158,4 +158,36 @@ describe("RegistersTab", () => {
     fireEvent.mouseDown(document.body);
     expect(screen.queryByLabelText(/toggle unit column/i)).not.toBeInTheDocument();
   });
+
+  it("shows scaled engineering values while running and in the stopped summary", () => {
+    const scaled = reg({ dataType: "u16", unit: "°C", scale: 0.1, holdValue: 235 });
+    const { unmount } = render(
+      <RegistersTab
+        {...base()}
+        registers={[scaled]}
+        status={{ running: true, listen: null, clientCount: 0 }}
+        snapshotFor={() => ({ unitId: 1, functionCode: 3, address: 5, valueWord: 235, valueBit: null })}
+      />,
+    );
+    expect(screen.getByText("23.5 °C")).toBeInTheDocument();
+    unmount();
+    const gen = reg({ id: 2, alias: "G", unit: "°C", scale: 0.1, valueSource: "generator", sourceParams: JSON.stringify({ kind: "sine", min: 20, max: 30 }) });
+    render(<RegistersTab {...base()} registers={[scaled, gen]} />);
+    expect(screen.getByText("hold 23.5 °C")).toBeInTheDocument();
+    expect(screen.getByText("sine 20–30 °C")).toBeInTheDocument();
+  });
+
+  it("decodes a two-word f32 live value", () => {
+    const f = reg({ dataType: "f32", address: 10 });
+    const words: Record<number, number> = { 10: 0x420e, 11: 0 };
+    render(
+      <RegistersTab
+        {...base()}
+        registers={[f]}
+        status={{ running: true, listen: null, clientCount: 0 }}
+        snapshotFor={(u, fc, a) => (a in words ? { unitId: u, functionCode: fc, address: a, valueWord: words[a], valueBit: null } : undefined)}
+      />,
+    );
+    expect(screen.getByText("35.500")).toBeInTheDocument();
+  });
 });

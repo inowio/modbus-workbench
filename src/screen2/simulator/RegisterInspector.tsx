@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 
+import UnitPicker from "../pages/analyzer/signalEditor/UnitPicker";
 import { fmtAddr, type AddrFmt } from "./ruleTargets";
+import { engFromRaw, formatEng, rawFromEng, registerScaling } from "./scaling";
 import { rwLabel, type PageRegister } from "./simFilters";
 import { addressConflict, parseAddressInput } from "./simRegister";
 import { buildPeriodicParams, initialPeriodText, parseSourceParams, periodPlaceholder } from "./sourceParams";
@@ -78,6 +80,29 @@ function parseIntText(text: string, min: number, max: number): number | null {
   return n >= min && n <= max ? n : null;
 }
 
+type ScalingText = { scale: string; offset: string; decimals: string };
+
+function scalingTexts(r: PageRegister): ScalingText {
+  return {
+    scale: r.scale == null ? "" : String(r.scale),
+    offset: r.scaleOffset == null ? "" : String(r.scaleOffset),
+    decimals: r.decimals == null ? "" : String(r.decimals),
+  };
+}
+
+/** Empty = default (null); otherwise a finite number, else undefined (invalid). */
+function parseOptionalNumber(text: string): number | null | undefined {
+  const t = text.trim();
+  if (t === "") return null;
+  const n = Number(t);
+  return Number.isFinite(n) ? n : undefined;
+}
+
+/** Engineering text for a raw value, trimmed of float noise. */
+function engText(raw: number, scale: number, offset: number): string {
+  return String(Number(engFromRaw(raw, scale, offset).toFixed(9)));
+}
+
 /** True when two register records differ in any field other than sourceParams (null/""/undefined count as equal). */
 function registerFieldsDiffer(a: PageRegister, b: PageRegister): boolean {
   const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
@@ -103,6 +128,8 @@ export type RegisterInspectorProps = {
   devices: SimDevice[];
   history: number[];
   liveValue: string;
+  /** Decoded raw value of the live register (unscaled), for the preview line. */
+  liveRaw?: number | null;
   sourceStatus?: string | null;
   running: boolean;
   onSave: (reg: PageRegister) => void;
@@ -134,7 +161,7 @@ function Sparkline({ history }: { history: number[] }) {
 }
 
 export default function RegisterInspector(props: RegisterInspectorProps) {
-  const { register, devices, history, liveValue, sourceStatus, running, onSave, onDuplicate, onDelete, onClose, onViewDevice, addrFmt = "dec", registers = [], error, onCreate, onDirtyChange } = props;
+  const { register, devices, history, liveValue, liveRaw = null, sourceStatus, running, onSave, onDuplicate, onDelete, onClose, onViewDevice, addrFmt = "dec", registers = [], error, onCreate, onDirtyChange } = props;
 
   const [tab, setTab] = useState<SubTab>("general");
   const [reg, setReg] = useState<PageRegister | null>(register);
@@ -157,6 +184,10 @@ export default function RegisterInspector(props: RegisterInspectorProps) {
   const [intervalText, setIntervalText] = useState(() => (register ? String(register.intervalMs ?? 0) : ""));
   // Whether the user typed a period themselves (so switching source keeps it).
   const [periodTouched, setPeriodTouched] = useState(false);
+  // Scaling fields are typed as text; empty means "default" (stored as null).
+  const [scalingText, setScalingText] = useState<ScalingText>(() => (register ? scalingTexts(register) : { scale: "", offset: "", decimals: "" }));
+  // Hold value as typed in engineering units (null = derive from the raw value).
+  const [holdText, setHoldText] = useState<string | null>(null);
 
   useEffect(() => {
     if (!register) {
@@ -182,6 +213,8 @@ export default function RegisterInspector(props: RegisterInspectorProps) {
     setUnitText(String(register.unitId));
     setIntervalText(String(register.intervalMs ?? 0));
     setPeriodTouched(false);
+    setScalingText(scalingTexts(register));
+    setHoldText(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [register?.id]);
 
@@ -233,7 +266,24 @@ export default function RegisterInspector(props: RegisterInspectorProps) {
     reg.valueSource !== "hold" && parseIntText(intervalText, 0, 2147483647) === null
       ? "Enter the update interval as a whole number of milliseconds (0 = default)."
       : null;
-  const blocked = addrError !== null || unitError !== null || conflict !== null || intervalError !== null;
+  const isBitBank = reg.functionCode === 1 || reg.functionCode === 2;
+  const scaleParsed = parseOptionalNumber(scalingText.scale);
+  const offsetParsed = parseOptionalNumber(scalingText.offset);
+  const decimalsParsed = parseOptionalNumber(scalingText.decimals);
+  const scaleError = isBitBank
+    ? null
+    : scaleParsed === undefined
+      ? "Scale must be a number."
+      : scaleParsed === 0
+        ? "Scale can't be zero."
+        : null;
+  const offsetError = !isBitBank && offsetParsed === undefined ? "Offset must be a number." : null;
+  const decimalsError =
+    !isBitBank && (decimalsParsed === undefined || (decimalsParsed !== null && (!Number.isInteger(decimalsParsed) || decimalsParsed < 0 || decimalsParsed > 6)))
+      ? "Decimals must be a whole number from 0 to 6 (or empty for automatic)."
+      : null;
+  const scalingError = scaleError ?? offsetError ?? decimalsError;
+  const blocked = addrError !== null || unitError !== null || conflict !== null || intervalError !== null || scalingError !== null;
 
   const set = (patch: Partial<PageRegister>) => setReg((r) => (r ? { ...r, ...patch } : r));
   const device = devices.find((d) => d.id === reg.deviceInstanceId);
@@ -275,16 +325,46 @@ export default function RegisterInspector(props: RegisterInspectorProps) {
     set(patch);
   };
 
+  const sc = registerScaling({
+    dataType: reg.dataType,
+    unit: reg.unit,
+    scale: scaleParsed ?? null,
+    scaleOffset: offsetParsed ?? null,
+    decimals: decimalsParsed ?? null,
+  });
+  const unitLabel = isBitBank ? "" : (reg.unit ?? "").trim();
+  const unitSuffix = unitLabel ? ` (${unitLabel})` : "";
+  const editScaling = (field: keyof ScalingText, text: string) => {
+    setScalingText((t) => ({ ...t, [field]: text }));
+    const n = parseOptionalNumber(text);
+    if (n === undefined) return; // invalid text: error shown, stored value unchanged
+    if (field === "scale") set({ scale: n });
+    else if (field === "offset") set({ scaleOffset: n });
+    else set({ decimals: n === null ? null : Number.isInteger(n) ? n : reg.decimals ?? null });
+    if (field !== "decimals") setHoldText(null);
+  };
+  const previewRaw = running && liveRaw !== null ? liveRaw : reg.valueSource === "hold" ? reg.holdValue : liveRaw ?? 0;
+  const holdShown = holdText ?? engText(reg.holdValue, sc.scale, sc.offset);
+  const showRawHold = !isBitBank && (sc.scale !== 1 || sc.offset !== 0);
+
   const buildSourceParams = () => buildParamsJson(reg.valueSource, srcNow);
 
+  // Unset scaling is stored as null so unscaled registers stay byte-identical.
+  const withScaling = (r: PageRegister): PageRegister => ({
+    ...r,
+    scale: r.scale ?? null,
+    scaleOffset: r.scaleOffset ?? null,
+    decimals: r.decimals ?? null,
+  });
+
   const handleSave = () => {
-    if (intervalError) return;
-    onSave({ ...reg, sourceParams: buildSourceParams() });
+    if (intervalError || scalingError) return;
+    onSave(withScaling({ ...reg, sourceParams: buildSourceParams() }));
   };
 
   const handleCreate = () => {
     if (blocked || parsedAddr === null) return;
-    void onCreate?.({ ...reg, address: parsedAddr, sourceParams: buildSourceParams() });
+    void onCreate?.(withScaling({ ...reg, address: parsedAddr, sourceParams: buildSourceParams() }));
   };
 
   return (
@@ -425,14 +505,66 @@ export default function RegisterInspector(props: RegisterInspectorProps) {
                 ))}
               </select>
             </label>
-            <label className={LABEL_CLASS}>
-              Unit
-              <input aria-label="Unit" value={reg.unit ?? ""} onChange={(e) => set({ unit: e.target.value })} className={INPUT_CLASS} />
-            </label>
             <div className={LABEL_CLASS}>
               Access
               <span className="py-1 text-sm text-slate-700 dark:text-slate-200">{accessLabel(reg.functionCode)}</span>
             </div>
+            {isBitBank ? null : (
+              <fieldset className="col-span-2 space-y-2 rounded-lg border border-slate-200 p-3 dark:border-slate-800">
+                <legend className="px-1 text-xs font-semibold text-slate-600 dark:text-slate-300">Scaling</legend>
+                <div className="grid grid-cols-2 gap-2">
+                  <div className={`col-span-2 ${LABEL_CLASS}`}>
+                    <label htmlFor="register-unit">Unit</label>
+                    <UnitPicker id="register-unit" value={reg.unit ?? ""} onChange={(u) => set({ unit: u })} />
+                  </div>
+                  <label className={LABEL_CLASS}>
+                    Scale
+                    <input
+                      aria-label="Scale"
+                      type="text"
+                      inputMode="decimal"
+                      value={scalingText.scale}
+                      placeholder="1"
+                      aria-invalid={scaleError ? "true" : undefined}
+                      onChange={(e) => editScaling("scale", e.target.value)}
+                      className={`${INPUT_CLASS} ${scaleError ? "border-rose-500 dark:border-rose-500" : ""}`}
+                    />
+                  </label>
+                  <label className={LABEL_CLASS}>
+                    Offset
+                    <input
+                      aria-label="Offset"
+                      type="text"
+                      inputMode="decimal"
+                      value={scalingText.offset}
+                      placeholder="0"
+                      aria-invalid={offsetError ? "true" : undefined}
+                      onChange={(e) => editScaling("offset", e.target.value)}
+                      className={`${INPUT_CLASS} ${offsetError ? "border-rose-500 dark:border-rose-500" : ""}`}
+                    />
+                  </label>
+                  <label className={LABEL_CLASS}>
+                    Decimals
+                    <input
+                      aria-label="Decimals"
+                      type="text"
+                      inputMode="numeric"
+                      value={scalingText.decimals}
+                      placeholder="auto"
+                      aria-invalid={decimalsError ? "true" : undefined}
+                      onChange={(e) => editScaling("decimals", e.target.value)}
+                      className={`${INPUT_CLASS} ${decimalsError ? "border-rose-500 dark:border-rose-500" : ""}`}
+                    />
+                  </label>
+                </div>
+                <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                  {scalingError ? "—" : `raw ${previewRaw} = ${formatEng(engFromRaw(previewRaw, sc.scale, sc.offset), sc.decimals, sc.unit)}`}
+                </p>
+                <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                  Value = raw × scale + offset. Generator, preset and rule values are entered in these units.
+                </p>
+              </fieldset>
+            )}
           </div>
         )}
 
@@ -450,8 +582,18 @@ export default function RegisterInspector(props: RegisterInspectorProps) {
 
             {reg.valueSource === "hold" && (
               <label className={LABEL_CLASS}>
-                Initial value
-                <input type="number" value={reg.holdValue} onChange={(e) => set({ holdValue: Number(e.target.value) })} className={INPUT_CLASS} />
+                {`Initial value${unitSuffix}`}
+                <input
+                  type="number"
+                  step="any"
+                  value={holdShown}
+                  onChange={(e) => {
+                    setHoldText(e.target.value);
+                    set({ holdValue: rawFromEng(Number(e.target.value), sc.scale, sc.offset, reg.dataType) });
+                  }}
+                  className={INPUT_CLASS}
+                />
+                {showRawHold ? <span className="text-[11px] text-slate-500 dark:text-slate-400">{`raw ${reg.holdValue}`}</span> : null}
               </label>
             )}
 
@@ -573,11 +715,11 @@ export default function RegisterInspector(props: RegisterInspectorProps) {
             {(reg.valueSource === "device" || reg.valueSource === "generator") && (
               <>
                 <label className={LABEL_CLASS}>
-                  Min
+                  {`Min${unitSuffix}`}
                   <input aria-label="Min" type="number" value={min} onChange={(e) => setMin(Number(e.target.value))} className={INPUT_CLASS} />
                 </label>
                 <label className={LABEL_CLASS}>
-                  Max
+                  {`Max${unitSuffix}`}
                   <input aria-label="Max" type="number" value={max} onChange={(e) => setMax(Number(e.target.value))} className={INPUT_CLASS} />
                 </label>
                 <label className={LABEL_CLASS}>
@@ -648,6 +790,7 @@ export default function RegisterInspector(props: RegisterInspectorProps) {
             {unitError ? <p>{unitError}</p> : null}
             {conflict ? <p>{conflict}</p> : null}
             {intervalError ? <p>{intervalError}</p> : null}
+            {scalingError ? <p>{scalingError}</p> : null}
             {error ? <p>{error}</p> : null}
           </div>
         ) : null}
@@ -726,7 +869,7 @@ export default function RegisterInspector(props: RegisterInspectorProps) {
             </button>
             <button
               type="button"
-              disabled={!dirty || intervalError !== null}
+              disabled={!dirty || intervalError !== null || scalingError !== null}
               onClick={handleSave}
               className="rounded-full border border-emerald-600/60 bg-emerald-500/10 px-4 py-2 text-sm font-semibold text-emerald-800 disabled:cursor-not-allowed disabled:opacity-50 dark:border-emerald-500/60 dark:text-emerald-200"
             >

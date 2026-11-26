@@ -15,6 +15,7 @@ import {
   type PageRegister,
   type RegisterFilter,
 } from "./simFilters";
+import { liveValueText } from "./scaling";
 import { sourceSummary } from "./sourceParams";
 
 const FC_LABEL: Record<number, string> = { 1: "Coil", 2: "Discrete", 3: "Holding", 4: "Input" };
@@ -144,7 +145,7 @@ export default function RegistersTab(props: RegistersTabProps) {
     }
     const row = snapshotFor(r.unitId, r.functionCode, r.address);
     if (!row) return <span>&mdash;</span>;
-    const text = row.valueBit !== null ? (row.valueBit ? "ON" : "OFF") : row.valueWord === null ? "—" : String(row.valueWord);
+    const text = liveValueText(r, snapshotFor);
     const sourceStatus = row.sourceStatus;
     const badgeCls = sourceStatus ? SOURCE_STATUS_STYLE[sourceStatus] ?? "bg-slate-500/15 text-slate-700 dark:text-slate-300" : null;
     return (

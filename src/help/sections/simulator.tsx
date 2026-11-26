@@ -201,6 +201,9 @@ const simulatorSection: HelpSectionDefinition = {
         <p>
           The table supports search, filters (unit / source / type), a <strong>Columns</strong> chooser, a <strong>Dec/Hex</strong> address toggle, and pagination. Click a row to open it in the same side panel to edit, Save, Duplicate, or Delete; use the row's delete action (with confirmation) to remove it.
         </p>
+        <p>
+          <strong>Scaling</strong> (General tab, Holding and Input registers): pick a <strong>Unit</strong>, then set <strong>Scale</strong>, <strong>Offset</strong> and optional <strong>Decimals</strong> so the register reads in real-world values (engineering value = raw × scale + offset; a raw 235 with scale 0.1 shows as 23.5 °C). The Registers table, Live Values and the panel show the scaled value, hold values and generator/preset Min/Max are entered in those units, and the master still reads the same raw registers. Leave the fields empty for plain raw values; scale cannot be zero.
+        </p>
         <p className="text-xs text-slate-500 dark:text-slate-400">
           Writable banks (Coils, Holding) accept master writes (0x05/0x06/0x0F/0x10); Discrete Inputs and Input registers are read-only, as in the Modbus spec.
         </p>

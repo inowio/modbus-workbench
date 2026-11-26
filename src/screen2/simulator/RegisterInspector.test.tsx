@@ -401,3 +401,82 @@ describe("RegisterInspector", () => {
     });
   });
 });
+
+describe("RegisterInspector scaling", () => {
+  const scaled: PageRegister = {
+    ...reg, id: 20, dataType: "u16", functionCode: 4, valueSource: "hold", holdValue: 235,
+    sourceParams: "{}", unit: "°C", scale: 0.1, scaleOffset: 0, decimals: null,
+  };
+
+  it("shows the Scaling block with a preview for holding/input and hides it for bit banks", () => {
+    const { unmount } = render(<RegisterInspector {...base()} register={scaled} />);
+    expect(screen.getByText("Scaling")).toBeInTheDocument();
+    expect(screen.getByLabelText("Scale")).toBeInTheDocument();
+    expect(screen.getByLabelText("Offset")).toBeInTheDocument();
+    expect(screen.getByLabelText("Decimals")).toBeInTheDocument();
+    expect(screen.getByText("raw 235 = 23.5 °C")).toBeInTheDocument();
+    unmount();
+    render(<RegisterInspector {...base()} register={{ ...scaled, id: 21, functionCode: 1, dataType: "bool" }} />);
+    expect(screen.queryByText("Scaling")).toBeNull();
+    expect(screen.queryByLabelText("Scale")).toBeNull();
+  });
+
+  it("rejects scale 0 inside the panel and blocks Save and Create", () => {
+    const p = base();
+    const { unmount } = render(<RegisterInspector {...p} register={scaled} />);
+    fireEvent.change(screen.getByLabelText("Scale"), { target: { value: "0" } });
+    expect(within(screen.getByRole("alert")).getByText(/scale can.t be zero/i)).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Alias"), { target: { value: "x" } });
+    expect(screen.getByRole("button", { name: /^save$/i })).toBeDisabled();
+    unmount();
+    const onCreate = vi.fn();
+    render(<RegisterInspector {...p} register={blankRegister([])} onCreate={onCreate} />);
+    fireEvent.change(screen.getByLabelText("Scale"), { target: { value: "0" } });
+    expect(screen.getByRole("button", { name: /^create$/i })).toBeDisabled();
+  });
+
+  it("enters the hold value in engineering units and saves it raw, showing raw small", () => {
+    const p = base();
+    render(<RegisterInspector {...p} register={scaled} />);
+    fireEvent.click(screen.getByRole("tab", { name: /source/i }));
+    const initial = screen.getByLabelText(/initial value/i) as HTMLInputElement;
+    expect(initial.value).toBe("23.5");
+    expect(screen.getByText("raw 235")).toBeInTheDocument();
+    fireEvent.change(initial, { target: { value: "25.6" } });
+    expect(screen.getByText("raw 256")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+    expect(p.onSave.mock.calls[0][0].holdValue).toBe(256);
+  });
+
+  it("labels generator and device Min/Max with the unit", () => {
+    const gen = { ...scaled, id: 22, valueSource: "generator", dataType: "u16", sourceParams: JSON.stringify({ kind: "sine", min: 20, max: 30 }) };
+    const { unmount } = render(<RegisterInspector {...base()} register={gen} />);
+    fireEvent.click(screen.getByRole("tab", { name: /source/i }));
+    expect(screen.getByLabelText("Min (°C)")).toBeInTheDocument();
+    expect(screen.getByLabelText("Max (°C)")).toBeInTheDocument();
+    unmount();
+    render(<RegisterInspector {...base()} register={{ ...gen, id: 23, valueSource: "device", sourceParams: JSON.stringify({ preset: "temperature", min: 0, max: 5 }) }} />);
+    fireEvent.click(screen.getByRole("tab", { name: /source/i }));
+    expect(screen.getByLabelText("Min (°C)")).toBeInTheDocument();
+  });
+
+  it("saves scaling edits and leaves the fields null with defaults", () => {
+    const p = base();
+    render(<RegisterInspector {...p} register={{ ...scaled, id: 24, scale: null, scaleOffset: null, unit: null }} />);
+    fireEvent.change(screen.getByLabelText("Alias"), { target: { value: "Renamed" } });
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+    expect(p.onSave.mock.calls[0][0]).toMatchObject({ scale: null, scaleOffset: null, decimals: null });
+  });
+
+  it("includes scale, offset and decimals in dirty tracking and the saved payload", () => {
+    const p = base();
+    render(<RegisterInspector {...p} register={{ ...scaled, id: 25, scale: null, scaleOffset: null, unit: null }} />);
+    expect(screen.getByRole("button", { name: /^save$/i })).toBeDisabled();
+    fireEvent.change(screen.getByLabelText("Scale"), { target: { value: "0.1" } });
+    expect(screen.getByText(/unsaved changes/i)).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Offset"), { target: { value: "-40" } });
+    fireEvent.change(screen.getByLabelText("Decimals"), { target: { value: "2" } });
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+    expect(p.onSave.mock.calls[0][0]).toMatchObject({ scale: 0.1, scaleOffset: -40, decimals: 2 });
+  });
+});

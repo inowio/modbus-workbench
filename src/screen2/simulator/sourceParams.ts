@@ -1,4 +1,5 @@
 import { bankName, fmtAddr, type AddrFmt } from "./ruleTargets";
+import { engFromRaw, formatEng, isIdentityScaling, registerScaling, type ScalableRegister } from "./scaling";
 
 // Shared source-param helpers for the register editor (RegisterInspector).
 
@@ -72,15 +73,22 @@ export function buildPeriodicParams(
  * place of a live value while the simulator is stopped.
  */
 export function sourceSummary(
-  r: { valueSource: string; holdValue: number; sourceParams: string },
+  r: { valueSource: string; holdValue: number; sourceParams: string } & Partial<ScalableRegister>,
   addrFmt: AddrFmt = "dec",
 ): string {
   const p = parseSourceParams(r.sourceParams);
+  const unitSuffix = r.unit ? ` ${r.unit}` : "";
   switch (r.valueSource) {
-    case "hold":
-      return `hold ${r.holdValue}`;
+    case "hold": {
+      // Hold is stored raw; show it in engineering units (unchanged when unscaled).
+      const reg = { dataType: "u16", ...r };
+      if (isIdentityScaling(reg)) return `hold ${r.holdValue}${unitSuffix}`;
+      const sc = registerScaling(reg);
+      return `hold ${formatEng(engFromRaw(r.holdValue, sc.scale, sc.offset), sc.decimals, sc.unit)}`;
+    }
     case "generator":
-      return `${p.kind ?? "generator"} ${p.min ?? 0}–${p.max ?? 100}`;
+      // Generator min/max are engineering values already.
+      return `${p.kind ?? "generator"} ${p.min ?? 0}–${p.max ?? 100}${unitSuffix}`;
     case "device":
       return `preset ${p.preset ?? "device"}`;
     case "route":

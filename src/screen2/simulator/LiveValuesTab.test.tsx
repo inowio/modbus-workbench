@@ -83,4 +83,15 @@ describe("LiveValuesTab", () => {
     expect(screen.getByText("A")).toBeInTheDocument();
     expect(screen.queryByText("B")).toBeNull();
   });
+
+  it("shows the scaled value with its unit", () => {
+    render(
+      <LiveValuesTab
+        registers={[reg({ unit: "°C", scale: 0.1 })]}
+        snapshotFor={() => ({ unitId: 1, functionCode: 3, address: 5, valueWord: 235, valueBit: null })}
+        status={{ running: true, listen: null, clientCount: 0 }}
+      />
+    );
+    expect(screen.getByText("23.5 °C")).toBeInTheDocument();
+  });
 });
