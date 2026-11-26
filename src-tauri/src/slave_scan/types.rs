@@ -168,7 +168,6 @@ pub fn parse_ip_range(s: &str) -> Result<Vec<Ipv4Addr>, String> {
 }
 
 /// Suggests a range for a private address: its /24 minus network and broadcast.
-#[allow(dead_code)] // used by the range engine (Task 2)
 pub fn default_range_for(ip: Ipv4Addr) -> Option<String> {
     let [a, b, c, _] = ip.octets();
     let private = a == 10 || (a == 172 && (16..=31).contains(&b)) || (a == 192 && b == 168);

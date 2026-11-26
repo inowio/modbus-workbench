@@ -281,6 +281,7 @@ pub fn run() {
             simulator::simulator_rebase_device,
             slave_scan::start_slave_scan,
             slave_scan::cancel_slave_scan,
+            slave_scan::scan_default_ip_range,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

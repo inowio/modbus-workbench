@@ -187,7 +187,7 @@ async fn reach_host<H: HostProbe>(
         let reach = tokio::select! {
             biased;
             _ = cancel.cancelled() => return (addr, None),
-            r = probe.reach(addr, wait) => r,
+            r = tokio::time::timeout(wait, probe.reach(addr, wait)) => r.unwrap_or(Reach::TimedOut),
         };
         if reach != Reach::TimedOut {
             return (addr, Some(reach));
@@ -487,6 +487,7 @@ mod tests {
     }
 
     #[derive(Clone, Debug)]
+    #[allow(dead_code)] // payloads are kept for Debug output of failed assertions
     enum Ev {
         Found(ScanFound),
         Progress(ScanProgress),

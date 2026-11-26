@@ -1010,7 +1010,7 @@ fn resolve_client_addresses(host: &str, port: u16) -> Vec<String> {
     vec![format!("{host}:{port}")]
 }
 
-fn primary_local_ipv4() -> Option<std::net::Ipv4Addr> {
+pub(crate) fn primary_local_ipv4() -> Option<std::net::Ipv4Addr> {
     use std::net::{IpAddr, UdpSocket};
     let sock = UdpSocket::bind("0.0.0.0:0").ok()?;
     sock.connect("8.8.8.8:80").ok()?;

@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, SocketAddrV4};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -20,6 +20,7 @@ use tokio_modbus::{Error, ProtocolError, Slave};
 use tokio_serial::SerialPortBuilderExt;
 
 use super::engine::{Connector, OpenError, Opener, Prober};
+use super::range::{ConnectorFactory, HostProbe, Reach};
 use super::types::{format_settings, ProbeOutcome, SerialParams};
 use crate::modbus::{
     parse_serial_data_bits, parse_serial_flow_control, parse_serial_parity,
@@ -535,6 +536,38 @@ impl Connector for TcpConnector {
             }
             Err(last_error)
         }
+    }
+}
+
+/// Stage 1 of a range scan: a plain TCP connect, dropped at once.
+pub struct TcpReach;
+
+impl HostProbe for TcpReach {
+    fn reach(&self, addr: SocketAddrV4, wait: Duration) -> impl Future<Output = Reach> + Send {
+        async move {
+            let started = std::time::Instant::now();
+            match timeout(wait, TcpStream::connect(addr)).await {
+                Ok(Ok(stream)) => {
+                    drop(stream);
+                    Reach::Open { ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX) }
+                }
+                Ok(Err(e)) if e.kind() == io::ErrorKind::ConnectionRefused => Reach::Refused,
+                Ok(Err(_)) | Err(_) => Reach::TimedOut,
+            }
+        }
+    }
+}
+
+/// Stage 2 of a range scan: one connector per open host.
+pub struct TcpConnectorFactory {
+    pub connect_timeout: Duration,
+}
+
+impl ConnectorFactory for TcpConnectorFactory {
+    type C = TcpConnector;
+
+    fn for_host(&self, addr: SocketAddrV4) -> TcpConnector {
+        TcpConnector::new(vec![addr.into()], self.connect_timeout)
     }
 }
 
@@ -1117,6 +1150,7 @@ mod tests {
     #[derive(Default)]
     struct Recorder {
         found: Mutex<Vec<ScanFound>>,
+        hosts: Mutex<Vec<ScanHost>>,
         done: Mutex<Vec<ScanDone>>,
     }
 
@@ -1126,7 +1160,9 @@ mod tests {
         }
         fn progress(&self, _e: ScanProgress) {}
         fn notice(&self, _e: ScanNotice) {}
-        fn host(&self, _e: ScanHost) {}
+        fn host(&self, e: ScanHost) {
+            self.hosts.lock().unwrap().push(e);
+        }
         fn done(&self, e: ScanDone) {
             self.done.lock().unwrap().push(e);
         }
@@ -1182,5 +1218,58 @@ mod tests {
         assert_eq!(found[3], (4, Category::Found, "exception 0x02".to_string()));
         assert_eq!(found[8], (9, Category::GatewayNoDevice, "gateway exception 0x0B".to_string()));
         assert!(sink.done.lock().unwrap().is_empty(), "the caller sends done");
+    }
+
+    #[tokio::test]
+    async fn tcp_reach_open_and_refused() {
+        use crate::slave_scan::range::{HostProbe, Reach};
+        use std::net::SocketAddrV4;
+        let wait = Duration::from_millis(500);
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let SocketAddr::V4(open) = listener.local_addr().expect("addr") else { panic!("v4") };
+        assert!(matches!(TcpReach.reach(open, wait).await, Reach::Open { .. }));
+
+        let closed: SocketAddrV4 = {
+            let l = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let SocketAddr::V4(a) = l.local_addr().expect("addr") else { panic!("v4") };
+            a
+        };
+        let reach = TcpReach.reach(closed, wait).await;
+        assert!(!matches!(reach, Reach::Open { .. }), "{reach:?}");
+    }
+
+    #[tokio::test]
+    async fn range_scan_end_to_end_on_loopback() {
+        use crate::slave_scan::engine::HostStatus;
+        use crate::slave_scan::range::run_range_scan;
+        let addr = start_server().await;
+        let scan = ValidScan {
+            scan_id: "r".into(),
+            kind: ScanKind::TcpRange,
+            units: vec![3],
+            probe: ProbeKind::Holding,
+            wait: WAIT,
+            retries: 0,
+            ports: vec![],
+            combos: vec![],
+            tcp: Some(TcpTarget { host: String::new(), port: addr.port() }),
+            concurrency: 1,
+            hosts: vec![std::net::Ipv4Addr::LOCALHOST],
+            host_concurrency: 4,
+            connect_wait: Duration::from_millis(500),
+        };
+        let sink = Arc::new(Recorder::default());
+        let (_tx, cancel) = cancel_pair();
+        let factory = Arc::new(TcpConnectorFactory { connect_timeout: Duration::from_secs(2) });
+        let done =
+            run_range_scan(scan, "ws".into(), Arc::new(TcpReach), factory, sink.clone(), cancel).await;
+        assert_eq!(done.reason, "completed", "{done:?}");
+        let hosts = sink.hosts.lock().unwrap();
+        let last = hosts.last().expect("host event");
+        assert_eq!(last.status, HostStatus::Devices, "{last:?}");
+        assert_eq!(last.found, 1);
+        let found = sink.found.lock().unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].unit_id, 3);
     }
 }

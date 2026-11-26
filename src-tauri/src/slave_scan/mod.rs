@@ -3,9 +3,6 @@
 //! [`transport`].
 
 pub mod engine;
-// `run_range_scan` and its traits are wired into `start_slave_scan` next
-// (TcpReach, the per-host connector factory); until then nothing calls them.
-#[allow(dead_code)]
 pub mod range;
 pub mod transport;
 pub mod types;
@@ -30,8 +27,8 @@ use engine::{
     cancel_pair, run_scan, Cancel, Connector, Opener, ScanDone, ScanFound, ScanHost, ScanNotice,
     ScanProgress, ScanSink,
 };
-use transport::{SerialOpener, TcpConnector};
-use types::{validate, ScanKind, ScanRequest, ValidScan};
+use transport::{SerialOpener, TcpConnector, TcpConnectorFactory, TcpReach};
+use types::{default_range_for, validate, ScanKind, ScanRequest, ValidScan};
 
 const POLLING_ACTIVE: &str = "Stop Analyzer polling before scanning — it is using the connection.";
 const PORT_RELEASE_WAIT: Duration = Duration::from_secs(3);
@@ -278,15 +275,21 @@ pub async fn start_slave_scan(
         return Ok(scan_id);
     };
     // 6. Run it; the task owns both guards.
-    tauri::async_runtime::spawn(run_and_report(
-        (flag, entry),
-        scan,
-        ws,
-        Arc::new(SerialOpener::new()),
-        connector,
-        sink,
-        cancel,
-    ));
+    let guards = (flag, entry);
+    if scan.kind == ScanKind::TcpRange {
+        let factory = Arc::new(TcpConnectorFactory { connect_timeout });
+        tauri::async_runtime::spawn(report_range(guards, scan, ws, Arc::new(TcpReach), factory, sink, cancel));
+    } else {
+        tauri::async_runtime::spawn(run_and_report(
+            guards,
+            scan,
+            ws,
+            Arc::new(SerialOpener::new()),
+            connector,
+            sink,
+            cancel,
+        ));
+    }
     // 7.
     Ok(scan_id)
 }
@@ -305,6 +308,32 @@ async fn run_and_report<O: Opener, C: Connector, S: ScanSink>(
 ) {
     let scan_id = scan.scan_id.clone();
     let run = tokio::spawn(run_scan(scan, ws.clone(), opener, connector, sink.clone(), cancel));
+    finish(guards, run, scan_id, ws, &*sink).await;
+}
+
+/// `run_and_report` for an IP range scan.
+async fn report_range<H: range::HostProbe, F: range::ConnectorFactory, S: ScanSink>(
+    guards: (ScanFlagGuard, ScanEntryGuard),
+    scan: ValidScan,
+    ws: String,
+    probe: Arc<H>,
+    factory: Arc<F>,
+    sink: Arc<S>,
+    cancel: Cancel,
+) {
+    let scan_id = scan.scan_id.clone();
+    let run = tokio::spawn(range::run_range_scan(scan, ws.clone(), probe, factory, sink.clone(), cancel));
+    finish(guards, run, scan_id, ws, &*sink).await;
+}
+
+/// Waits for the scan task, frees the workspace, then sends `done`.
+async fn finish<S: ScanSink>(
+    guards: (ScanFlagGuard, ScanEntryGuard),
+    run: tokio::task::JoinHandle<ScanDone>,
+    scan_id: String,
+    ws: String,
+    sink: &S,
+) {
     let done = match run.await {
         Ok(done) => done,
         Err(e) => {
@@ -321,6 +350,13 @@ async fn run_and_report<O: Opener, C: Connector, S: ScanSink>(
     };
     drop(guards);
     sink.done(done);
+}
+
+/// The local network's default scan range, for pre-filling the UI. `None`
+/// when the machine has no private IPv4 address.
+#[tauri::command]
+pub fn scan_default_ip_range() -> Option<String> {
+    crate::simulator::primary_local_ipv4().and_then(default_range_for)
 }
 
 #[tauri::command]
@@ -643,5 +679,49 @@ mod tests {
         drop(prepared);
         assert_released(&scan_state, &modbus);
         assert!(sink.0.lock().unwrap().is_empty());
+    }
+
+    fn range_scan(id: &str) -> ValidScan {
+        ValidScan {
+            kind: ScanKind::TcpRange,
+            ports: vec![],
+            combos: vec![],
+            tcp: Some(types::TcpTarget { host: String::new(), port: 502 }),
+            hosts: vec![std::net::Ipv4Addr::LOCALHOST],
+            host_concurrency: 4,
+            connect_wait: Duration::from_millis(100),
+            ..serial_scan(id)
+        }
+    }
+
+    #[tokio::test]
+    async fn range_scan_reserves_entry_and_tcp_flag() {
+        let (scan_state, modbus, polling) =
+            (SlaveScanState::default(), ModbusState::default(), AnalyzerPollingState::default());
+        let sink = DoneSink::default();
+        let prepared = prepare(&scan_state, &modbus, &polling, "ws", &range_scan("r1"), Duration::from_secs(1), Duration::from_millis(20), &sink)
+            .await
+            .expect("prepared")
+            .expect("not cancelled");
+        assert!(prepared.connector.is_none(), "stage 2 builds a connector per host");
+        assert!(scan_block_error(&modbus, "ws", SessionKind::Tcp).is_some());
+        assert_eq!(scan_block_error(&modbus, "ws", SessionKind::Rtu), None);
+        assert!(check_free(&scan_state, "ws").is_err());
+        drop(prepared);
+        assert_eq!(scan_block_error(&modbus, "ws", SessionKind::Tcp), None, "flag cleared");
+        check_free(&scan_state, "ws").expect("entry cleared");
+    }
+
+    #[tokio::test]
+    async fn range_scan_refused_while_polling_runs() {
+        let (scan_state, modbus, polling) =
+            (SlaveScanState::default(), ModbusState::default(), AnalyzerPollingState::default());
+        let worker = tokio::spawn(std::future::pending::<()>());
+        polling.insert_worker_for_test("ws", tauri::async_runtime::JoinHandle::Tokio(worker));
+        let sink = DoneSink::default();
+        let res = prepare(&scan_state, &modbus, &polling, "ws", &range_scan("r1"), Duration::from_secs(1), Duration::from_millis(20), &sink).await;
+        assert_eq!(res.err().as_deref(), Some(POLLING_ACTIVE));
+        assert_eq!(scan_block_error(&modbus, "ws", SessionKind::Tcp), None);
+        check_free(&scan_state, "ws").expect("nothing reserved");
     }
 }
