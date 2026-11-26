@@ -244,7 +244,7 @@ export default function TemplateEditorModal(props: {
     <>
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/70 p-4 backdrop-blur-sm">
       <div role="dialog" aria-modal="true" aria-labelledby="tpl-editor-title"
-        className="flex h-[92vh] w-[96vw] max-w-[1800px] flex-col overflow-hidden rounded-2xl border border-slate-200 bg-white text-slate-900 shadow-2xl dark:border-slate-800 dark:bg-slate-900 dark:text-slate-100">
+        className="@container flex h-[92vh] w-[96vw] max-w-[1800px] flex-col overflow-hidden rounded-2xl border border-slate-200 bg-white text-slate-900 shadow-2xl dark:border-slate-800 dark:bg-slate-900 dark:text-slate-100">
 
         {/* Header */}
         <div className="flex shrink-0 items-center justify-between gap-2 border-b border-slate-200 px-6 py-3 dark:border-slate-800">
@@ -263,7 +263,7 @@ export default function TemplateEditorModal(props: {
         </div>
 
         {/* Body: details on top, then list | editor panes. Stacks and scrolls on narrow widths. */}
-        <div className="@container flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-6 py-4 @4xl:overflow-hidden">
+        <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-6 py-4 @4xl:overflow-hidden">
           {/* Identity */}
           <section className="grid shrink-0 grid-cols-1 gap-3 @3xl:grid-cols-[auto_minmax(0,1fr)] @3xl:items-start">
             <IconField value={t.icon} onOpen={() => setIconModalOpen(true)} />
@@ -328,7 +328,7 @@ export default function TemplateEditorModal(props: {
                         className={`flex items-center gap-1 px-2 py-1.5 ${clash !== undefined
                           ? "bg-rose-500/10 ring-1 ring-inset ring-rose-400/60"
                           : active ? "bg-emerald-500/10" : ""}`}>
-                        <button type="button" aria-label={`Select register ${i}`} aria-current={active ? "true" : undefined}
+                        <button type="button" aria-label={`Register ${i + 1}: ${regLabel(r)}, offset ${formatOffset(r.offset, addrFmt)}, ${(BANK_SHORT[r.bank] ?? String(r.bank)).toLowerCase()}`} aria-current={active ? "true" : undefined}
                           onClick={() => setSel(i)}
                           className="grid min-w-0 flex-1 grid-cols-[1.5rem_minmax(0,1.4fr)_4rem_5rem_3rem_minmax(0,1.6fr)] items-center gap-2 rounded-lg px-1.5 py-1.5 text-left text-sm transition hover:bg-slate-100 dark:hover:bg-white/5">
                           <span className="text-xs text-slate-400">{i + 1}</span>
@@ -343,11 +343,11 @@ export default function TemplateEditorModal(props: {
                             </span>
                           ) : null}
                         </button>
-                        <button type="button" aria-label={`Duplicate register ${i}`} title="Duplicate register" onClick={() => duplicateReg(i)}
+                        <button type="button" aria-label={`Duplicate register ${i + 1}: ${regLabel(r)}`} title="Duplicate register" onClick={() => duplicateReg(i)}
                           className="shrink-0 rounded-lg p-2 text-slate-500 transition hover:bg-slate-500/10 dark:text-slate-300">
                           <FiCopy className="h-4 w-4" aria-hidden="true" />
                         </button>
-                        <button type="button" aria-label={`Remove register ${i}`} title="Remove register" onClick={() => removeReg(i)}
+                        <button type="button" aria-label={`Remove register ${i + 1}: ${regLabel(r)}`} title="Remove register" onClick={() => removeReg(i)}
                           className="shrink-0 rounded-lg p-2 text-rose-600 transition hover:bg-rose-500/10 dark:text-rose-300">
                           <FiTrash2 className="h-4 w-4" aria-hidden="true" />
                         </button>
@@ -555,22 +555,22 @@ function RegisterEditor(props: {
             {BANKS.map((b) => <option key={b.value} value={b.value}>{b.label}</option>)}
           </select>
         </label>
-        <div className={labelCls}>Type
+        <div className={labelCls}><span>Type</span>
           {isBit ? (
-            <div aria-label={`Type ${i}`} className="px-0.5 py-1.5 text-sm font-normal text-slate-700 dark:text-slate-200">bit</div>
+            <span className="px-0.5 py-1.5 text-sm font-normal text-slate-700 dark:text-slate-200">bit</span>
           ) : (
             <select aria-label={`Type ${i}`} value={r.dataType} onChange={(e) => changeType(e.target.value)} className={inputCls}>
               {typeOptions.map((d) => <option key={d} value={d}>{d}</option>)}
             </select>
           )}
         </div>
-        <div className={labelCls}>Byte order
+        <div className={labelCls}><span>Byte order</span>
           {isMulti ? (
             <select aria-label={`Order ${i}`} value={r.byteOrder} onChange={(e) => onChange({ byteOrder: e.target.value })} className={inputCls}>
               {BYTE_ORDERS.map((b) => <option key={b} value={b}>{b}</option>)}
             </select>
           ) : (
-            <div aria-label={`Order ${i}`} className="px-0.5 py-1.5 text-sm font-normal text-slate-500 dark:text-slate-400">—</div>
+            <span className="px-0.5 py-1.5 text-sm font-normal text-slate-500 dark:text-slate-400">—</span>
           )}
         </div>
         <label className={`${labelCls} @2xl:col-span-2`}>Value source
@@ -660,6 +660,22 @@ function ParamsEditor(props: {
   );
 }
 
+/** Period field with its own text draft so clearing it (to retype) doesn't snap back to 1000 mid-edit. */
+function GeneratorPeriod(props: { index: number; periodMs: unknown; onChange: (ms: number) => void }) {
+  const { index: i, periodMs, onChange } = props;
+  const [text, setText] = useState(() => String(numOr(periodMs, GENERATOR_DEFAULT_PERIOD_MS)));
+  return (
+    <label className={labelCls}>Period (ms)
+      <input aria-label={`Period ${i}`} type="number" min={0} value={text} placeholder={periodPlaceholder("generator")}
+        onChange={(e) => {
+          setText(e.target.value);
+          // Empty saves as the default period; the field stays empty while typing.
+          onChange(e.target.value === "" ? GENERATOR_DEFAULT_PERIOD_MS : Number(e.target.value));
+        }} className={inputCls} />
+    </label>
+  );
+}
+
 function ParamsForm(props: {
   index: number;
   source: string;
@@ -685,9 +701,7 @@ function ParamsForm(props: {
         <label className={labelCls}>Max
           <input aria-label={`Max ${i}`} type="number" value={numOr(params.max, 100)} onChange={(e) => patch({ max: Number(e.target.value) })} className={inputCls} />
         </label>
-        <label className={labelCls}>Period (ms)
-          <input aria-label={`Period ${i}`} type="number" min={0} value={numOr(params.periodMs, GENERATOR_DEFAULT_PERIOD_MS)} onChange={(e) => patch({ periodMs: e.target.value === "" ? GENERATOR_DEFAULT_PERIOD_MS : Number(e.target.value) })} placeholder={periodPlaceholder("generator")} className={inputCls} />
-        </label>
+        <GeneratorPeriod index={i} periodMs={params.periodMs} onChange={(periodMs) => patch({ periodMs })} />
       </div>
     );
   }

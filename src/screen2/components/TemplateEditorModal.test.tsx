@@ -43,7 +43,7 @@ describe("TemplateEditorModal", () => {
     expect(screen.getByLabelText("Alias 0")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /add register/i }));
     expect(screen.getByLabelText("Alias 1")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: /remove register 1/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^remove register 2:/i }));
     expect(screen.queryByLabelText("Alias 1")).not.toBeInTheDocument();
   });
 
@@ -112,7 +112,7 @@ describe("TemplateEditorModal", () => {
 
   it("duplicates after the row at the next free offset with a (copy) alias", () => {
     render(<TemplateEditorModal open initial={withRegs([reg(0), reg(1)])} takenKeys={[]} onClose={vi.fn()} onSave={vi.fn()} />);
-    fireEvent.click(screen.getByRole("button", { name: "Duplicate register 0" }));
+    fireEvent.click(screen.getByRole("button", { name: /^duplicate register 1:/i }));
     expect(screen.getByLabelText("Alias 1")).toHaveValue("r0 (copy)");
     expect(screen.getByLabelText("Offset 1")).toHaveValue("2");
   });
@@ -126,9 +126,9 @@ describe("TemplateEditorModal", () => {
 
   it("hides irrelevant type and byte order fields", () => {
     render(<TemplateEditorModal open initial={withRegs([reg(0, { bank: 1, dataType: "bool" })])} takenKeys={[]} onClose={vi.fn()} onSave={vi.fn()} />);
-    expect(screen.getByLabelText("Type 0").tagName).not.toBe("SELECT");
-    expect(screen.getByLabelText("Type 0")).toHaveTextContent("bit");
-    expect(screen.getByLabelText("Order 0")).toHaveTextContent("—");
+    expect(screen.queryByLabelText("Type 0")).toBeNull(); // plain text, not a labelled control
+    expect(screen.getByText("bit")).toBeInTheDocument();
+    expect(screen.getByText("Byte order").parentElement).toHaveTextContent("—");
   });
 
   it("saves an empty alias as Reg <offset> and keeps optional fields", () => {
@@ -158,9 +158,47 @@ describe("TemplateEditorModal", () => {
     expect(JSON.parse(onSave.mock.calls[0][0].registers[0].sourceParams)).not.toHaveProperty("periodMs");
   });
 
+  it("lets the generator period be cleared and retyped, saving the default when left empty (M7)", () => {
+    const onSave = vi.fn();
+    render(<TemplateEditorModal open initial={custom} takenKeys={[]} onClose={vi.fn()} onSave={onSave} />);
+    fireEvent.change(screen.getByLabelText("Source 0"), { target: { value: "generator" } });
+    const period = screen.getByLabelText("Period 0") as HTMLInputElement;
+    expect(period.value).toBe("1000");
+    fireEvent.change(period, { target: { value: "" } });
+    expect(period.value).toBe("");
+    fireEvent.click(screen.getByRole("button", { name: /save device/i }));
+    expect(JSON.parse(onSave.mock.calls[0][0].registers[0].sourceParams).periodMs).toBe(1000);
+    fireEvent.change(period, { target: { value: "250" } });
+    fireEvent.click(screen.getByRole("button", { name: /save device/i }));
+    expect(JSON.parse(onSave.mock.calls[1][0].registers[0].sourceParams).periodMs).toBe(250);
+  });
+
+  it("names the list buttons 1-based with alias, offset and bank (M8)", () => {
+    render(<TemplateEditorModal open initial={withRegs([reg(0, { alias: "Temp" })])} takenKeys={[]} onClose={vi.fn()} onSave={vi.fn()} />);
+    const btn = screen.getByRole("button", { name: "Register 1: Temp, offset 0, holding" });
+    expect(btn).toHaveAttribute("aria-current", "true");
+  });
+
+  it("puts the container on the dialog so the body's @4xl overflow rule can apply (M2)", () => {
+    render(<TemplateEditorModal open initial={custom} takenKeys={[]} onClose={vi.fn()} onSave={vi.fn()} />);
+    const dialog = screen.getByRole("dialog");
+    expect(dialog.className).toMatch(/(^|\s)@container(\s|$)/);
+    const body = dialog.querySelector(".overflow-y-auto") as HTMLElement;
+    expect(body.className).toMatch(/@4xl:overflow-hidden/);
+    expect(body.className).not.toMatch(/(^|\s)@container(\s|$)/);
+  });
+
+  it("round-trips displayFormat and holdValue through save", () => {
+    const onSave = vi.fn();
+    render(<TemplateEditorModal open initial={withRegs([reg(0, { displayFormat: "hex", holdValue: 42, unit: "V" })])} takenKeys={[]} onClose={vi.fn()} onSave={onSave} />);
+    fireEvent.change(screen.getByLabelText("Alias 0"), { target: { value: "Renamed" } });
+    fireEvent.click(screen.getByRole("button", { name: /save device/i }));
+    expect(onSave.mock.calls[0][0].registers[0]).toMatchObject({ alias: "Renamed", displayFormat: "hex", holdValue: 42, unit: "V" });
+  });
+
   it("switches the editor pane when another register is selected", () => {
     render(<TemplateEditorModal open initial={withRegs([reg(0), reg(1)])} takenKeys={[]} onClose={vi.fn()} onSave={vi.fn()} />);
-    fireEvent.click(screen.getByRole("button", { name: "Select register 1" }));
+    fireEvent.click(screen.getByRole("button", { name: /^Register 2: r1, offset 1, holding$/ }));
     expect(screen.getByLabelText("Alias 1")).toHaveValue("r1");
   });
 });
