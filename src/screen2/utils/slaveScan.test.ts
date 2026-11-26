@@ -6,12 +6,14 @@ import {
   SCAN_PARITIES,
   defaultQuantity,
   defaultWaitMs,
+  estimateRangeSeconds,
   estimateScanSeconds,
   formatDuration,
   formatSettings,
   groupScanResults,
   isAlreadyInWorkspace,
   newScanId,
+  parseIpRange,
   suggestSlaveName,
   unitRange,
 } from "./slaveScan";
@@ -165,5 +167,43 @@ describe("newScanId", () => {
     expect(a.length).toBeGreaterThan(0);
     expect(a.length).toBeLessThanOrEqual(64);
     expect(a).not.toBe(b);
+  });
+});
+
+describe("parseIpRange (mirrors the Rust parser)", () => {
+  it.each([
+    ["192.168.68.1-254", 254],
+    ["192.168.68.10-192.168.69.20", 267],
+    ["192.168.68.0/24", 254],
+    ["10.0.0.0/22", 1022],
+    ["192.168.1.5", 1],
+    ["192.168.1.0/31", 2],
+    ["192.168.1.7/32", 1],
+    [" 192.168.68.1 - 20 ", 20],
+  ])("counts %s", (input, count) => {
+    expect(parseIpRange(input)).toEqual({ count });
+  });
+
+  it.each([
+    ["192.168.68.20-10", "Range end is before its start"],
+    ["224.0.0.1", "Multicast, broadcast and 0.x addresses can't be scanned"],
+    ["255.255.255.255", "Multicast, broadcast and 0.x addresses can't be scanned"],
+    ["0.1.2.3", "Multicast, broadcast and 0.x addresses can't be scanned"],
+    ["192.168.68.300", "Not an IPv4 address or range"],
+    ["abc", "Not an IPv4 address or range"],
+    ["", "Not an IPv4 address or range"],
+    ["1.2.3.4/33", "Not an IPv4 address or range"],
+    ["1.2.3.4-300", "Not an IPv4 address or range"],
+    ["10.0.0.0/21", "Too many addresses (2046) — the limit is 1024"],
+    ["10.0.0.0-10.0.4.0", "Too many addresses (1025) — the limit is 1024"],
+  ])("refuses %j", (input, error) => {
+    expect(parseIpRange(input)).toEqual({ error });
+  });
+});
+
+describe("estimateRangeSeconds", () => {
+  it("is addresses x connect wait x attempts / parallel hosts", () => {
+    expect(estimateRangeSeconds({ addresses: 254, connectWaitMs: 300, retries: 0, hostConcurrency: 64 })).toBe(2);
+    expect(estimateRangeSeconds({ addresses: 254, connectWaitMs: 300, retries: 1, hostConcurrency: 1 })).toBe(153);
   });
 });

@@ -1,7 +1,7 @@
 import { useId, useMemo, type Dispatch, type ReactNode, type SetStateAction } from "react";
 
 import type { ProbeKind, ScanKind, ScanRequest, SerialParams, SerialParity } from "../api/slaveScan";
-import { SCAN_BAUDS, SCAN_PARITIES, defaultQuantity, defaultWaitMs, unitRange } from "../utils/slaveScan";
+import { SCAN_BAUDS, SCAN_PARITIES, defaultQuantity, defaultWaitMs, parseIpRange, unitRange } from "../utils/slaveScan";
 import type { ConnectionSettings, PortItem } from "./ConnectionSettingsForm";
 
 export type FormState = {
@@ -16,6 +16,10 @@ export type FormState = {
   sweepBauds: number[];
   sweepParities: SerialParity[];
   host: string;
+  tcpMode: "single" | "range";
+  range: string;
+  connectWaitMs: string;
+  hostConcurrency: string;
   tcpPort: string;
   concurrency: string;
   start: string;
@@ -104,6 +108,10 @@ export function initialForm(ws: ConnectionSettings): FormState {
     sweepBauds: [],
     sweepParities: [],
     host: ws.tcpHost ?? "127.0.0.1",
+    tcpMode: "single",
+    range: "",
+    connectWaitMs: "300",
+    hostConcurrency: "64",
     tcpPort: String(ws.tcpPort ?? 502),
     concurrency: "4",
     start: "1",
@@ -136,9 +144,18 @@ export function formProblem(f: FormState): string | null {
       return "Pick at least one baud rate and one parity";
     }
   } else {
-    if (!f.host.trim()) return "Enter a host";
+    if (f.tcpMode === "range") {
+      const parsed = parseIpRange(f.range);
+      if ("error" in parsed) return parsed.error;
+    } else if (!f.host.trim()) {
+      return "Enter a host";
+    }
     if (intIn(f.tcpPort, 1, 65535) === null) return "TCP port must be 1–65535";
     if (intIn(f.concurrency, 1, 32) === null) return "Parallel checks must be 1–32";
+    if (f.tcpMode === "range") {
+      if (intIn(f.connectWaitMs, 50, 5000) === null) return "Connect wait must be 50–5000 ms";
+      if (intIn(f.hostConcurrency, 1, 256) === null) return "Parallel hosts must be 1–256";
+    }
   }
   if (intIn(f.waitMs, 20, 5000) === null) return "Wait must be 20–5000 ms";
   if (intIn(f.retries, 0, 3) === null) return "Retries must be 0–3";
@@ -161,6 +178,20 @@ export function buildRequest(f: FormState, scanId: string): ScanRequest {
     waitMs: Number(f.waitMs),
     retries: Number(f.retries),
   };
+  if (f.kind === "tcp" && f.tcpMode === "range") {
+    return {
+      ...common,
+      kind: "tcpRange",
+      ports: [],
+      serial: null,
+      sweep: null,
+      tcp: { host: "", port: Number(f.tcpPort) },
+      concurrency: Number(f.concurrency),
+      range: f.range.trim(),
+      hostConcurrency: Number(f.hostConcurrency),
+      connectWaitMs: Number(f.connectWaitMs),
+    };
+  }
   if (f.kind === "tcp") {
     return {
       ...common,
@@ -268,6 +299,7 @@ export default function SlaveScanForm({ form, setForm, portItems, disabled }: Sl
 
 
   const range = unitRange(form.kind);
+  const rangeParsed = form.tcpMode === "range" ? parseIpRange(form.range) : null;
 
   return (
     <fieldset disabled={disabled} className="flex min-w-0 flex-col gap-6 disabled:opacity-80">
@@ -489,19 +521,66 @@ export default function SlaveScanForm({ form, setForm, portItems, disabled }: Sl
         </>
       ) : (
         <Section title="TCP target">
-          <div className="grid grid-cols-2 gap-3">
-            <div className="col-span-2 flex flex-col gap-1">
-              <label className={labelCls} htmlFor={fieldId("host")}>
-                Host
+          <div
+            role="radiogroup"
+            aria-label="TCP target"
+            className="flex gap-1 rounded-xl border border-slate-200 bg-slate-100 p-1 dark:border-slate-800 dark:bg-slate-950/60"
+          >
+            {(
+              [
+                { value: "single", label: "Single host" },
+                { value: "range", label: "IP range" },
+              ] as const
+            ).map((opt) => (
+              <label key={opt.value} className={segmentCls}>
+                <input
+                  type="radio"
+                  className="sr-only"
+                  name={fieldId("tcpmode")}
+                  value={opt.value}
+                  checked={form.tcpMode === opt.value}
+                  onChange={() => patch({ tcpMode: opt.value })}
+                />
+                {opt.label}
               </label>
-              <input
-                id={fieldId("host")}
-                className={inputCls}
-                value={form.host}
-                placeholder="e.g. 192.168.1.10"
-                onChange={(e) => patch({ host: e.currentTarget.value })}
-              />
-            </div>
+            ))}
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            {form.tcpMode === "range" ? (
+              <div className="col-span-2 flex flex-col gap-1">
+                <label className={labelCls} htmlFor={fieldId("range")}>
+                  Range
+                </label>
+                <input
+                  id={fieldId("range")}
+                  className={inputCls}
+                  value={form.range}
+                  placeholder="e.g. 192.168.1.1-254 or 192.168.1.0/24"
+                  aria-describedby={fieldId("range-info")}
+                  onChange={(e) => patch({ range: e.currentTarget.value })}
+                />
+                <span id={fieldId("range-info")} className="text-xs text-slate-500 dark:text-slate-400">
+                  {rangeParsed === null || form.range.trim() === "" ? null : "error" in rangeParsed ? (
+                    <span className="text-rose-700 dark:text-rose-300">{rangeParsed.error}</span>
+                  ) : (
+                    `${rangeParsed.count} ${rangeParsed.count === 1 ? "address" : "addresses"}`
+                  )}
+                </span>
+              </div>
+            ) : (
+              <div className="col-span-2 flex flex-col gap-1">
+                <label className={labelCls} htmlFor={fieldId("host")}>
+                  Host
+                </label>
+                <input
+                  id={fieldId("host")}
+                  className={inputCls}
+                  value={form.host}
+                  placeholder="e.g. 192.168.1.10"
+                  onChange={(e) => patch({ host: e.currentTarget.value })}
+                />
+              </div>
+            )}
             <div className="flex flex-col gap-1">
               <label className={labelCls} htmlFor={fieldId("tcpport")}>
                 TCP port
@@ -530,6 +609,38 @@ export default function SlaveScanForm({ form, setForm, portItems, disabled }: Sl
                 onChange={(e) => patch({ concurrency: e.currentTarget.value })}
               />
             </div>
+            {form.tcpMode === "range" ? (
+              <>
+                <div className="flex flex-col gap-1">
+                  <label className={labelCls} htmlFor={fieldId("connectwait")}>
+                    Connect wait (ms)
+                  </label>
+                  <input
+                    id={fieldId("connectwait")}
+                    type="number"
+                    min={50}
+                    max={5000}
+                    className={inputCls}
+                    value={form.connectWaitMs}
+                    onChange={(e) => patch({ connectWaitMs: e.currentTarget.value })}
+                  />
+                </div>
+                <div className="flex flex-col gap-1">
+                  <label className={labelCls} htmlFor={fieldId("hostconcurrency")}>
+                    Parallel hosts
+                  </label>
+                  <input
+                    id={fieldId("hostconcurrency")}
+                    type="number"
+                    min={1}
+                    max={256}
+                    className={inputCls}
+                    value={form.hostConcurrency}
+                    onChange={(e) => patch({ hostConcurrency: e.currentTarget.value })}
+                  />
+                </div>
+              </>
+            ) : null}
           </div>
           <p className="text-xs text-slate-500 dark:text-slate-400">
             Behind a TCP-to-RTU gateway, use 1 parallel check and a wait longer than the gateway&apos;s own timeout.

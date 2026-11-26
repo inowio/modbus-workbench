@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 
-export type ScanKind = "serial" | "tcp";
+export type ScanKind = "serial" | "tcp" | "tcpRange";
 
 export type ProbeKind = "holding" | "input" | "holdingThenInput";
 
@@ -38,6 +38,10 @@ export type ScanRequest = {
   sweep: ScanSweep | null;
   tcp: ScanTcpTarget | null;
   concurrency: number | null;
+  /** tcpRange only: `a.b.c.d`, `a.b.c.d-e`, `a.b.c.d-w.x.y.z` or `a.b.c.d/n`. */
+  range?: string | null;
+  hostConcurrency?: number | null;
+  connectWaitMs?: number | null;
 };
 
 export type ScanCategory = "found" | "garbled" | "gatewayNoDevice";
@@ -61,11 +65,27 @@ export type ScanProgressEvent = {
   scanId: string;
   checked: number;
   total: number;
+  phase: "units" | "hosts";
+  hostIndex: number | null;
+  hostCount: number | null;
   current: {
     target: string;
     unitId: number;
     settings: SerialParams | null;
   };
+};
+
+export type ScanHostStatus = "open" | "devices" | "answersAll" | "gateway" | "noModbus" | "lost";
+
+export type ScanHostEvent = {
+  workspace: string;
+  scanId: string;
+  /** "ip:port". */
+  host: string;
+  status: ScanHostStatus;
+  connectMs: number | null;
+  found: number;
+  gateway: boolean;
 };
 
 export type ScanNoticeEvent = {
@@ -89,6 +109,7 @@ export const SLAVE_SCAN_EVENTS = {
   found: "slave_scan_found",
   progress: "slave_scan_progress",
   notice: "slave_scan_notice",
+  host: "slave_scan_host",
   done: "slave_scan_done",
 } as const;
 
@@ -100,4 +121,9 @@ export async function startSlaveScan(workspace: string, request: ScanRequest): P
 /** Cancels the scan. Idempotent; an unknown or finished scan ID is not an error. */
 export async function cancelSlaveScan(workspace: string, scanId: string): Promise<void> {
   await invoke<void>("cancel_slave_scan", { name: workspace, scanId });
+}
+
+/** The workspace's local /24 as a range such as `192.168.68.1-254`, or null when there is no private address. */
+export async function scanDefaultIpRange(): Promise<string | null> {
+  return (await invoke<string | null>("scan_default_ip_range")) ?? null;
 }

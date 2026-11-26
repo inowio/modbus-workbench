@@ -117,3 +117,83 @@ export function newScanId(): string {
   const random = Math.random().toString(36).slice(2, 10) || "0";
   return `scan-${Date.now()}-${random}`;
 }
+
+const NOT_AN_ADDRESS = "Not an IPv4 address or range";
+const UNSCANNABLE = "Multicast, broadcast and 0.x addresses can't be scanned";
+const MAX_RANGE_ADDRS = 1024;
+
+function parseIpv4(s: string): number | null {
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(s.trim());
+  if (!m) return null;
+  let ip = 0;
+  for (const part of m.slice(1)) {
+    if (part.length > 1 && part.startsWith("0")) return null; // like Rust, no leading zeros
+    const n = Number(part);
+    if (n > 255) return null;
+    ip = ip * 256 + n;
+  }
+  return ip;
+}
+
+function isScannable(ip: number): boolean {
+  const first = Math.floor(ip / 2 ** 24);
+  return first !== 0 && first < 224;
+}
+
+/**
+ * Mirrors `slave_scan::types::parse_ip_range`: the same forms, refusals and copy. Returns the
+ * number of addresses (after CIDR network/broadcast exclusion), or the error to show.
+ */
+export function parseIpRange(input: string): { count: number } | { error: string } {
+  const s = input.trim();
+  const bad = { error: NOT_AN_ADDRESS };
+  let start: number;
+  let end: number;
+  const slash = s.indexOf("/");
+  const dash = s.indexOf("-");
+  if (slash >= 0) {
+    const ip = parseIpv4(s.slice(0, slash));
+    const prefixText = s.slice(slash + 1).trim();
+    if (ip === null || !/^\d+$/.test(prefixText)) return bad;
+    const prefix = Number(prefixText);
+    if (prefix > 32) return bad;
+    const size = 2 ** (32 - prefix);
+    const net = Math.floor(ip / size) * size;
+    const bcast = net + size - 1;
+    [start, end] = prefix <= 30 ? [net + 1, bcast - 1] : [net, bcast];
+  } else if (dash >= 0) {
+    const a = parseIpv4(s.slice(0, dash));
+    if (a === null) return bad;
+    const b = s.slice(dash + 1).trim();
+    if (b.includes(".")) {
+      const e = parseIpv4(b);
+      if (e === null) return bad;
+      end = e;
+    } else {
+      if (!/^\d+$/.test(b) || Number(b) > 255) return bad;
+      end = Math.floor(a / 256) * 256 + Number(b);
+    }
+    start = a;
+  } else {
+    const ip = parseIpv4(s);
+    if (ip === null) return bad;
+    start = ip;
+    end = ip;
+  }
+  if (end < start) return { error: "Range end is before its start" };
+  if (!isScannable(start) || !isScannable(end)) return { error: UNSCANNABLE };
+  const count = end - start + 1;
+  if (count > MAX_RANGE_ADDRS) return { error: `Too many addresses (${count}) — the limit is ${MAX_RANGE_ADDRS}` };
+  return { count };
+}
+
+/** Worst-case time for stage 1 (finding hosts): every address times out on every attempt. */
+export function estimateRangeSeconds(args: {
+  addresses: number;
+  connectWaitMs: number;
+  retries: number;
+  hostConcurrency: number;
+}): number {
+  const { addresses, connectWaitMs, retries, hostConcurrency } = args;
+  return Math.ceil((addresses * connectWaitMs * (retries + 1)) / Math.max(1, hostConcurrency) / 1000);
+}

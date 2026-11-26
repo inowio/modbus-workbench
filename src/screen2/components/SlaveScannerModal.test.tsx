@@ -589,4 +589,94 @@ describe("SlaveScannerModal", () => {
     });
     expect(screen.getByText("Device accepts 1 connection(s); scanning 1 at a time")).toBeInTheDocument();
   });
+
+  describe("IP range mode", () => {
+    function setupRange(defaultRange: string | null = "192.168.68.1-254") {
+      setup();
+      const base = invokeMock.getMockImplementation()!;
+      invokeMock.mockImplementation((command: string, args?: { request?: ScanRequest }) =>
+        command === "scan_default_ip_range" ? Promise.resolve(defaultRange) : base(command, args),
+      );
+    }
+
+    async function openRangeMode() {
+      renderModal();
+      await loaded();
+      fireEvent.click(screen.getByRole("radio", { name: "TCP" }));
+      fireEvent.click(screen.getByRole("radio", { name: "IP range" }));
+    }
+
+    it("shows range fields, pre-filled from scan_default_ip_range", async () => {
+      setupRange();
+      await openRangeMode();
+      await waitFor(() => expect(screen.getByLabelText("Range")).toHaveValue("192.168.68.1-254"));
+      expect(screen.getByText("254 addresses")).toBeInTheDocument();
+      expect(screen.getByLabelText("TCP port")).toHaveValue(502);
+      expect(screen.getByLabelText("Connect wait (ms)")).toHaveValue(300);
+      expect(screen.getByLabelText("Parallel hosts")).toHaveValue(64);
+      expect(screen.queryByLabelText("Host")).toBeNull();
+      expect(screen.getByLabelText("Start")).toBeInTheDocument();
+      expect(screen.getByLabelText("Check with")).toBeInTheDocument();
+      expect(screen.getByText(/Finding hosts: about 2 s, then about/)).toBeInTheDocument();
+    });
+
+    it("leaves the range empty when there is no default", async () => {
+      setupRange(null);
+      await openRangeMode();
+      expect(screen.getByLabelText("Range")).toHaveValue("");
+      expect(screen.getByRole("button", { name: "Scan" })).toBeDisabled();
+    });
+
+    it("an invalid range shows the reason and disables Scan", async () => {
+      setupRange();
+      await openRangeMode();
+      await waitFor(() => expect(screen.getByLabelText("Range")).toHaveValue("192.168.68.1-254"));
+      fireEvent.change(screen.getByLabelText("Range"), { target: { value: "10.0.0.0/21" } });
+      expect(screen.getAllByText("Too many addresses (2046) — the limit is 1024").length).toBeGreaterThan(0);
+      expect(screen.getByRole("button", { name: "Scan" })).toBeDisabled();
+    });
+
+    it("validates connect wait and parallel hosts", async () => {
+      setupRange();
+      await openRangeMode();
+      await waitFor(() => expect(screen.getByLabelText("Range")).toHaveValue("192.168.68.1-254"));
+      fireEvent.change(screen.getByLabelText("Connect wait (ms)"), { target: { value: "10" } });
+      expect(screen.getByText("Connect wait must be 50–5000 ms")).toBeInTheDocument();
+      fireEvent.change(screen.getByLabelText("Connect wait (ms)"), { target: { value: "300" } });
+      fireEvent.change(screen.getByLabelText("Parallel hosts"), { target: { value: "300" } });
+      expect(screen.getByText("Parallel hosts must be 1–256")).toBeInTheDocument();
+    });
+
+    it("sends a tcpRange request", async () => {
+      setupRange();
+      await openRangeMode();
+      await waitFor(() => expect(screen.getByLabelText("Range")).toHaveValue("192.168.68.1-254"));
+      fireEvent.change(screen.getByLabelText("Range"), { target: { value: " 192.168.68.1-20 " } });
+      await startScan();
+      const req = (startCalls()[0][1] as { request: ScanRequest }).request;
+      expect(req).toMatchObject({
+        kind: "tcpRange",
+        range: "192.168.68.1-20",
+        hostConcurrency: 64,
+        connectWaitMs: 300,
+        tcp: { host: "", port: 502 },
+        concurrency: 4,
+        serial: null,
+        sweep: null,
+      });
+    });
+
+    it("single host mode is unchanged", async () => {
+      setupRange();
+      renderModal();
+      await loaded();
+      fireEvent.click(screen.getByRole("radio", { name: "TCP" }));
+      expect(screen.getByLabelText("Host")).toBeInTheDocument();
+      expect(screen.queryByLabelText("Range")).toBeNull();
+      await startScan();
+      const req = (startCalls()[0][1] as { request: ScanRequest }).request;
+      expect(req.kind).toBe("tcp");
+      expect(req.range ?? null).toBeNull();
+    });
+  });
 });

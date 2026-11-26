@@ -6,21 +6,23 @@ import { FiAlertTriangle, FiSearch, FiSquare, FiX } from "react-icons/fi";
 import {
   SLAVE_SCAN_EVENTS,
   cancelSlaveScan,
+  scanDefaultIpRange,
   startSlaveScan,
   type ScanDoneEvent,
   type ScanFoundEvent,
-  type ScanKind,
   type ScanNoticeEvent,
   type ScanProgressEvent,
   type SerialParams,
 } from "../api/slaveScan";
 import {
+  estimateRangeSeconds,
   estimateScanSeconds,
   formatDuration,
   formatSettings,
   groupScanResults,
   isAlreadyInWorkspace,
   newScanId,
+  parseIpRange,
   suggestSlaveName,
 } from "../utils/slaveScan";
 import { normalizeConnectionSettings, type ConnectionSettings, type PortItem } from "./ConnectionSettingsForm";
@@ -82,7 +84,7 @@ export default function SlaveScannerModal({ open, workspaceName, existingSlaves,
   const [form, setForm] = useState<FormState>(() => initialForm(normalizeConnectionSettings({ kind: "serial" })));
 
   const [phase, setPhaseState] = useState<Phase>("idle");
-  const [resultKind, setResultKind] = useState<ScanKind>("serial");
+  const [resultKind, setResultKind] = useState<"serial" | "tcp">("serial");
   const [results, setResults] = useState<ScanFoundEvent[]>([]);
   const [progress, setProgress] = useState<ScanProgressEvent | null>(null);
   const [notices, setNotices] = useState<string[]>([]);
@@ -136,9 +138,10 @@ export default function SlaveScannerModal({ open, workspaceName, existingSlaves,
     setSummary(null);
     setFinalChecked(null);
     void (async () => {
-      const [settingsRes, portsRes] = await Promise.allSettled([
+      const [settingsRes, portsRes, rangeRes] = await Promise.allSettled([
         invoke<ConnectionSettings>("get_connection_settings", { name: workspaceName }),
         invoke<PortItem[]>("list_serial_ports"),
+        scanDefaultIpRange(),
       ]);
       if (stale) return;
       const loaded = normalizeConnectionSettings(
@@ -147,7 +150,9 @@ export default function SlaveScannerModal({ open, workspaceName, existingSlaves,
       if (settingsRes.status === "rejected") setError(String(settingsRes.reason));
       setWs(loaded);
       setPortItems(portsRes.status === "fulfilled" && Array.isArray(portsRes.value) ? portsRes.value : []);
-      setForm(initialForm(loaded));
+      const defaultRange = rangeRes.status === "fulfilled" ? rangeRes.value : null;
+      const fresh = initialForm(loaded);
+      setForm(defaultRange && !fresh.range ? { ...fresh, range: defaultRange } : fresh);
       setLoading(false);
     })();
     return () => {
@@ -230,10 +235,11 @@ export default function SlaveScannerModal({ open, workspaceName, existingSlaves,
   const estimate = useMemo(() => {
     if (formProblem(form) !== null) return null;
     const serial = form.kind === "serial";
+    const rangeParsed = form.tcpMode === "range" && !serial ? parseIpRange(form.range) : null;
     const ports = Math.max(1, form.ports.length);
     const combos = serial && form.sweepOn ? sweptBauds(form).length * form.sweepParities.length : 1;
     // Serial: every port scans the whole range in parallel; TCP: `concurrency` workers share it.
-    return estimateScanSeconds({
+    const perHost = estimateScanSeconds({
       addresses: Number(form.quantity) * (serial ? ports : 1),
       combos,
       waitMs: Number(form.waitMs),
@@ -241,6 +247,17 @@ export default function SlaveScannerModal({ open, workspaceName, existingSlaves,
       probe: form.probe,
       parallelism: serial ? ports : Number(form.concurrency),
     });
+    if (rangeParsed === null || "error" in rangeParsed) return { total: perHost, hosts: null };
+    // Range: find hosts first (every address times out), then scan each host found.
+    return {
+      total: perHost,
+      hosts: estimateRangeSeconds({
+        addresses: rangeParsed.count,
+        connectWaitMs: Number(form.connectWaitMs),
+        retries: Number(form.retries),
+        hostConcurrency: Number(form.hostConcurrency),
+      }),
+    };
   }, [form]);
 
   const counts = useMemo(() => {
@@ -259,7 +276,7 @@ export default function SlaveScannerModal({ open, workspaceName, existingSlaves,
     currentScanIdRef.current = request.scanId;
     scanWorkspaceRef.current = workspaceName;
     setPhase("scanning");
-    setResultKind(request.kind);
+    setResultKind(request.kind === "serial" ? "serial" : "tcp");
     setResults([]);
     setNotices([]);
     setProgress(null);
@@ -409,7 +426,11 @@ export default function SlaveScannerModal({ open, workspaceName, existingSlaves,
                 {problem ? (
                   <span className="text-rose-700 dark:text-rose-300">{problem}</span>
                 ) : estimate !== null && !loading ? (
-                  <span className="text-slate-600 dark:text-slate-300">{`Estimated time: ${formatDuration(estimate)} (worst case)`}</span>
+                  <span className="text-slate-600 dark:text-slate-300">
+                    {estimate.hosts !== null
+                      ? `Finding hosts: ${formatDuration(estimate.hosts)}, then ${formatDuration(estimate.total)} per host found (worst case)`
+                      : `Estimated time: ${formatDuration(estimate.total)} (worst case)`}
+                  </span>
                 ) : null}
               </div>
               {busy ? (
