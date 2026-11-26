@@ -1,7 +1,18 @@
 import { FiEdit2, FiTrash2 } from "react-icons/fi";
 
 import type { SimRule } from "../components/SimRuleModal";
-import { findTargetRegister, targetLabel, type AddrFmt } from "./ruleTargets";
+import {
+  DEADBAND_OPS,
+  bankName,
+  exactRegister,
+  findTargetRegister,
+  fmtAddr,
+  formatRuleValue,
+  readConditions,
+  ruleRegisterName,
+  targetLabel,
+  type AddrFmt,
+} from "./ruleTargets";
 import type { PageRegister, SimDevice } from "./useSimulatorData";
 
 const BANK_LABEL: Record<number, string> = { 1: "coil", 2: "discrete", 3: "holding", 4: "input" };
@@ -30,8 +41,12 @@ export function ruleSummary(rule: SimRule): string {
     switch (t.type) {
       case "interval":
         return `interval ${t.ms}ms`;
-      case "condition":
-        return `${bank}[${t.address}] ${t.op} ${t.value}`;
+      case "condition": {
+        const { join, conditions } = readConditions(t);
+        return conditions
+          .map((c) => `${bankLabel(c.bank)}[${c.address}] ${c.op} ${c.value}`)
+          .join(join === "any" ? " or " : " and ");
+      }
       case "onWrite":
         return `onWrite ${bank}[${isAnyAddress(t.address) ? "any" : t.address}]`;
       default:
@@ -77,16 +92,59 @@ export function actionsSummary(rule: SimRule): string {
 
 const OP_LABEL: Record<string, string> = { "==": "=", "!=": "≠", ">=": "≥", "<=": "≤" };
 
-type Piece = { text: string; missing: boolean };
-type Resolver = (unit: unknown, bank: unknown, address: unknown) => { label: string; missing: boolean };
+type Piece = { text: string; missing: boolean; title?: string };
+type Resolved = {
+  /** Short name (alias when unique) for the summary text. */
+  label: string;
+  missing: boolean;
+  /** Why it is flagged, or the full location of a found register. */
+  title?: string;
+  /** The register starting at this address (its units/decimals format values). */
+  reg?: PageRegister;
+  bank: number;
+};
+/** `anyWord`: a write to any word of a register counts (onWrite matches the written address). */
+type Resolver = (unit: unknown, bank: unknown, address: unknown, anyWord?: boolean) => Resolved;
 
 function makeResolver(registers: readonly PageRegister[] | undefined, fmt: AddrFmt): Resolver {
-  return (unit, bank, address) => {
+  return (unit, bank, address, anyWord = false) => {
+    const u = Number(unit ?? 1);
     const b = Number(bank);
     const a = Number(address);
-    const reg = registers ? findTargetRegister(registers, Number(unit ?? 1), b, a) : undefined;
-    return { label: targetLabel(reg, b, a, fmt), missing: registers !== undefined && !reg };
+    const loc = `${bankName(b)} ${fmtAddr(a, fmt)}`;
+    // Rules reference a register by its START address (the engine looks it up there).
+    const reg = exactRegister(registers, u, b, a);
+    if (reg) {
+      const alias = reg.alias?.trim();
+      return { label: ruleRegisterName(reg, b, a, fmt, registers), missing: false, title: alias ? `${alias} · ${loc}` : undefined, reg, bank: b };
+    }
+    if (!registers) return { label: loc, missing: false, bank: b };
+    const covering = findTargetRegister(registers, u, b, a);
+    if (covering && anyWord) return { label: targetLabel(covering, b, a, fmt), missing: false, bank: b };
+    return {
+      label: loc,
+      missing: true,
+      title: covering ? "Points inside a register, not at its start" : "No such register",
+      bank: b,
+    };
   };
+}
+
+const opText = (op: string): string => OP_LABEL[op] ?? op;
+
+function conditionText(c: { op: string; value: number; deadband: number }, r: Resolved): string {
+  if (c.op === "changed") return `${r.label} changed`;
+  const value = formatRuleValue(c.value, r.bank, r.reg);
+  const band = DEADBAND_OPS.has(c.op) && c.deadband > 0 ? ` (±${formatRuleValue(c.deadband, r.bank, r.reg, false)})` : "";
+  return `${r.label} ${opText(c.op)} ${value}${band}`;
+}
+
+/** Combined title: the first problem wins, else every found register's location. */
+function combineTitles(parts: Resolved[]): string | undefined {
+  const problem = parts.find((p) => p.missing);
+  if (problem) return problem.title;
+  const found = parts.map((p) => p.title).filter((t): t is string => !!t);
+  return found.length ? found.join(", ") : undefined;
 }
 
 function triggerPiece(rule: SimRule, resolve: Resolver): Piece {
@@ -96,15 +154,16 @@ function triggerPiece(rule: SimRule, resolve: Resolver): Piece {
       case "interval":
         return { text: `Every ${t.ms} ms`, missing: false };
       case "condition": {
-        const r = resolve(t.unit, t.bank, t.address);
-        const op = String(t.op);
-        const text = op === "changed" ? `${r.label} changed` : `${r.label} ${OP_LABEL[op] ?? op} ${t.value}`;
-        return { text, missing: r.missing };
+        const { join, conditions } = readConditions(t);
+        const resolved = conditions.map((c) => resolve(c.unit, c.bank, c.address));
+        const parts = conditions.map((c, i) => conditionText(c, resolved[i]));
+        const text = parts.length === 1 ? parts[0] : `${join === "any" ? "Any of" : "All of"}: ${parts.join(", ")}`;
+        return { text, missing: resolved.some((r) => r.missing), title: combineTitles(resolved) };
       }
       case "onWrite": {
         if (isAnyAddress(t.address)) return { text: `On write to ${bankLabel(Number(t.bank))} (any address)`, missing: false };
-        const r = resolve(t.unit, t.bank, t.address);
-        return { text: `On write to ${r.label}`, missing: r.missing };
+        const r = resolve(t.unit, t.bank, t.address, true);
+        return { text: `On write to ${r.label}`, missing: r.missing, title: r.title };
       }
       default:
         return { text: String(t.type ?? "unknown trigger"), missing: false };
@@ -125,21 +184,23 @@ function actionPieces(rule: SimRule, resolve: Resolver): Piece[] {
   }
   return rows.map((a) => {
     const dst = resolve(a.unit, a.bank, a.address);
+    const own = { missing: dst.missing, title: dst.title };
+    const eng = (v: unknown) => (typeof v === "number" ? formatRuleValue(v, dst.bank, dst.reg) : String(v));
     switch (a.type) {
       case "set":
-        return { text: `Set ${dst.label} = ${a.value}`, missing: dst.missing };
+        return { text: `Set ${dst.label} = ${eng(a.value)}`, ...own };
       case "inc":
-        return { text: `Increment ${dst.label} by ${a.by}`, missing: dst.missing };
+        return { text: `Increment ${dst.label} by ${eng(a.by)}`, ...own };
       case "dec":
-        return { text: `Decrement ${dst.label} by ${a.by}`, missing: dst.missing };
+        return { text: `Decrement ${dst.label} by ${eng(a.by)}`, ...own };
       case "toggle":
-        return { text: `Toggle ${dst.label}`, missing: dst.missing };
+        return { text: `Toggle ${dst.label}`, ...own };
       case "copy": {
         const src = resolve(a.srcUnit, a.srcBank, a.srcAddr);
-        return { text: `Copy ${src.label} → ${dst.label}`, missing: dst.missing || src.missing };
+        return { text: `Copy ${src.label} → ${dst.label}`, missing: dst.missing || src.missing, title: combineTitles([src, dst]) };
       }
       case "randomize":
-        return { text: `Randomize ${dst.label} ${a.min}..${a.max}`, missing: dst.missing };
+        return { text: `Randomize ${dst.label} ${a.min}..${a.max}`, ...own };
       default:
         return { text: String(a.type ?? "unknown action"), missing: false };
     }
@@ -148,9 +209,9 @@ function actionPieces(rule: SimRule, resolve: Resolver): Piece[] {
 
 function PieceView({ piece }: { piece: Piece }) {
   return piece.missing ? (
-    <span title="No such register" className="text-amber-700 dark:text-amber-300">{piece.text}</span>
+    <span title={piece.title ?? "No such register"} className="text-amber-700 dark:text-amber-300">{piece.text}</span>
   ) : (
-    <span>{piece.text}</span>
+    <span title={piece.title}>{piece.text}</span>
   );
 }
 
@@ -158,7 +219,8 @@ function PieceView({ piece }: { piece: Piece }) {
 function ruleScope(rule: SimRule, devices: SimDevice[]): string {
   try {
     const t = JSON.parse(rule.trigger) as Record<string, unknown>;
-    const unit = Number(t.unit);
+    // A multi-condition trigger is scoped by its first condition's unit.
+    const unit = t.type === "condition" ? (readConditions(t).conditions[0]?.unit ?? NaN) : Number(t.unit);
     if (!Number.isFinite(unit)) return "—";
     const device = devices.find((d) => d.unitId === unit);
     return device?.name ?? "—";

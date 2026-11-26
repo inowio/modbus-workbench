@@ -60,6 +60,10 @@ const simulatorSection: HelpSectionDefinition = {
     "delay",
     "interval",
     "condition",
+    "deadband",
+    "all of",
+    "any of",
+    "engineering units",
     "onwrite",
     "on write",
     "set",
@@ -87,7 +91,7 @@ const simulatorSection: HelpSectionDefinition = {
     "delete device",
   ],
   searchText:
-    "Learn how the TCP Simulator turns the workbench into a Modbus TCP server external masters can query. Covers the tabbed workspace (Registers, Devices, Rules, Live Values, Activity), the status dashboard (Exposed, Accessible At, Connected Clients, Uptime, with the Tick Interval next to the port) and footer, the Expose toggle (LAN 0.0.0.0 vs Local only 127.0.0.1), the port, Start/Stop, the resolved Listening/Accessible-At address, serving all four register banks (Coils, Discrete Inputs, Holding, Input) across multiple Unit IDs, value sources (Hold, Device presets, Generators—sine/ramp/decrement/step/random/toggle, and Route from slave) with u16/i16/u32/i32/f32/u64/i64/f64 data types and byte order (ABCD/BADC/CDAB/DCBA), per-register update intervals (the Interval field in the side panel), adding whole virtual devices via Add Device (built-in, custom, or a workspace slave routed as a gateway), the live value view, the ok/stale/missing route source-status badge, scale/offset transforms on routed values, the Activity tab (uptime, connected-clients list, event log), workspace Profile export/import, the global running-status chip with client count, and automation rules pairing a trigger (interval / register condition / on client write) with actions (set/inc/dec/toggle/copy/randomize) including per-action delay and multi-word targets.",
+    "Learn how the TCP Simulator turns the workbench into a Modbus TCP server external masters can query. Covers the tabbed workspace (Registers, Devices, Rules, Live Values, Activity), the status dashboard (Exposed, Accessible At, Connected Clients, Uptime, with the Tick Interval next to the port) and footer, the Expose toggle (LAN 0.0.0.0 vs Local only 127.0.0.1), the port, Start/Stop, the resolved Listening/Accessible-At address, serving all four register banks (Coils, Discrete Inputs, Holding, Input) across multiple Unit IDs, value sources (Hold, Device presets, Generators—sine/ramp/decrement/step/random/toggle, and Route from slave) with u16/i16/u32/i32/f32/u64/i64/f64 data types and byte order (ABCD/BADC/CDAB/DCBA), per-register update intervals (the Interval field in the side panel), adding whole virtual devices via Add Device (built-in, custom, or a workspace slave routed as a gateway), the live value view, the ok/stale/missing route source-status badge, scale/offset transforms on routed values, the Activity tab (uptime, connected-clients list, event log), workspace Profile export/import, the global running-status chip with client count, and automation rules pairing a trigger (interval / register condition / on client write) with actions (set/inc/dec/toggle/copy/randomize) including per-action delay and multi-word targets; rule conditions and Set/Increment/Decrement values are in the register's engineering units, with an optional deadband and All of / Any of for several conditions.",
   anchors: [
     { id: "overview", label: "What the TCP Simulator does" },
     { id: "tabs", label: "The five tabs" },
@@ -265,19 +269,23 @@ const simulatorSection: HelpSectionDefinition = {
         <p>Three trigger types:</p>
         <ul className="list-disc space-y-1 pl-5">
           <li><strong>Interval</strong> — fires every N milliseconds.</li>
-          <li><strong>Condition</strong> — fires on the edge where <code>register op value</code> becomes true (<code>== != &lt; &gt; &gt;= &lt;= changed</code>), e.g. <code>holding[0] &gt;= 100</code>.</li>
+          <li><strong>Condition</strong> — pick a register from the list (alias first, e.g. <em>Temperature · input 1</em>), an operator (<code>== != &lt; &gt; &gt;= &lt;= changed</code>) and a value in the register's own units (On/Off for coils and discrete inputs), e.g. <code>Temperature ≥ 35.0 °C</code>. The value is compared with the register's real, scaled value (signed, 32/64-bit and float registers decode by their type); <code>==</code> and <code>!=</code> compare after rounding to the register's decimals, so <code>== 23.5</code> works on a 0.1-scaled register. The rule fires on the edge where the condition becomes true.</li>
           <li><strong>On client write</strong> — fires when a master writes a specific (or any) register, e.g. <code>onWrite coil[0]</code>.</li>
         </ul>
-        <p>Actions run in order, each with an optional per-action <strong>delay</strong> (fire now, or N ms later):</p>
         <ul className="list-disc space-y-1 pl-5">
-          <li><strong>set</strong> — write a constant.</li>
-          <li><strong>inc</strong> / <strong>dec</strong> — add/subtract N (wraps on overflow).</li>
+          <li><strong>Deadband</strong> (optional, for <code>&gt; &gt;= &lt; &lt;=</code>, in the register's units) stops a value hovering at the threshold from firing over and over: <code>Temperature ≥ 35.0 °C</code> with deadband 1.0 fires at 35.0 and only re-arms once the value drops below 34.0 (shown as <em>(±1.0)</em> in the Rules table).</li>
+          <li><strong>+ Add condition</strong> combines several conditions with <strong>All of</strong> (every one true) or <strong>Any of</strong> (at least one true); the rule fires when the combined result becomes true. <code>changed</code> is an event, so it can only be used as a rule's only condition.</li>
+        </ul>
+        <p>Actions run in order, each with an optional per-action <strong>delay</strong> (fire now, or N ms later). Set, Increment and Decrement values are in the target register's units:</p>
+        <ul className="list-disc space-y-1 pl-5">
+          <li><strong>set</strong> — write a constant (On/Off for bits). A value the register can't hold exactly is rounded to its nearest step; the dialog says so (<em>Will be stored as 25.6 °C</em>) but still saves.</li>
+          <li><strong>inc</strong> / <strong>dec</strong> — add/subtract an amount, e.g. 0.5 °C. An amount smaller than one step of a scaled register (0.1 °C for scale 0.1) does nothing, and the dialog warns you.</li>
           <li><strong>toggle</strong> — flip a bit, or a word between 0 and non-zero.</li>
           <li><strong>copy</strong> — copy another register's value, with optional scale and offset.</li>
           <li><strong>randomize</strong> — write a random value in a min/max range.</li>
         </ul>
         <p className="text-xs text-slate-500 dark:text-slate-400">
-          Actions can target multi-word/typed registers (the value is encoded across the register's words); single-word targets are written in place. A rule can target any register, but a rule-written value on a Device/Generator/Route register is overwritten on the next tick since the source keeps driving it—rules are strongest on Hold registers.
+          Rules remember the register's unit, bank and start address and look up its current type, byte order and scaling each time they run, so fixing a register's scale later keeps "35 °C" meaning 35 °C. A rule whose register no longer exists is shown in amber and does nothing until you add one. Actions write multi-word/typed registers using the register's own type (the stored target type is only a fallback when there is no register); single-word targets are written in place. A rule can target any register, but a rule-written value on a Device/Generator/Route register is overwritten on the next tick since the source keeps driving it—rules are strongest on Hold registers.
         </p>
       </SectionBlock>
 

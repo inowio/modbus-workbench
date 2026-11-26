@@ -44,7 +44,7 @@ export function rawFromEng(eng: number, scale: number, offset: number, dataType:
 }
 
 /** Decimal places of the shortest representation of |s| (no exponent form). */
-function decimalPlaces(s: number): number {
+export function decimalPlaces(s: number): number {
   const text = String(s);
   const m = /^(\d+)(?:\.(\d+))?e([+-]\d+)$/i.exec(text);
   if (m) {

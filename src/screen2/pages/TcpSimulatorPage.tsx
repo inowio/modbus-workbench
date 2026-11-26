@@ -381,6 +381,7 @@ export default function TcpSimulatorPage() {
         open={ruleModalOpen}
         initial={modalRule}
         registers={sim.registers}
+        addrFmt={addrFmt}
         error={dialogError}
         onClose={() => closeDialog(() => setRuleModalOpen(false))}
         onSubmit={async (rule: SimRule) => {
