@@ -156,7 +156,7 @@ pub fn decode_value(data_type: &str, byte_order: &str, words: &[u16]) -> Option<
 
 use std::f64::consts::PI;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GenParams {
     pub min: f64,
     pub max: f64,
@@ -208,7 +208,7 @@ pub fn generator_value(kind: &str, p: &GenParams, elapsed_ms: f64, seed: u64) ->
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PresetParams {
     pub min: f64,
     pub max: f64,
@@ -277,7 +277,7 @@ pub fn transform_route_words(
 /// Dynamic (device/generator) register resolved from a `SimRegister`'s
 /// `value_source` + `source_params`. `None` from `parse_dynamic` for hold
 /// registers (Plan 1 behavior) or unparseable params.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum DynKind {
     Generator { kind: String, params: GenParams, seed: u64 },
     Preset { preset: String, params: PresetParams, seed: u64 },
@@ -298,7 +298,7 @@ pub enum DynKind {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DynReg {
     pub unit: u8,
     pub bank: u8,
@@ -781,6 +781,13 @@ pub fn reconcile_rules(
     pending.retain(|p| unchanged(p.rule_id));
 }
 
+/// True when the route register `d` a read was started for is still exactly
+/// configured in the live list (same register, same route params). A read that
+/// completes after its register was edited, moved, or deleted is discarded.
+pub fn route_still_current(dynamics: &[DynReg], d: &DynReg) -> bool {
+    dynamics.iter().any(|x| x == d)
+}
+
 /// Route connection kinds: `"serial"` and `"rtu"` both mean the workspace's
 /// RTU session (matches `modbus::ensure_route_session`); anything else is TCP.
 fn is_serial_kind(kind: &str) -> bool {
@@ -797,7 +804,8 @@ fn slave_table_kind(kind: &str) -> &str {
 /// never stalls the tick (generators, rules, delayed actions, emits). Reads
 /// each due route register through the workspace's shared client session and
 /// writes the result through `update_existing_words` (a register deleted
-/// mid-read is not resurrected). Status per register: "ok", "stale" (read
+/// mid-read is not resurrected; a result whose register was edited mid-read
+/// is discarded — see `route_still_current`). Status per register: "ok", "stale" (read
 /// failed/timed out — last-good value kept) or "missing" (no session).
 async fn route_loop(
     banks: Banks,
@@ -838,6 +846,14 @@ async fn route_loop(
                     Ok(words) => {
                         let out = transform_route_words(d, &words, *scale, *offset, src_byte_order);
                         if let Ok(mut guard) = banks.write() {
+                            // Re-check under the banks lock: if the register was
+                            // edited/removed while the read was in flight, the
+                            // result belongs to the old config — discard it.
+                            // (Edits drop the old entry before touching banks.)
+                            let current = dynamics.lock().map(|g| route_still_current(&g, d)).unwrap_or(false);
+                            if !current {
+                                continue; // no status either: the register changed
+                            }
                             update_existing_words(&mut guard, d.unit, d.bank, d.address, &out);
                         }
                         "ok"
@@ -974,6 +990,16 @@ impl SimEngine {
     pub fn set_dynamics(&self, dynamics: Vec<DynReg>) {
         if let Ok(mut g) = self.dynamics.lock() {
             *g = dynamics;
+        }
+    }
+
+    /// Drop the register at `(unit, bank, address)` from the live generator/
+    /// route list. Edits call this before touching the banks so an in-flight
+    /// route read for the old config is discarded instead of overwriting the
+    /// new value; `refresh_running_config` then re-adds the new config.
+    pub fn forget_dynamic(&self, unit: u8, bank: u8, address: u16) {
+        if let Ok(mut g) = self.dynamics.lock() {
+            g.retain(|d| (d.unit, d.bank, d.address) != (unit, bank, address));
         }
     }
 
@@ -3279,6 +3305,9 @@ fn apply_to_running(state: &tauri::State<'_, SimulatorState>, ws: &str, reg: &Si
         let bank = reg.function_code as u8;
         let unit = reg.unit_id as u8;
         let addr = reg.address as u16;
+        // Drop the old live entry first so an in-flight route read for it is
+        // discarded rather than landing on top of this change.
+        engine.forget_dynamic(unit, bank, addr);
         if remove {
             // Covers both hold (1 word) and dynamic (multi-word) registers.
             engine.clear_span(unit, bank, addr, word_count(&reg.data_type) as u16);
@@ -5760,5 +5789,66 @@ mod tests {
         };
         apply_timed_action(&mut b, &ta, 0);
         assert_eq!(b[&1].holding.get(&5), Some(&7), "partial f32 write landed on a u16 register");
+    }
+
+    fn route_dyn(address: u16, src_addr: u16) -> DynReg {
+        DynReg {
+            unit: 1, bank: 4, address, data_type: "u16".into(), byte_order: "ABCD".into(), interval_ms: 20.0,
+            kind: DynKind::Route { slave_unit: 7, connection_kind: "tcp".into(), src_fc: 3, src_addr, count: 1, scale: 1.0, offset: 0.0, src_byte_order: "ABCD".into() },
+        }
+    }
+
+    #[test]
+    fn route_still_current_requires_the_exact_route() {
+        let d = route_dyn(10, 0);
+        assert!(route_still_current(&[d.clone()], &d));
+        // Register removed / turned into a hold register (no dynamic entry).
+        assert!(!route_still_current(&[], &d));
+        // Same key, different route params.
+        assert!(!route_still_current(&[route_dyn(10, 5)], &d));
+        // Same route params, different register.
+        assert!(!route_still_current(&[route_dyn(11, 0)], &d));
+    }
+
+    #[test]
+    fn forget_dynamic_drops_only_that_register() {
+        let engine = SimEngine::new();
+        engine.set_dynamics(vec![route_dyn(10, 0), route_dyn(11, 0)]);
+        engine.forget_dynamic(1, 4, 10);
+        let left: Vec<u16> = engine.dynamics.lock().unwrap().iter().map(|d| d.address).collect();
+        assert_eq!(left, vec![11]);
+    }
+
+    #[tokio::test]
+    async fn route_read_finishing_after_an_edit_is_discarded() {
+        use crate::modbus::SessionMap;
+        // SOURCE: unit 7 holding[0] = 1234.
+        let mut a = SimEngine::new();
+        let mut abanks = HashMap::new();
+        place_words(&mut abanks, 7, 3, 0, &[1234]);
+        let ainfo = a.start(NoopSink, "src".into(), "127.0.0.1", 0, 100, abanks, Vec::new(), Default::default(), Default::default(), Vec::new()).await.unwrap();
+        let aaddr: std::net::SocketAddr = ainfo.bound.parse().unwrap();
+        let tcp_map: SessionMap = Default::default();
+        let ctx = tokio_modbus::client::tcp::connect(aaddr).await.unwrap();
+        let session = std::sync::Arc::new(tokio::sync::Mutex::new(ctx));
+        tcp_map.lock().unwrap().insert("ws".to_string(), session.clone());
+        // Hold the session so the first route read is in flight (waiting).
+        let held = session.clone().lock_owned().await;
+
+        let mut bbanks = HashMap::new();
+        place_words(&mut bbanks, 1, 4, 10, &[0]);
+        let mut b = SimEngine::new();
+        b.start(NoopSink, "ws".into(), "127.0.0.1", 0, 20, bbanks, vec![route_dyn(10, 0)], tcp_map, Default::default(), Vec::new()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // Edit mid-read: the register becomes a hold register with value 42,
+        // in the order the edit commands use (live list first, then banks).
+        b.forget_dynamic(1, 4, 10);
+        b.apply_register_change(1, 4, 10, Some(42), None);
+        drop(held);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let v = b.snapshot().get(&1).and_then(|u| u.input.get(&10).copied());
+        b.stop().await;
+        a.stop().await;
+        assert_eq!(v, Some(42), "stale route read overwrote the edited register");
     }
 }
