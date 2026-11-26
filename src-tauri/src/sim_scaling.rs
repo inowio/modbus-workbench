@@ -88,6 +88,19 @@ pub fn effective_decimals(decimals: Option<i64>, scale: f64, offset: f64, data_t
     places.max(decimal_places(offset)).min(6) as u32
 }
 
+/// Decimals rule comparisons round to (R7). Integer types: never coarser than
+/// one raw step — max(explicit, automatic) — so explicit display decimals 0 on a
+/// ×0.1 register don't turn "> 35.5" into "> 36". Float types: the explicit
+/// decimals when set, else 6. Display keeps using `effective_decimals`.
+pub fn compare_decimals(decimals: Option<i64>, scale: f64, offset: f64, data_type: &str) -> u32 {
+    let explicit = effective_decimals(decimals, scale, offset, data_type);
+    if is_integer_type(data_type) {
+        explicit.max(effective_decimals(None, scale, offset, data_type))
+    } else {
+        explicit
+    }
+}
+
 pub fn round_to(value: f64, decimals: u32) -> f64 {
     let f = 10f64.powi(decimals as i32);
     (value * f).round() / f
@@ -124,11 +137,7 @@ pub fn build_reg_meta(regs: &[SimRegister]) -> RegMetaMap {
                 byte_order: r.byte_order.clone(),
                 scale,
                 offset,
-                // Comparison precision: never coarser than one raw step, so
-                // explicit display decimals 0 on a ×0.1 register don't turn
-                // "> 35.5" into "> 36". Display keeps the explicit decimals.
-                decimals: effective_decimals(r.decimals, scale, offset, &r.data_type)
-                    .max(effective_decimals(None, scale, offset, &r.data_type)),
+                decimals: compare_decimals(r.decimals, scale, offset, &r.data_type),
             },
         );
     }
@@ -234,8 +243,10 @@ mod tests {
         // Finer explicit decimals are kept.
         assert_eq!(dec(Some(0.1), Some(3), "u16"), 3);
         assert_eq!(dec(None, Some(2), "u16"), 2);
-        // Floats compare at their automatic precision.
-        assert_eq!(dec(None, Some(1), "f32"), 6);
+        // R7: floats use explicit decimals when set, else 6.
+        assert_eq!(dec(None, Some(2), "f32"), 2);
+        assert_eq!(dec(Some(0.1), Some(1), "f64"), 1);
+        assert_eq!(dec(None, None, "f32"), 6);
     }
 
     #[test]

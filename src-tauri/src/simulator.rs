@@ -6476,6 +6476,22 @@ mod tests {
     }
 
     #[test]
+    fn f32_explicit_decimals_round_comparisons() {
+        let regs = [SimRegister {
+            id: 1, unit_id: 1, function_code: 3, address: 0, alias: String::new(), data_type: "f32".into(),
+            hold_value: 0, sort_order: 0, device_instance_id: None, value_source: "generator".into(),
+            byte_order: "ABCD".into(), source_params: "{}".into(), interval_ms: 1000, unit: None,
+            display_format: None, scale: None, scale_offset: None, decimals: Some(2),
+        }];
+        let meta = build_reg_meta(&regs);
+        let mut b = HashMap::new();
+        place_words(&mut b, 1, 3, 0, &encode_value("f32", "ABCD", 35.456).unwrap());
+        let rules = vec![cond_rule(1, Join::All, vec![cnd(1, 3, 0, "==", 35.46, 0.0)])];
+        let mut st = HashMap::new();
+        assert_eq!(eval_rules(&rules, &mut st, &b, &meta, 0.0, &[]).len(), 1, "35.456 == 35.46 at 2 decimals");
+    }
+
+    #[test]
     fn scaled_equality_uses_register_decimals() {
         let meta = cmeta(&[(1, 3, 0, "u16", 0.1)]);
         let rules = vec![cond_rule(1, Join::All, vec![cnd(1, 3, 0, "==", 23.5, 0.0)])];
