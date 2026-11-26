@@ -325,6 +325,28 @@ mod tests {
     }
 
     #[test]
+    fn test_connection_refuses_while_scanning_that_kind() {
+        let state = ModbusState::default();
+        assert_eq!(test_connection_scan_check(&state, "ws", "serial"), Ok(()));
+        let serial = begin_scan(&state, "ws", SessionKind::Rtu).expect("begin serial scan");
+        assert_eq!(
+            test_connection_scan_check(&state, "ws", "serial").err().as_deref(),
+            Some("Serial port is in use by the slave scanner")
+        );
+        assert_eq!(test_connection_scan_check(&state, "ws", "tcp"), Ok(()), "TCP is free");
+        assert_eq!(test_connection_scan_check(&state, "other", "serial"), Ok(()));
+        drop(serial);
+        let tcp = begin_scan(&state, "ws", SessionKind::Tcp).expect("begin TCP scan");
+        assert_eq!(
+            test_connection_scan_check(&state, "ws", "tcp").err().as_deref(),
+            Some("Connection is in use by the slave scanner")
+        );
+        assert_eq!(test_connection_scan_check(&state, "ws", "serial"), Ok(()));
+        assert_eq!(test_connection_scan_check(&state, "ws", "bogus"), Ok(()), "left to the command");
+        drop(tcp);
+    }
+
+    #[test]
     fn begin_scan_twice_fails() {
         let state = ModbusState::default();
         let first = begin_scan(&state, "ws", SessionKind::Rtu).expect("first begin");
@@ -456,14 +478,30 @@ pub(crate) fn lookup_slave_id_and_address_offset(
     }
 }
 
+/// `test_connection` refuses while a scan owns that kind of connection in
+/// the workspace, with the same message as the shared-session commands.
+/// Unknown kinds are left to the command to reject.
+fn test_connection_scan_check(state: &ModbusState, ws: &str, kind: &str) -> Result<(), String> {
+    let session_kind = match kind {
+        "tcp" => SessionKind::Tcp,
+        "serial" => SessionKind::Rtu,
+        _ => return Ok(()),
+    };
+    match scan_block_error(state, ws, session_kind) {
+        Some(e) => Err(e.to_string()),
+        None => Ok(()),
+    }
+}
+
 #[tauri::command]
 pub async fn test_connection(
     app: tauri::AppHandle,
-    _state: tauri::State<'_, ModbusState>,
+    state: tauri::State<'_, ModbusState>,
     name: String,
     settings: ConnectionSettings,
 ) -> Result<(), String> {
     let ws = validate_workspace_name(&name)?;
+    test_connection_scan_check(&state, &ws, settings.kind.as_str())?;
 
     match settings.kind.as_str() {
         "tcp" => {

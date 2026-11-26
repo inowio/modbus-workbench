@@ -218,6 +218,9 @@ pub fn validate(req: &ScanRequest) -> Result<ValidScan, String> {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ProbeOutcome {
     Value,
+    /// Serial: the unit answered an earlier request late (same unit, other
+    /// function code), so it is there.
+    LateReply,
     Exception(u8),
     NoReply,
     Garbled(String),
@@ -236,6 +239,7 @@ pub enum Category {
 pub fn classify(o: &ProbeOutcome) -> Option<(Category, String)> {
     match o {
         ProbeOutcome::Value => Some((Category::Found, "reply".into())),
+        ProbeOutcome::LateReply => Some((Category::Found, "late reply".into())),
         ProbeOutcome::Exception(c @ (0x0A | 0x0B)) => {
             Some((Category::GatewayNoDevice, format!("gateway exception 0x{c:02X}")))
         }
@@ -521,6 +525,10 @@ mod tests {
             Some((Category::Garbled, "x".to_string()))
         );
         assert_eq!(classify(&ProbeOutcome::LinkError("e".into())), None);
+        assert_eq!(
+            classify(&ProbeOutcome::LateReply),
+            Some((Category::Found, "late reply".to_string()))
+        );
     }
 
     #[test]

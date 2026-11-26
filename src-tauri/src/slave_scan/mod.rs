@@ -23,7 +23,8 @@ use crate::modbus::{
 use crate::settings::get_client_settings;
 use crate::workspace::validate_workspace_name;
 use engine::{
-    cancel_pair, run_scan, Cancel, ScanDone, ScanFound, ScanNotice, ScanProgress, ScanSink,
+    cancel_pair, run_scan, Cancel, Connector, Opener, ScanDone, ScanFound, ScanNotice,
+    ScanProgress, ScanSink,
 };
 use transport::{SerialOpener, TcpConnector};
 use types::{validate, ScanKind, ScanRequest, ValidScan};
@@ -145,16 +146,27 @@ async fn connect_timeout_of(app: &tauri::AppHandle, ws: &str) -> Result<Duration
     )))
 }
 
+/// Orders resolved addresses IPv4 first, keeping the resolver's order
+/// otherwise. On Windows `localhost` resolves to `::1` first, while device
+/// simulators often listen on 127.0.0.1 only.
+fn ipv4_first(addrs: impl IntoIterator<Item = SocketAddr>) -> Vec<SocketAddr> {
+    let (mut v4, v6): (Vec<_>, Vec<_>) = addrs.into_iter().partition(SocketAddr::is_ipv4);
+    v4.extend(v6);
+    v4
+}
+
 /// Resolves the TCP target under the connect timeout.
 async fn tcp_connector(host: &str, port: u16, connect_timeout: Duration) -> Result<TcpConnector, String> {
     let host = host.trim();
-    let addr: SocketAddr = tokio::time::timeout(connect_timeout, tokio::net::lookup_host((host, port)))
+    let addrs = tokio::time::timeout(connect_timeout, tokio::net::lookup_host((host, port)))
         .await
         .map_err(|_| format!("timed out resolving {host}"))?
-        .map_err(|e| format!("could not resolve {host}: {e}"))?
-        .next()
-        .ok_or_else(|| format!("could not resolve {host}"))?;
-    Ok(TcpConnector { addr, connect_timeout })
+        .map_err(|e| format!("could not resolve {host}: {e}"))?;
+    let addrs = ipv4_first(addrs);
+    if addrs.is_empty() {
+        return Err(format!("could not resolve {host}"));
+    }
+    Ok(TcpConnector::new(addrs, connect_timeout))
 }
 
 /// Everything the scan task owns. Dropping it clears the scanning flag and
@@ -259,34 +271,49 @@ pub async fn start_slave_scan(
         return Ok(scan_id);
     };
     // 6. Run it; the task owns both guards.
-    let task_ws = ws.clone();
-    tauri::async_runtime::spawn(async move {
-        let _flag = flag;
-        let _entry = entry;
-        let scan_id = scan.scan_id.clone();
-        let run = tokio::spawn(run_scan(
-            scan,
-            task_ws.clone(),
-            Arc::new(SerialOpener),
-            connector,
-            sink.clone(),
-            cancel,
-        ));
-        // `run_scan` sends `done` itself; only a panic needs one sent here.
-        if let Err(e) = run.await {
-            log::error!("slave scan {scan_id} in {task_ws} failed: {e}");
-            sink.done(ScanDone {
-                workspace: task_ws,
+    tauri::async_runtime::spawn(run_and_report(
+        (flag, entry),
+        scan,
+        ws,
+        Arc::new(SerialOpener),
+        connector,
+        sink,
+        cancel,
+    ));
+    // 7.
+    Ok(scan_id)
+}
+
+/// The scan task: runs the scan, frees the workspace (scanning flag and
+/// scan entry), then sends `done`, so the UI can start again or reconnect as
+/// soon as it sees it.
+async fn run_and_report<O: Opener, C: Connector, S: ScanSink>(
+    guards: (ScanFlagGuard, ScanEntryGuard),
+    scan: ValidScan,
+    ws: String,
+    opener: Arc<O>,
+    connector: Option<Arc<C>>,
+    sink: Arc<S>,
+    cancel: Cancel,
+) {
+    let scan_id = scan.scan_id.clone();
+    let run = tokio::spawn(run_scan(scan, ws.clone(), opener, connector, sink.clone(), cancel));
+    let done = match run.await {
+        Ok(done) => done,
+        Err(e) => {
+            log::error!("slave scan {scan_id} in {ws} failed: {e}");
+            ScanDone {
+                workspace: ws,
                 scan_id,
                 reason: "failed".to_string(),
                 error: Some(format!("scan task failed: {e}")),
                 checked: 0,
                 found: 0,
-            });
+            }
         }
-    });
-    // 7.
-    Ok(scan_id)
+    };
+    drop(guards);
+    sink.done(done);
 }
 
 #[tauri::command]
@@ -475,6 +502,115 @@ mod tests {
         );
         assert_released(&scan_state, &modbus);
         assert!(sink.0.lock().unwrap().is_empty());
+    }
+
+    // ---------- run_and_report ----------
+
+    use engine::{OpenError, Prober};
+    use types::ProbeOutcome;
+
+    struct SilentProber;
+
+    impl Prober for SilentProber {
+        fn read(
+            &mut self,
+            _unit: u8,
+            _function_code: u8,
+            _wait: Duration,
+        ) -> impl std::future::Future<Output = ProbeOutcome> + Send {
+            std::future::ready(ProbeOutcome::NoReply)
+        }
+    }
+
+    struct SilentOpener;
+
+    impl Opener for SilentOpener {
+        type P = SilentProber;
+        fn open(
+            &self,
+            _port: &str,
+            _params: &SerialParams,
+        ) -> impl std::future::Future<Output = Result<SilentProber, OpenError>> + Send {
+            std::future::ready(Ok(SilentProber))
+        }
+    }
+
+    /// Notes, at the moment `done` arrives, whether the workspace is free.
+    struct FreeAtDone {
+        scanning: crate::modbus::ScanFlags,
+        scans: Arc<Mutex<ScanMap>>,
+        seen: Mutex<Vec<(String, bool, bool)>>,
+    }
+
+    impl ScanSink for FreeAtDone {
+        fn found(&self, _e: ScanFound) {}
+        fn progress(&self, _e: ScanProgress) {}
+        fn notice(&self, _e: ScanNotice) {}
+        fn done(&self, e: ScanDone) {
+            let flag_clear = !self.scanning.lock().unwrap().contains_key("ws");
+            let entry_clear = !lock_scans(&self.scans).contains_key("ws");
+            self.seen.lock().unwrap().push((e.reason, flag_clear, entry_clear));
+        }
+    }
+
+    /// F6: by the time the UI sees `done`, a new scan or a reconnect works.
+    #[tokio::test]
+    async fn done_is_sent_after_the_workspace_is_free() {
+        let (scan_state, modbus, polling) =
+            (SlaveScanState::default(), ModbusState::default(), AnalyzerPollingState::default());
+        let sink = Arc::new(FreeAtDone {
+            scanning: modbus.scanning.clone(),
+            scans: scan_state.scans.clone(),
+            seen: Mutex::new(Vec::new()),
+        });
+        let scan = serial_scan("s1");
+        let Prepared { flag, entry, cancel, connector: _ } =
+            prepare(&scan_state, &modbus, &polling, "ws", &scan, Duration::ZERO, Duration::from_millis(20), &*sink)
+                .await
+                .expect("prepared")
+                .expect("not cancelled");
+        run_and_report::<_, TcpConnector, _>(
+            (flag, entry),
+            scan,
+            "ws".into(),
+            Arc::new(SilentOpener),
+            None,
+            sink.clone(),
+            cancel,
+        )
+        .await;
+        assert_eq!(*sink.seen.lock().unwrap(), vec![("completed".to_string(), true, true)]);
+        assert_released(&scan_state, &modbus);
+    }
+
+    // ---------- TCP host resolution ----------
+
+    #[test]
+    fn ipv4_addresses_come_first() {
+        let v6: SocketAddr = "[::1]:502".parse().unwrap();
+        let v4: SocketAddr = "127.0.0.1:502".parse().unwrap();
+        let v6b: SocketAddr = "[fe80::1]:502".parse().unwrap();
+        let v4b: SocketAddr = "10.0.0.1:502".parse().unwrap();
+        assert_eq!(ipv4_first(vec![v6, v4, v6b, v4b]), vec![v4, v4b, v6, v6b]);
+        assert_eq!(ipv4_first(vec![v6]), vec![v6]);
+    }
+
+    /// F10: on Windows `localhost` resolves to ::1 first; a device simulator
+    /// listening on 127.0.0.1 must still be reached.
+    #[tokio::test]
+    async fn localhost_reaches_an_ipv4_only_listener() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((s, _)) = listener.accept().await {
+                held.push(s);
+            }
+        });
+        let connector = tcp_connector("localhost", port, Duration::from_millis(500))
+            .await
+            .expect("localhost resolves");
+        connector.connect().await.expect("connects over 127.0.0.1");
     }
 
     #[tokio::test]

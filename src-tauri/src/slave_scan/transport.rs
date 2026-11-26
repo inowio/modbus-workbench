@@ -15,10 +15,10 @@ use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_modbus::client::{self, Reader};
 use tokio_modbus::slave::SlaveContext;
-use tokio_modbus::{Error, Slave};
+use tokio_modbus::{Error, ProtocolError, Slave};
 use tokio_serial::SerialPortBuilderExt;
 
-use super::engine::{Connector, Opener, Prober};
+use super::engine::{Connector, OpenError, Opener, Prober};
 use super::types::{ProbeOutcome, SerialParams};
 use crate::modbus::{
     parse_serial_data_bits, parse_serial_flow_control, parse_serial_parity,
@@ -94,14 +94,31 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for CountingStream<T> {
 
 // ---------- shared request/reply handling ----------
 
+/// The unit that sent a reply, from tokio-modbus's header-mismatch message
+/// ("expected/request = Header { slave_id: 4 }, actual/response = Header {
+/// slave_id: 9 }"). `None` if the message has another shape.
+fn replying_unit(message: &str) -> Option<u8> {
+    let (_, actual) = message.split_once("actual/response")?;
+    let (_, rest) = actual.split_once("slave_id:")?;
+    let digits: String = rest.trim_start().chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
 /// Maps a tokio-modbus reply to a probe outcome (timeouts are handled by
-/// the caller; `TcpProber` handles a mismatched reply itself).
+/// the caller; `TcpProber` handles a mismatched reply itself, so the
+/// protocol errors here are serial ones).
 fn outcome_of(reply: tokio_modbus::Result<()>) -> ProbeOutcome {
     match reply {
         Ok(Ok(())) => ProbeOutcome::Value,
         Ok(Err(code)) => ProbeOutcome::Exception(u8::from(code)),
-        Err(Error::Protocol(_)) => {
-            ProbeOutcome::Garbled("reply from another unit or function".to_string())
+        // The RTU header (the unit) matched, only the function differs: the
+        // unit is there and answered an earlier request late.
+        Err(Error::Protocol(ProtocolError::FunctionCodeMismatch { .. })) => ProbeOutcome::LateReply,
+        Err(Error::Protocol(ProtocolError::HeaderMismatch { message, .. })) => {
+            ProbeOutcome::Garbled(match replying_unit(&message) {
+                Some(u) => format!("reply from unit {u}"),
+                None => "reply from another unit".to_string(),
+            })
         }
         Err(Error::Transport(e)) if e.kind() == io::ErrorKind::InvalidData => {
             ProbeOutcome::Garbled("CRC or framing error".to_string())
@@ -205,6 +222,14 @@ impl Session {
 
 // ---------- serial ----------
 
+fn serial_builder(port: &str, params: &SerialParams) -> Result<tokio_serial::SerialPortBuilder, String> {
+    Ok(tokio_serial::new(port, params.baud)
+        .parity(parse_serial_parity(Some(params.parity.clone()))?)
+        .data_bits(parse_serial_data_bits(Some(i64::from(params.data_bits)))?)
+        .stop_bits(parse_serial_stop_bits(Some(i64::from(params.stop_bits)))?)
+        .flow_control(parse_serial_flow_control(Some(params.flow_control.clone()))?))
+}
+
 /// Opens serial ports for the scan, one per settings combination.
 pub struct SerialOpener;
 
@@ -215,15 +240,11 @@ impl Opener for SerialOpener {
         &self,
         port: &str,
         params: &SerialParams,
-    ) -> impl Future<Output = Result<SerialProber, String>> + Send {
+    ) -> impl Future<Output = Result<SerialProber, OpenError>> + Send {
         let port = port.to_string();
         let params = params.clone();
         async move {
-            let builder = tokio_serial::new(port.clone(), params.baud)
-                .parity(parse_serial_parity(Some(params.parity.clone()))?)
-                .data_bits(parse_serial_data_bits(Some(i64::from(params.data_bits)))?)
-                .stop_bits(parse_serial_stop_bits(Some(i64::from(params.stop_bits)))?)
-                .flow_control(parse_serial_flow_control(Some(params.flow_control.clone()))?);
+            let builder = serial_builder(&port, &params).map_err(OpenError::Failed)?;
             // If the wait runs out, the blocking open still finishes on its
             // own and the stream it returns is dropped, closing the port.
             let opened = timeout(
@@ -231,9 +252,9 @@ impl Opener for SerialOpener {
                 tokio::task::spawn_blocking(move || builder.open_native_async()),
             )
             .await
-            .map_err(|_| format!("timed out opening {port}"))?
-            .map_err(|e| format!("port open task failed: {e}"))?;
-            let stream = opened.map_err(|e| e.to_string())?;
+            .map_err(|_| OpenError::TimedOut(format!("timed out opening {port}")))?
+            .map_err(|e| OpenError::Failed(format!("port open task failed: {e}")))?;
+            let stream = opened.map_err(|e| OpenError::Failed(e.to_string()))?;
             Ok(SerialProber::attach(stream))
         }
     }
@@ -285,9 +306,24 @@ impl Prober for SerialProber {
 // ---------- TCP ----------
 
 /// Opens one Modbus TCP connection per scan worker.
+///
+/// The first connect tries each resolved address in order (the caller puts
+/// IPv4 first); later connects go straight to the address that worked.
 pub struct TcpConnector {
-    pub addr: SocketAddr,
-    pub connect_timeout: Duration,
+    addrs: Vec<SocketAddr>,
+    connect_timeout: Duration,
+    working: Arc<Mutex<Option<SocketAddr>>>,
+}
+
+impl TcpConnector {
+    pub fn new(addrs: Vec<SocketAddr>, connect_timeout: Duration) -> Self {
+        Self { addrs, connect_timeout, working: Arc::new(Mutex::new(None)) }
+    }
+
+    fn candidates(&self) -> Vec<SocketAddr> {
+        let working = *self.working.lock().unwrap_or_else(|e| e.into_inner());
+        working.map_or_else(|| self.addrs.clone(), |a| vec![a])
+    }
 }
 
 async fn open_tcp_session(addr: SocketAddr, limit: Duration) -> Result<Session, String> {
@@ -304,11 +340,21 @@ impl Connector for TcpConnector {
     type P = TcpProber;
 
     fn connect(&self) -> impl Future<Output = Result<TcpProber, String>> + Send {
-        let addr = self.addr;
+        let candidates = self.candidates();
         let connect_timeout = self.connect_timeout;
+        let working = self.working.clone();
         async move {
-            let session = open_tcp_session(addr, connect_timeout).await?;
-            Ok(TcpProber { addr, connect_timeout, session: Some(session) })
+            let mut last_error = "no address to connect to".to_string();
+            for addr in candidates {
+                match open_tcp_session(addr, connect_timeout).await {
+                    Ok(session) => {
+                        *working.lock().unwrap_or_else(|e| e.into_inner()) = Some(addr);
+                        return Ok(TcpProber { addr, connect_timeout, session: Some(session) });
+                    }
+                    Err(e) => last_error = e,
+                }
+            }
+            Err(last_error)
         }
     }
 }
@@ -326,14 +372,33 @@ pub struct TcpProber {
     session: Option<Session>,
 }
 
+/// Pauses before each extra reconnect attempt. Single-connection devices and
+/// gateways can take a moment to free the slot of the connection just
+/// dropped.
+const RECONNECT_BACKOFF: [Duration; 3] =
+    [Duration::from_millis(100), Duration::from_millis(250), Duration::from_millis(500)];
+
 impl TcpProber {
+    /// Opens a fresh connection: one attempt, then one more after each
+    /// backoff pause, each bounded by the connect timeout. The pauses are
+    /// async sleeps, and the engine races every read against cancel, so a
+    /// cancel drops this at once.
     async fn reconnect(&mut self) -> Result<(), String> {
         self.session = None;
-        let session = open_tcp_session(self.addr, self.connect_timeout)
-            .await
-            .map_err(|e| format!("reconnect failed: {e}"))?;
-        self.session = Some(session);
-        Ok(())
+        let mut last_error = String::new();
+        for pause in std::iter::once(Duration::ZERO).chain(RECONNECT_BACKOFF) {
+            if !pause.is_zero() {
+                tokio::time::sleep(pause).await;
+            }
+            match open_tcp_session(self.addr, self.connect_timeout).await {
+                Ok(session) => {
+                    self.session = Some(session);
+                    return Ok(());
+                }
+                Err(e) => last_error = e,
+            }
+        }
+        Err(format!("reconnect failed: {last_error}"))
     }
 }
 
@@ -436,7 +501,11 @@ mod tests {
     }
 
     fn connector(addr: SocketAddr) -> TcpConnector {
-        TcpConnector { addr, connect_timeout: Duration::from_secs(2) }
+        connector_with(addr, Duration::from_secs(2))
+    }
+
+    fn connector_with(addr: SocketAddr, connect_timeout: Duration) -> TcpConnector {
+        TcpConnector::new(vec![addr], connect_timeout)
     }
 
     #[tokio::test]
@@ -521,12 +590,55 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(5)).await;
             drop(s);
         });
-        let c = TcpConnector { addr, connect_timeout: Duration::from_millis(300) };
+        let c = connector_with(addr, Duration::from_millis(300));
         let mut p = c.connect().await.expect("connect");
         match p.read(1, 3, Duration::from_millis(30)).await {
             ProbeOutcome::LinkError(e) => assert!(e.starts_with("reconnect failed"), "{e}"),
             other => panic!("expected LinkError, got {other:?}"),
         }
+    }
+
+    /// A listener that can be closed and reopened on the same port while
+    /// accepted connections stay open.
+    fn reusable_listener(addr: SocketAddr) -> TcpListener {
+        let socket = tokio::net::TcpSocket::new_v4().expect("socket");
+        socket.set_reuseaddr(true).expect("reuseaddr");
+        socket.bind(addr).expect("bind");
+        socket.listen(16).expect("listen")
+    }
+
+    /// Answers every request with a valid FC03 value.
+    async fn answer_all(mut s: TcpStream) {
+        let mut req = [0u8; 12];
+        while s.read_exact(&mut req).await.is_ok() {
+            let reply = [req[0], req[1], 0, 0, 0, 5, req[6], 3, 2, 0, 42];
+            if s.write_all(&reply).await.is_err() {
+                return;
+            }
+        }
+    }
+
+    /// F1: a single-connection device or gateway may not have freed its slot
+    /// yet when the prober reconnects. The first reconnect is refused (nothing
+    /// listens), a later one is accepted, and the scan goes on.
+    #[tokio::test]
+    async fn tcp_reconnect_is_retried() {
+        let first = reusable_listener("127.0.0.1:0".parse().unwrap());
+        let addr = first.local_addr().unwrap();
+        tokio::spawn(async move {
+            // The first connection never answers, so the check times out.
+            let (silent, _) = first.accept().await.unwrap();
+            drop(first);
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            let again = reusable_listener(addr);
+            while let Ok((s, _)) = again.accept().await {
+                tokio::spawn(answer_all(s));
+            }
+            drop(silent);
+        });
+        let mut p = connector_with(addr, Duration::from_millis(300)).connect().await.expect("connect");
+        assert_eq!(p.read(1, 3, Duration::from_millis(30)).await, ProbeOutcome::NoReply);
+        assert_eq!(p.read(2, 3, WAIT).await, ProbeOutcome::Value, "next unit found");
     }
 
     #[tokio::test]
@@ -535,7 +647,7 @@ mod tests {
         let addr = TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap();
         // Windows retries a refused localhost connect for ~2 s; the timeout
         // bounds it either way.
-        let c = TcpConnector { addr, connect_timeout: Duration::from_millis(300) };
+        let c = connector_with(addr, Duration::from_millis(300));
         assert!(c.connect().await.is_err());
     }
 
@@ -617,6 +729,8 @@ mod tests {
             2 => rtu_frame(&[2, fc | 0x80, 2]),
             3 => vec![0xFF, 0xFF, 0xFF],
             4 => rtu_frame(&[9, fc, 2, 0, 42]),
+            // Same unit, other function: a late answer to an earlier request.
+            6 => rtu_frame(&[6, if fc == 3 { 4 } else { 3 }, 2, 0, 42]),
             _ => vec![],
         });
         assert_eq!(p.read(1, 3, WAIT).await, ProbeOutcome::Value);
@@ -626,9 +740,11 @@ mod tests {
             p.read(3, 3, Duration::from_millis(50)).await,
             ProbeOutcome::Garbled("3 bytes received, no valid reply".into())
         );
+        assert_eq!(p.read(4, 3, WAIT).await, ProbeOutcome::Garbled("reply from unit 9".into()));
+        // F11: the unit is there; it answered an earlier request late.
         assert_eq!(
-            p.read(4, 3, WAIT).await,
-            ProbeOutcome::Garbled("reply from another unit or function".into())
+            crate::slave_scan::types::classify(&p.read(6, 3, WAIT).await),
+            Some((Category::Found, "late reply".to_string()))
         );
         assert_eq!(p.read(1, 4, WAIT).await, ProbeOutcome::Value, "port still usable");
     }
@@ -709,6 +825,6 @@ mod tests {
         assert_eq!(found[2], (3, Category::Found, "reply".to_string()));
         assert_eq!(found[3], (4, Category::Found, "exception 0x02".to_string()));
         assert_eq!(found[8], (9, Category::GatewayNoDevice, "gateway exception 0x0B".to_string()));
-        assert_eq!(sink.done.lock().unwrap().len(), 1);
+        assert!(sink.done.lock().unwrap().is_empty(), "the caller sends done");
     }
 }

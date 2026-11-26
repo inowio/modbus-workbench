@@ -5,7 +5,8 @@
 //! [`Prober`]; events go out through [`ScanSink`]. Nothing here touches Tauri
 //! or real I/O, so the whole engine is tested with fakes.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::fmt;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -37,6 +38,8 @@ fn tcp_fallback_notice(n: usize) -> String {
     format!("Device accepts {n} connection(s); scanning {n} at a time")
 }
 
+const GATEWAY_NOTICE: &str = "Gateway detected; scanning 1 at a time";
+
 /// Locks a std mutex, recovering the data if another task panicked while
 /// holding it (the engine's state stays usable; nothing here is left torn).
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -56,13 +59,30 @@ pub trait Prober: Send {
     ) -> impl Future<Output = ProbeOutcome> + Send;
 }
 
+/// Why a serial open failed. A timeout means the port is stuck, so the
+/// port's remaining settings are skipped; any other failure only skips the
+/// one setting.
+#[derive(Clone, Debug, PartialEq)]
+pub enum OpenError {
+    TimedOut(String),
+    Failed(String),
+}
+
+impl fmt::Display for OpenError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            OpenError::TimedOut(m) | OpenError::Failed(m) => f.write_str(m),
+        }
+    }
+}
+
 pub trait Opener: Send + Sync + 'static {
     type P: Prober + 'static;
     fn open(
         &self,
         port: &str,
         params: &SerialParams,
-    ) -> impl Future<Output = Result<Self::P, String>> + Send;
+    ) -> impl Future<Output = Result<Self::P, OpenError>> + Send;
 }
 
 pub trait Connector: Send + Sync + 'static {
@@ -207,11 +227,15 @@ struct Ctx<S: ScanSink> {
     workspace: String,
     scan_id: String,
     sink: Arc<S>,
-    total: u64,
+    /// Grows when a TCP scan re-checks units after spotting a gateway.
+    total: AtomicU64,
     checked: AtomicU64,
     found: AtomicU64,
     progress: Mutex<ProgressState>,
     cancel_seen: AtomicBool,
+    /// Serial: whether any open succeeded, and the first open failure.
+    opened_any: AtomicBool,
+    first_open_error: Mutex<Option<String>>,
 }
 
 impl<S: ScanSink> Ctx<S> {
@@ -225,6 +249,11 @@ impl<S: ScanSink> Ctx<S> {
 
     fn saw_cancel(&self) {
         self.cancel_seen.store(true, Ordering::SeqCst);
+    }
+
+    fn open_failed(&self, message: String) {
+        lock(&self.first_open_error).get_or_insert_with(|| message.clone());
+        self.notice(message);
     }
 
     /// Reports one finished check: a found event if it classifies, then the
@@ -268,8 +297,9 @@ impl<S: ScanSink> Ctx<S> {
         if checked <= st.last_checked_sent {
             return;
         }
+        let total = self.total.load(Ordering::SeqCst);
         let now = tokio::time::Instant::now().into_std();
-        if !st.throttle.should_emit(now, checked >= self.total) {
+        if !st.throttle.should_emit(now, checked >= total) {
             return;
         }
         st.last_checked_sent = checked;
@@ -277,7 +307,7 @@ impl<S: ScanSink> Ctx<S> {
             workspace: self.workspace.clone(),
             scan_id: self.scan_id.clone(),
             checked,
-            total: self.total,
+            total,
             current: ScanCurrent {
                 target: target.to_string(),
                 unit_id: unit,
@@ -289,8 +319,10 @@ impl<S: ScanSink> Ctx<S> {
 
 // ---------- entry point ----------
 
-/// Runs a whole scan and sends `done` before returning it. `connector` is
-/// only used (and required) for TCP scans; `opener` only for serial ones.
+/// Runs a whole scan and returns its `done` event without sending it, so the
+/// caller can release the workspace first. Every other event has been sent
+/// by then. `connector` is only used (and required) for TCP scans; `opener`
+/// only for serial ones.
 pub async fn run_scan<O: Opener, C: Connector, S: ScanSink>(
     scan: ValidScan,
     workspace: String,
@@ -308,7 +340,7 @@ pub async fn run_scan<O: Opener, C: Connector, S: ScanSink>(
         workspace,
         scan_id: scan.scan_id.clone(),
         sink,
-        total,
+        total: AtomicU64::new(total),
         checked: AtomicU64::new(0),
         found: AtomicU64::new(0),
         progress: Mutex::new(ProgressState {
@@ -316,6 +348,8 @@ pub async fn run_scan<O: Opener, C: Connector, S: ScanSink>(
             last_checked_sent: 0,
         }),
         cancel_seen: AtomicBool::new(false),
+        opened_any: AtomicBool::new(false),
+        first_open_error: Mutex::new(None),
     });
     let scan = Arc::new(scan);
 
@@ -327,6 +361,14 @@ pub async fn run_scan<O: Opener, C: Connector, S: ScanSink>(
         },
     };
 
+    // A serial scan that could not open any port at any setting failed.
+    let checked = ctx.checked.load(Ordering::SeqCst);
+    let result = match result {
+        Ok(()) if checked == 0 && !ctx.opened_any.load(Ordering::SeqCst) => {
+            lock(&ctx.first_open_error).clone().map_or(Ok(()), Err)
+        }
+        other => other,
+    };
     let (reason, error) = if ctx.cancel_seen.load(Ordering::SeqCst) {
         ("cancelled", None)
     } else {
@@ -335,16 +377,14 @@ pub async fn run_scan<O: Opener, C: Connector, S: ScanSink>(
             Err(e) => ("failed", Some(e)),
         }
     };
-    let done = ScanDone {
+    ScanDone {
         workspace: ctx.workspace.clone(),
         scan_id: ctx.scan_id.clone(),
         reason: reason.to_string(),
         error,
-        checked: ctx.checked.load(Ordering::SeqCst),
+        checked,
         found: ctx.found.load(Ordering::SeqCst),
-    };
-    ctx.sink.done(done.clone());
-    done
+    }
 }
 
 /// Waits for every task, so no port or connection outlives the scan; a
@@ -408,10 +448,15 @@ async fn serial_port_task<O: Opener, S: ScanSink>(
         let mut prober = match opener.open(&port, combo).await {
             Ok(p) => p,
             Err(e) => {
-                ctx.notice(format!("{port}: could not open at {}: {e}", format_settings(combo)));
-                continue;
+                ctx.open_failed(format!("{port}: could not open at {}: {e}", format_settings(combo)));
+                match e {
+                    // A stuck port would stall every remaining setting too.
+                    OpenError::TimedOut(_) => return,
+                    OpenError::Failed(_) => continue,
+                }
             }
         };
+        ctx.opened_any.store(true, Ordering::SeqCst);
         if cancel.is_cancelled() {
             ctx.saw_cancel();
             return;
@@ -449,7 +494,9 @@ async fn scan_combo<P: Prober, S: ScanSink>(
             return ComboEnd::PortLost;
         }
         let category = ctx.record(port, unit, Some(combo), &outcome, fc, ms);
-        if guard.record(category) != FloodVerdict::Continue {
+        // Only garbage at every address is a flood: real devices at many
+        // consecutive addresses are not (an all-found run just disarms it).
+        if guard.record(category) == FloodVerdict::AllGarbled {
             ctx.notice(serial_flood_notice(&format_settings(combo)));
             return ComboEnd::Finished;
         }
@@ -467,9 +514,16 @@ async fn scan_combo<P: Prober, S: ScanSink>(
 /// left without checking anything. Devices that allow one connection often
 /// accept extra ones and reset them on the first request, so the fallback
 /// notice waits until every worker is settled to report the final count.
+///
+/// A TCP-to-RTU gateway queues every request onto one serial bus, so with
+/// several checks in flight a real device can answer only after the wait.
+/// The first gateway reply therefore shrinks the pool to one worker, and the
+/// units that went silent while other checks were in flight are checked
+/// again.
 struct PoolState {
     queue: VecDeque<u8>,
-    in_flight: usize,
+    /// Units being checked, each with whether another check overlapped it.
+    in_flight: HashMap<u8, bool>,
     unsettled: usize,
     live: usize,
     retired: bool,
@@ -477,6 +531,12 @@ struct PoolState {
     stopped: bool,
     flood: FloodGuard,
     last_error: Option<String>,
+    /// A gateway answered: one check at a time from then on.
+    gateway: bool,
+    /// Silent while overlapped, before any gateway reply was seen.
+    suspects: Vec<u8>,
+    /// Units already put back once for a re-check.
+    rechecked: HashSet<u8>,
 }
 
 struct Pool {
@@ -491,13 +551,49 @@ enum Take {
     Exhausted,
 }
 
+/// One unit taken from the pool. Closed by `finish`, `abandon` or `retire`;
+/// if it is dropped open (its worker panicked), the drop frees its slot so
+/// the other workers do not wait for it forever.
+struct Ticket<'a> {
+    pool: &'a Pool,
+    unit: u8,
+    open: bool,
+}
+
+impl Ticket<'_> {
+    /// Frees the slot; returns whether another check overlapped this one.
+    fn close(&mut self, st: &mut PoolState) -> bool {
+        self.open = false;
+        st.in_flight.remove(&self.unit).unwrap_or(false)
+    }
+}
+
+impl Drop for Ticket<'_> {
+    fn drop(&mut self) {
+        if self.open {
+            lock(&self.pool.state).in_flight.remove(&self.unit);
+            self.pool.changed.notify_waiters();
+        }
+    }
+}
+
+/// What finishing a check changed in the pool.
+struct Finished {
+    /// The flood guard tripped on an all-found run.
+    flooded: bool,
+    /// This check was the scan's first gateway reply.
+    gateway_now: bool,
+    /// Fallback notice count, if due.
+    notice: Option<usize>,
+}
+
 impl Pool {
     /// Worker 0 is already connected (live); all `workers` are unsettled.
     fn new(units: VecDeque<u8>, workers: usize) -> Self {
         Self {
             state: Mutex::new(PoolState {
                 queue: units,
-                in_flight: 0,
+                in_flight: HashMap::new(),
                 unsettled: workers,
                 live: 1,
                 retired: false,
@@ -505,6 +601,9 @@ impl Pool {
                 stopped: false,
                 flood: FloodGuard::new(FLOOD_THRESHOLD),
                 last_error: None,
+                gateway: false,
+                suspects: Vec::new(),
+                rechecked: HashSet::new(),
             }),
             changed: Notify::new(),
         }
@@ -515,11 +614,25 @@ impl Pool {
         if st.stopped {
             return Take::Exhausted;
         }
+        if st.gateway {
+            if st.live > 1 {
+                // Retire quietly; the last live worker carries on alone.
+                st.live -= 1;
+                return Take::Exhausted;
+            }
+            if !st.in_flight.is_empty() {
+                return Take::Wait;
+            }
+        }
         if let Some(u) = st.queue.pop_front() {
-            st.in_flight += 1;
+            let overlapped = !st.in_flight.is_empty();
+            for other in st.in_flight.values_mut() {
+                *other = true;
+            }
+            st.in_flight.insert(u, overlapped);
             return Take::Unit(u);
         }
-        if st.in_flight == 0 {
+        if st.in_flight.is_empty() {
             Take::Exhausted
         } else {
             // Another worker may still put its unit back.
@@ -527,16 +640,16 @@ impl Pool {
         }
     }
 
-    /// Next unit, or `None` when the work is done, the pool stopped, or
-    /// cancel was requested.
-    async fn take(&self, cancel: &mut Cancel) -> Option<u8> {
+    /// Next unit, or `None` when the work is done, the pool stopped, this
+    /// worker retired, or cancel was requested.
+    async fn take(&self, cancel: &mut Cancel) -> Option<Ticket<'_>> {
         loop {
             let notified = self.changed.notified();
             tokio::pin!(notified);
             // Register before checking so a wake between check and await is kept.
             notified.as_mut().enable();
             match self.try_take() {
-                Take::Unit(u) => return Some(u),
+                Take::Unit(unit) => return Some(Ticket { pool: self, unit, open: true }),
                 Take::Exhausted => return None,
                 Take::Wait => {}
             }
@@ -565,39 +678,67 @@ impl Pool {
         Self::settle_one(&mut lock(&self.state))
     }
 
-    /// A check finished; `first` settles the worker. Returns whether this
-    /// check tripped the flood guard, and the fallback notice count if due.
-    fn finish(&self, category: Option<Category>, first: bool) -> (bool, Option<usize>) {
+    /// A check finished; `first` settles the worker. Each unit put back for
+    /// a re-check adds one to `total` before any worker can take it, so
+    /// progress never shows checked == total while re-checks are queued.
+    fn finish(
+        &self,
+        mut ticket: Ticket<'_>,
+        no_reply: bool,
+        category: Option<Category>,
+        first: bool,
+        total: &AtomicU64,
+    ) -> Finished {
+        let unit = ticket.unit;
         let result = {
             let mut st = lock(&self.state);
-            st.in_flight = st.in_flight.saturating_sub(1);
+            let overlapped = ticket.close(&mut st);
             let flooded = st.flood.record(category) == FloodVerdict::AllFound;
-            if flooded {
-                st.stopped = true;
+            let mut recheck = Vec::new();
+            if no_reply && overlapped && !st.rechecked.contains(&unit) {
+                if st.gateway {
+                    recheck.push(unit);
+                } else {
+                    st.suspects.push(unit);
+                }
+            }
+            let gateway_now = category == Some(Category::GatewayNoDevice) && !st.gateway;
+            if gateway_now {
+                st.gateway = true;
+                recheck.append(&mut st.suspects);
+            }
+            for u in recheck {
+                if st.rechecked.insert(u) {
+                    total.fetch_add(1, Ordering::SeqCst);
+                    st.queue.push_back(u);
+                }
             }
             let notice = if first { Self::settle_one(&mut st) } else { None };
-            (flooded, notice)
+            Finished { flooded, gateway_now, notice }
         };
         self.changed.notify_waiters();
         result
     }
 
+    /// Stops handing out units (the device ignores the unit ID).
+    fn stop(&self) {
+        lock(&self.state).stopped = true;
+        self.changed.notify_waiters();
+    }
+
     /// A check was abandoned because of cancel.
-    fn abandon(&self) {
-        {
-            let mut st = lock(&self.state);
-            st.in_flight = st.in_flight.saturating_sub(1);
-        }
+    fn abandon(&self, mut ticket: Ticket<'_>) {
+        ticket.close(&mut lock(&self.state));
         self.changed.notify_waiters();
     }
 
     /// A worker's connection broke: its unit goes back on the queue and the
     /// worker stops. Returns the live count if the fallback notice is due.
-    fn retire(&self, unit: u8, err: String, first: bool) -> Option<usize> {
+    fn retire(&self, mut ticket: Ticket<'_>, err: String, first: bool) -> Option<usize> {
         let notice = {
             let mut st = lock(&self.state);
-            st.in_flight = st.in_flight.saturating_sub(1);
-            st.queue.push_front(unit);
+            ticket.close(&mut st);
+            st.queue.push_front(ticket.unit);
             st.live = st.live.saturating_sub(1);
             st.retired = true;
             st.last_error = Some(err);
@@ -618,14 +759,25 @@ impl Pool {
 
     /// One notice per scan, once every worker is settled and some worker
     /// was lost, and only while one is still alive (otherwise the scan fails).
+    /// After a gateway reply the pool is down to one on purpose, so there is
+    /// no fallback notice then.
     fn notice_due(st: &mut PoolState) -> Option<usize> {
-        if st.retired && !st.notice_sent && st.unsettled == 0 && st.live > 0 {
+        if st.retired && !st.notice_sent && !st.gateway && st.unsettled == 0 && st.live > 0 {
             st.notice_sent = true;
             Some(st.live)
         } else {
             None
         }
     }
+}
+
+/// A unit outside the scanned set, probed when every scanned unit answers:
+/// 254 if it is not scanned, else the highest free unit in 0–255.
+fn control_unit(units: &[u8]) -> Option<u8> {
+    if !units.contains(&254) {
+        return Some(254);
+    }
+    (0..=255u8).rev().find(|u| !units.contains(u))
 }
 
 fn send_fallback_notice<S: ScanSink>(ctx: &Ctx<S>, due: Option<usize>) {
@@ -654,7 +806,7 @@ async fn scan_tcp_pool<C: Connector, S: ScanSink>(
     };
     let first = first.map_err(|e| format!("could not connect to {target}: {e}"))?;
 
-    let workers = scan.concurrency.max(1);
+    let workers = scan.concurrency.min(scan.units.len()).max(1);
     let pool = Arc::new(Pool::new(scan.units.iter().copied().collect(), workers));
     let mut set = JoinSet::new();
     set.spawn(tcp_worker(
@@ -714,8 +866,31 @@ async fn tcp_connect_then_work<C: Connector, S: ScanSink>(
     }
 }
 
-/// Takes units from the pool until it runs dry, stops, or this connection
-/// breaks. The prober is dropped on every return.
+enum Control {
+    /// The control unit is silent: real devices, keep scanning.
+    Continue,
+    /// The control unit answers too: the device ignores the unit ID.
+    Stop,
+    Cancelled,
+}
+
+/// After every scanned unit so far answered, probes one unit outside the
+/// scan with the same settings. Its result is never reported or counted.
+async fn check_control<P: Prober>(prober: &mut P, scan: &ValidScan, cancel: &mut Cancel) -> Control {
+    let Some(unit) = control_unit(&scan.units) else {
+        return Control::Stop;
+    };
+    match probe_unit(prober, unit, scan.probe, scan.retries, scan.wait, cancel).await {
+        None => Control::Cancelled,
+        Some((outcome, _, _)) if classify(&outcome).map(|(c, _)| c) == Some(Category::Found) => {
+            Control::Stop
+        }
+        Some(_) => Control::Continue,
+    }
+}
+
+/// Takes units from the pool until it runs dry, stops, retires this worker,
+/// or this connection breaks. The prober is dropped on every return.
 async fn tcp_worker<P: Prober, S: ScanSink>(
     mut prober: P,
     target: Arc<str>,
@@ -726,31 +901,47 @@ async fn tcp_worker<P: Prober, S: ScanSink>(
 ) {
     let mut settled = false;
     loop {
-        let Some(unit) = pool.take(&mut cancel).await else {
+        let Some(ticket) = pool.take(&mut cancel).await else {
             if cancel.is_cancelled() {
                 ctx.saw_cancel();
             }
             break;
         };
+        let unit = ticket.unit;
         match probe_unit(&mut prober, unit, scan.probe, scan.retries, scan.wait, &mut cancel).await
         {
             None => {
-                pool.abandon();
+                pool.abandon(ticket);
                 ctx.saw_cancel();
                 break;
             }
             Some((ProbeOutcome::LinkError(e), _, _)) => {
                 log::info!("slave scan: connection to {target} lost: {e}");
-                send_fallback_notice(&ctx, pool.retire(unit, e, !settled));
+                send_fallback_notice(&ctx, pool.retire(ticket, e, !settled));
                 return;
             }
             Some((outcome, fc, ms)) => {
-                let category = ctx.record(&target, unit, None, &outcome, fc, ms);
-                let (flooded, due) = pool.finish(category, !settled);
+                let category = classify(&outcome).map(|(c, _)| c);
+                let no_reply = outcome == ProbeOutcome::NoReply;
+                let fin = pool.finish(ticket, no_reply, category, !settled, &ctx.total);
                 settled = true;
-                send_fallback_notice(&ctx, due);
-                if flooded {
-                    ctx.notice(TCP_FLOOD_NOTICE.to_string());
+                ctx.record(&target, unit, None, &outcome, fc, ms);
+                send_fallback_notice(&ctx, fin.notice);
+                if fin.gateway_now {
+                    ctx.notice(GATEWAY_NOTICE.to_string());
+                }
+                if fin.flooded {
+                    match check_control(&mut prober, &scan, &mut cancel).await {
+                        Control::Continue => {}
+                        Control::Stop => {
+                            pool.stop();
+                            ctx.notice(TCP_FLOOD_NOTICE.to_string());
+                        }
+                        Control::Cancelled => {
+                            ctx.saw_cancel();
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -817,6 +1008,12 @@ mod tests {
         script: Script,
         delay: Duration,
         link_error: bool,
+        /// Units that get no reply while another read is in flight (a
+        /// gateway queueing requests onto one bus), and their scripted
+        /// answer when read alone.
+        contended: HashSet<u8>,
+        /// A read of this unit panics.
+        panic_unit: Option<u8>,
         calls: Calls,
         in_flight: Arc<AtomicUsize>,
         max_in_flight: Arc<AtomicUsize>,
@@ -837,6 +1034,10 @@ mod tests {
             _wait: Duration,
         ) -> impl std::future::Future<Output = ProbeOutcome> + Send {
             self.calls.lock().unwrap().push((self.label.clone(), unit, function_code));
+            if self.panic_unit == Some(unit) {
+                panic!("fake prober panicked on unit {unit}");
+            }
+            let contended = self.contended.contains(&unit);
             let outcome = if self.link_error {
                 ProbeOutcome::LinkError("reset".into())
             } else {
@@ -851,8 +1052,12 @@ mod tests {
             let max = self.max_in_flight.clone();
             async move {
                 let _g = InFlight::enter(&cur, &max);
+                let at_start = cur.load(Ordering::SeqCst);
                 if !delay.is_zero() {
                     tokio::time::sleep(delay).await;
+                }
+                if contended && (at_start > 1 || cur.load(Ordering::SeqCst) > 1) {
+                    return ProbeOutcome::NoReply;
                 }
                 outcome
             }
@@ -870,6 +1075,7 @@ mod tests {
     struct FakeOpener {
         scripts: HashMap<(String, u32, String), Script>,
         fail_ports: HashSet<String>,
+        timeout_ports: HashSet<String>,
         delay: Duration,
         calls: Calls,
         opens: Mutex<Vec<(String, u32, String)>>,
@@ -897,10 +1103,12 @@ mod tests {
             &self,
             port: &str,
             params: &SerialParams,
-        ) -> impl std::future::Future<Output = Result<FakeProber, String>> + Send {
+        ) -> impl std::future::Future<Output = Result<FakeProber, OpenError>> + Send {
             self.opens.lock().unwrap().push((port.into(), params.baud, params.parity.clone()));
-            let result = if self.fail_ports.contains(port) {
-                Err("access denied".to_string())
+            let result = if self.timeout_ports.contains(port) {
+                Err(OpenError::TimedOut(format!("timed out opening {port}")))
+            } else if self.fail_ports.contains(port) {
+                Err(OpenError::Failed("access denied".to_string()))
             } else {
                 let c = self.counters(port);
                 if c.live.fetch_add(1, Ordering::SeqCst) != 0 {
@@ -912,6 +1120,8 @@ mod tests {
                     script: self.scripts.get(&key).cloned().unwrap_or_default(),
                     delay: self.delay,
                     link_error: false,
+                    contended: HashSet::new(),
+                    panic_unit: None,
                     calls: self.calls.clone(),
                     in_flight: c.in_flight.clone(),
                     max_in_flight: c.max_in_flight.clone(),
@@ -930,6 +1140,8 @@ mod tests {
         accept: Option<usize>,
         /// Connection indexes whose every read is a LinkError.
         link_error_conns: HashSet<usize>,
+        contended: HashSet<u8>,
+        panic_unit: Option<u8>,
         connects: AtomicUsize,
         calls: Calls,
         in_flight: Arc<AtomicUsize>,
@@ -950,6 +1162,8 @@ mod tests {
                     script: self.script.clone(),
                     delay: self.delay,
                     link_error: self.link_error_conns.contains(&n),
+                    contended: self.contended.clone(),
+                    panic_unit: self.panic_unit,
                     calls: self.calls.clone(),
                     in_flight: self.in_flight.clone(),
                     max_in_flight: self.max_in_flight.clone(),
@@ -1061,6 +1275,12 @@ mod tests {
     ) -> Run {
         let sink = Arc::new(RecordingSink::default());
         let done = run_scan(scan, "ws1".into(), opener, connector, sink.clone(), cancel).await;
+        assert!(
+            !sink.events.lock().unwrap().iter().any(|e| matches!(e, Ev::Done(_))),
+            "run_scan leaves done to its caller"
+        );
+        // As the caller does, once nothing else can send.
+        sink.done(done.clone());
         let events = sink.events.lock().unwrap().clone();
         let dones: Vec<&ScanDone> =
             events.iter().filter_map(|e| if let Ev::Done(d) = e { Some(d) } else { None }).collect();
@@ -1430,6 +1650,193 @@ mod tests {
         );
         assert_eq!(r.done.reason, "completed");
         assert_eq!(r.done.found, r.done.checked);
+    }
+
+    // ---------- final-review fixes ----------
+
+    /// F3: real devices at 20 consecutive addresses are not a flood on serial.
+    #[tokio::test(start_paused = true)]
+    async fn serial_consecutive_devices_are_not_a_flood() {
+        let opener = Arc::new(FakeOpener::default().script(
+            "COM1",
+            9600,
+            "none",
+            Script::all(ProbeOutcome::Value),
+        ));
+        let mut scan = serial_scan(1..=20, &["COM1"]);
+        scan.probe = ProbeKind::Holding;
+        let r = run_serial(scan, opener).await;
+        assert_eq!(r.found().len(), 20);
+        assert!(r.found().iter().all(|f| f.category == Category::Found));
+        assert!(r.notices().is_empty(), "{:?}", r.notices());
+        assert_eq!(r.done.checked, 20);
+        assert_eq!(r.done.reason, "completed");
+    }
+
+    /// F3: 20 garbled addresses still skip the setting after 16.
+    #[tokio::test(start_paused = true)]
+    async fn serial_garbled_flood_skips_after_16() {
+        let opener = Arc::new(FakeOpener::default().script(
+            "COM1",
+            9600,
+            "none",
+            Script::all(ProbeOutcome::Garbled("CRC error".into())),
+        ));
+        let log = opener.calls.clone();
+        let mut scan = serial_scan(1..=20, &["COM1"]);
+        scan.probe = ProbeKind::Holding;
+        let r = run_serial(scan, opener).await;
+        assert_eq!(calls(&log).len(), 16);
+        assert_eq!(r.notices(), vec![serial_flood_notice("9600 8N1")]);
+    }
+
+    /// F3: units 1-20 all answer but the control unit 254 stays silent, so
+    /// these are real devices: the scan goes on and nothing is flagged.
+    #[tokio::test(start_paused = true)]
+    async fn tcp_flood_with_silent_control_continues() {
+        let connector = Arc::new(FakeConnector {
+            script: Script::all(ProbeOutcome::Value).with(254, 3, ProbeOutcome::NoReply),
+            delay: Duration::from_millis(5),
+            ..Default::default()
+        });
+        let log = connector.calls.clone();
+        let r = run_tcp(tcp_scan(1..=20, 4), connector).await;
+        assert_eq!(r.found().len(), 20);
+        assert!(r.found().iter().all(|f| f.unit_id != 254));
+        assert!(r.notices().is_empty(), "{:?}", r.notices());
+        assert_eq!(r.done.checked, 20, "the control probe is not counted");
+        assert_eq!(r.done.found, 20);
+        assert_eq!(r.done.reason, "completed");
+        assert_eq!(calls(&log).iter().filter(|c| c.1 == 254).count(), 1, "control probed once");
+    }
+
+    /// F3: the control unit answers too, so the device ignores the unit ID.
+    #[tokio::test(start_paused = true)]
+    async fn tcp_flood_with_answering_control_stops() {
+        let connector = Arc::new(FakeConnector {
+            script: Script::all(ProbeOutcome::Value),
+            delay: Duration::from_millis(5),
+            ..Default::default()
+        });
+        let log = connector.calls.clone();
+        let r = run_tcp(tcp_scan(1..=40, 4), connector).await;
+        assert_eq!(r.notices(), vec![TCP_FLOOD_NOTICE.to_string()]);
+        assert!(r.found().iter().all(|f| f.unit_id != 254), "control never reported");
+        assert_eq!(calls(&log).iter().filter(|c| c.1 == 254).count(), 1);
+        assert!(r.done.checked < 40, "stopped early: checked {}", r.done.checked);
+        assert_eq!(r.done.found, r.done.checked, "control not counted");
+        assert_eq!(r.done.reason, "completed");
+    }
+
+    #[test]
+    fn control_unit_choice() {
+        assert_eq!(control_unit(&(1..=20).collect::<Vec<u8>>()), Some(254));
+        assert_eq!(control_unit(&(200..=255).collect::<Vec<u8>>()), Some(199));
+        assert_eq!(control_unit(&(0..=254).collect::<Vec<u8>>()), Some(255));
+        assert_eq!(control_unit(&(0..=255).collect::<Vec<u8>>()), None);
+    }
+
+    /// F2: a gateway queues requests onto one bus, so units 2 and 3 only
+    /// answer when read alone. Once unit 5's 0x0B shows it is a gateway, the
+    /// pool drops to one worker and the units that went silent under load
+    /// are checked again.
+    #[tokio::test(start_paused = true)]
+    async fn tcp_gateway_shrinks_to_one_and_rechecks() {
+        let connector = Arc::new(FakeConnector {
+            script: Script::default()
+                .with(2, 3, ProbeOutcome::Value)
+                .with(3, 3, ProbeOutcome::Value)
+                .with(5, 3, ProbeOutcome::Exception(0x0B)),
+            contended: HashSet::from([2, 3]),
+            delay: Duration::from_millis(10),
+            ..Default::default()
+        });
+        let r = run_tcp(tcp_scan(1..=10, 4), connector.clone()).await;
+        let found: Vec<u8> = r
+            .found()
+            .iter()
+            .filter(|f| f.category == Category::Found)
+            .map(|f| f.unit_id)
+            .collect();
+        assert!(found.contains(&2) && found.contains(&3), "found {found:?}");
+        assert_eq!(
+            r.notices(),
+            vec!["Gateway detected; scanning 1 at a time".to_string()],
+            "one gateway notice, no fallback notice"
+        );
+        let last = r.progress().last().cloned().unwrap();
+        assert_eq!(last.checked, last.total);
+        assert_eq!(r.done.checked, last.total);
+        assert!(r.done.checked > 10, "re-checks are counted: {}", r.done.checked);
+        assert_eq!(r.done.reason, "completed");
+        assert_eq!(connector.live.load(Ordering::SeqCst), 0);
+    }
+
+    /// F7: a worker that panics mid-check must not leave the others waiting
+    /// for its unit forever.
+    #[tokio::test(start_paused = true)]
+    async fn tcp_worker_panic_does_not_hang_the_pool() {
+        let connector = Arc::new(FakeConnector {
+            panic_unit: Some(1),
+            delay: Duration::from_millis(5),
+            ..Default::default()
+        });
+        let r = tokio::time::timeout(Duration::from_secs(600), run_tcp(tcp_scan(1..=10, 2), connector))
+            .await
+            .expect("scan hung after a worker panic");
+        assert_eq!(r.done.reason, "failed");
+    }
+
+    /// F12: never more workers than units.
+    #[tokio::test(start_paused = true)]
+    async fn tcp_workers_clamped_to_unit_count() {
+        let connector = Arc::new(FakeConnector::default());
+        let r = run_tcp(tcp_scan(7..=7, 4), connector.clone()).await;
+        assert_eq!(connector.connects.load(Ordering::SeqCst), 1);
+        assert_eq!(r.done.checked, 1);
+        assert!(r.notices().is_empty());
+    }
+
+    /// F8: a port whose open times out is stuck; its other settings are
+    /// skipped. (A plain open error only skips the one setting, see
+    /// `open_failure_on_one_port_others_continue`.)
+    #[tokio::test(start_paused = true)]
+    async fn open_timeout_ends_that_port() {
+        let mut opener = FakeOpener::default();
+        opener.timeout_ports.insert("COM1".into());
+        let mut scan = serial_scan(1..=3, &["COM1"]);
+        scan.combos = vec![combo(9600, "none"), combo(19200, "none")];
+        let opener = Arc::new(opener);
+        let r = run_serial(scan, opener.clone()).await;
+        assert_eq!(opener.opens(), vec![("COM1".into(), 9600, "none".into())]);
+        assert_eq!(r.notices(), vec!["COM1: could not open at 9600 8N1: timed out opening COM1".to_string()]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn open_error_moves_to_the_next_setting() {
+        let mut opener = FakeOpener::default();
+        opener.fail_ports.insert("COM1".into());
+        let mut scan = serial_scan(1..=3, &["COM1"]);
+        scan.combos = vec![combo(9600, "none"), combo(19200, "none")];
+        let opener = Arc::new(opener);
+        let r = run_serial(scan, opener.clone()).await;
+        assert_eq!(opener.opens().len(), 2);
+        assert_eq!(r.notices().len(), 2);
+    }
+
+    /// F9: nothing could be opened at all, so the scan failed.
+    #[tokio::test(start_paused = true)]
+    async fn every_open_failing_is_failed() {
+        let mut opener = FakeOpener::default();
+        opener.fail_ports.insert("COM_A".into());
+        opener.fail_ports.insert("COM_B".into());
+        let mut scan = serial_scan(1..=3, &["COM_A", "COM_B"]);
+        scan.combos = vec![combo(9600, "none"), combo(19200, "none")];
+        let r = run_serial(scan, Arc::new(opener)).await;
+        assert_eq!(r.done.reason, "failed");
+        let err = r.done.error.clone().expect("error");
+        assert!(r.notices().contains(&err), "error {err:?} is the first open error");
+        assert_eq!(r.done.checked, 0);
     }
 
     #[tokio::test(start_paused = true)]
