@@ -2317,6 +2317,50 @@ pub fn simulator_update_device(app: tauri::AppHandle, name: String, device: SimD
     Ok(())
 }
 
+/// Move a device (its base address and every child register) by
+/// `new_base - old_base` in the DB, atomically: one transaction, so any
+/// failure leaves the base and every register where they were. Register
+/// updates are ordered so `UNIQUE(unit_id, function_code, address)` never
+/// collides mid-way (highest address first when moving up, lowest first when
+/// moving down). Returns the updated device plus the children before and
+/// after the move (for the live banks).
+pub fn rebase_device_in_db(
+    conn: &mut Connection,
+    id: i64,
+    new_base_address: i64,
+) -> Result<(SimDevice, Vec<SimRegister>, Vec<SimRegister>), String> {
+    let mut device = db_list_devices(conn)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .find(|d| d.id == id)
+        .ok_or_else(|| format!("device {} not found", id))?;
+
+    let children = db_list_registers_for_device(conn, id).map_err(|e| e.to_string())?;
+    let shifted = rebase_children(&children, device.base_address, new_base_address)?;
+
+    // The shifted registers must not collide with anything outside this
+    // device (other devices' registers or unowned/manual registers).
+    let others = db_list_registers_excluding_device(conn, id).map_err(|e| e.to_string())?;
+    validate_no_overlap(&others, &shifted)?;
+
+    let delta = new_base_address - device.base_address;
+    let mut ordered: Vec<&SimRegister> = shifted.iter().collect();
+    if delta > 0 {
+        ordered.sort_by_key(|r| std::cmp::Reverse(r.address));
+    } else {
+        ordered.sort_by_key(|r| r.address);
+    }
+
+    device.base_address = new_base_address;
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    db_update_device(&tx, &device).map_err(|e| e.to_string())?;
+    for reg in ordered {
+        db_update_register(&tx, reg).map_err(|e| e.to_string())?;
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok((device, children, shifted))
+}
+
 #[tauri::command]
 pub fn simulator_rebase_device(
     app: tauri::AppHandle,
@@ -2329,27 +2373,8 @@ pub fn simulator_rebase_device(
     if !(0..=65535).contains(&new_base_address) {
         return Err(format!("base address {} out of range (0-65535)", new_base_address));
     }
-    let conn = open_workspace_db(&app, &ws)?;
-
-    let mut device = db_list_devices(&conn)
-        .map_err(|e| e.to_string())?
-        .into_iter()
-        .find(|d| d.id == id)
-        .ok_or_else(|| format!("device {} not found", id))?;
-
-    let children = db_list_registers_for_device(&conn, id).map_err(|e| e.to_string())?;
-    let shifted = rebase_children(&children, device.base_address, new_base_address)?;
-
-    // The shifted registers must not collide with anything outside this
-    // device (other devices' registers or unowned/manual registers).
-    let others = db_list_registers_excluding_device(&conn, id).map_err(|e| e.to_string())?;
-    validate_no_overlap(&others, &shifted)?;
-
-    device.base_address = new_base_address;
-    db_update_device(&conn, &device).map_err(|e| e.to_string())?;
-    for reg in &shifted {
-        db_update_register(&conn, reg).map_err(|e| e.to_string())?;
-    }
+    let mut conn = open_workspace_db(&app, &ws)?;
+    let (device, children, shifted) = rebase_device_in_db(&mut conn, id, new_base_address)?;
 
     // Move the registers in the live banks too: clear all old addresses first,
     // then place the shifted ones (clear-before-place is safe when spans overlap).
@@ -2851,6 +2876,9 @@ fn validate_config(cfg: &SimConfig) -> Result<(), String> {
     }
     if cfg.host != "0.0.0.0" && cfg.host != "127.0.0.1" {
         return Err(format!("host must be 0.0.0.0 or 127.0.0.1, got {}", cfg.host));
+    }
+    if !(10..=60000).contains(&cfg.tick_ms) {
+        return Err(format!("tick interval {} ms out of range (10-60000)", cfg.tick_ms));
     }
     Ok(())
 }
@@ -3359,17 +3387,22 @@ fn build_profile(conn: &Connection) -> rusqlite::Result<SimProfile> {
     })
 }
 
-/// Replace the DB's simulator setup with `profile`: validate every register,
-/// clear the existing config/devices/registers/rules, then repopulate with
-/// fresh IDs, remapping each register's `device_instance_id` to the device's
-/// new ID so device grouping survives the round-trip.
-fn apply_profile(conn: &Connection, profile: &SimProfile) -> Result<(), String> {
+/// Replace the DB's simulator setup with `profile`: validate the config and
+/// every register, clear the existing config/devices/registers/rules, then
+/// repopulate with fresh IDs, remapping each register's `device_instance_id`
+/// to the device's new ID so device grouping survives the round-trip. The
+/// clear + repopulate is one transaction: any error leaves the workspace
+/// exactly as it was.
+fn apply_profile(conn: &mut Connection, profile: &SimProfile) -> Result<(), String> {
+    validate_config(&profile.config)?;
     for reg in &profile.registers {
         validate_register(reg)?;
     }
     // Reject a profile whose registers overlap each other (multi-word spans
     // included) before we destroy the current setup — same guard add/update use.
     validate_no_overlap(&[], &profile.registers)?;
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    let conn: &Connection = &tx;
     for r in db_list_registers(conn).map_err(|e| e.to_string())? {
         db_delete_register(conn, r.id).map_err(|e| e.to_string())?;
     }
@@ -3409,7 +3442,7 @@ fn apply_profile(conn: &Connection, profile: &SimProfile) -> Result<(), String> 
         nrule.id = 0;
         db_insert_rule(conn, &nrule).map_err(|e| e.to_string())?;
     }
-    Ok(())
+    tx.commit().map_err(|e| e.to_string())
 }
 
 /// Export the whole workspace simulator setup to a JSON file. Opens a native
@@ -3447,7 +3480,7 @@ pub async fn simulator_import_profile(
     name: String,
 ) -> Result<bool, String> {
     let ws = validate_workspace_name(&name)?;
-    {
+    let refuse_if_running = || -> Result<(), String> {
         let map = state.0.lock().unwrap();
         if map.get(&ws).map(|e| e.is_running()).unwrap_or(false) {
             crate::logs::log_workspace_event(
@@ -3456,7 +3489,9 @@ pub async fn simulator_import_profile(
             );
             return Err("Stop the simulator before importing a profile.".into());
         }
-    }
+        Ok(())
+    };
+    refuse_if_running()?;
     let Some(file) = app
         .dialog()
         .file()
@@ -3469,8 +3504,11 @@ pub async fn simulator_import_profile(
     let json = std::fs::read_to_string(&path).map_err(|e| format!("failed to read file: {e}"))?;
     let profile: SimProfile =
         serde_json::from_str(&json).map_err(|e| format!("invalid profile JSON: {e}"))?;
-    let conn = open_workspace_db(&app, &ws)?;
-    apply_profile(&conn, &profile)?;
+    // The dialog can stay open for a long time: the simulator may have been
+    // started meanwhile, so check again right before touching the DB.
+    refuse_if_running()?;
+    let mut conn = open_workspace_db(&app, &ws)?;
+    apply_profile(&mut conn, &profile)?;
     crate::logs::log_workspace_event(
         &app,
         &ws,
@@ -3869,9 +3907,9 @@ mod tests {
         let profile = build_profile(&c).unwrap();
         let json = serde_json::to_string(&profile).unwrap();
 
-        let c2 = mem_db();
+        let mut c2 = mem_db();
         let parsed: SimProfile = serde_json::from_str(&json).unwrap();
-        apply_profile(&c2, &parsed).unwrap();
+        apply_profile(&mut c2, &parsed).unwrap();
 
         let devs = db_list_devices(&c2).unwrap();
         assert_eq!(devs.len(), 1);
@@ -3922,7 +3960,7 @@ mod tests {
 
     #[test]
     fn apply_profile_rejects_invalid_register() {
-        let c = mem_db();
+        let mut c = mem_db();
         let bad = SimProfile {
             version: 1,
             config: db_get_config(&c).unwrap(),
@@ -3935,7 +3973,7 @@ mod tests {
             }],
             rules: Vec::new(),
         };
-        assert!(apply_profile(&c, &bad).is_err());
+        assert!(apply_profile(&mut c, &bad).is_err());
     }
 
     #[test]
@@ -5239,5 +5277,111 @@ mod tests {
         assert_eq!(status, Some("ok"));
         assert_eq!(slave_table_kind("rtu"), "serial");
         assert_eq!(slave_table_kind("tcp"), "tcp");
+    }
+
+    /// A device at `base` owning u16 input registers at `addrs` (linked the
+    /// way the device-add path links them). Returns the device id.
+    fn device_with_registers(c: &Connection, base: i64, addrs: &[i64]) -> i64 {
+        let dev = db_insert_device(c, &SimDevice {
+            id: 0, template_key: "temp".into(), name: "D".into(), unit_id: 1, base_address: base, sort_order: 0,
+        }).unwrap();
+        for &a in addrs {
+            let rid = db_insert_register(c, &SimRegister {
+                id: 0, unit_id: 1, function_code: 4, address: a, alias: format!("r{a}"),
+                data_type: "u16".into(), hold_value: 0, value_source: "hold".into(),
+                byte_order: "ABCD".into(), source_params: "{}".into(), interval_ms: 1000, sort_order: 0,
+                device_instance_id: None, unit: None, display_format: None,
+            }).unwrap();
+            c.execute("UPDATE sim_registers SET device_instance_id = ?1 WHERE id = ?2", [dev, rid]).unwrap();
+        }
+        dev
+    }
+
+    fn addresses(c: &Connection) -> Vec<i64> {
+        db_list_registers(c).unwrap().into_iter().map(|r| r.address).collect()
+    }
+
+    #[test]
+    fn device_rebase_by_one_does_not_collide_mid_way() {
+        let mut c = mem_db();
+        let dev = device_with_registers(&c, 100, &[100, 101]);
+        rebase_device_in_db(&mut c, dev, 101).unwrap();
+        assert_eq!(addresses(&c), vec![101, 102]);
+        rebase_device_in_db(&mut c, dev, 99).unwrap();
+        assert_eq!(addresses(&c), vec![99, 100]);
+        assert_eq!(db_list_devices(&c).unwrap()[0].base_address, 99);
+    }
+
+    #[test]
+    fn failed_device_rebase_leaves_base_and_registers_unchanged() {
+        let mut c = mem_db();
+        let dev = device_with_registers(&c, 100, &[100, 101]);
+        // Make the SECOND register move fail (after the device base and the
+        // first register were already written) to prove it's all-or-nothing.
+        c.execute_batch(
+            "CREATE TRIGGER fail_move BEFORE UPDATE OF address ON sim_registers
+             WHEN NEW.address = 110 BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+        ).unwrap();
+        assert!(rebase_device_in_db(&mut c, dev, 110).is_err());
+        assert_eq!(db_list_devices(&c).unwrap()[0].base_address, 100, "device base rolled back");
+        assert_eq!(addresses(&c), vec![100, 101], "registers rolled back");
+    }
+
+    fn hold_reg(addr: i64) -> SimRegister {
+        SimRegister {
+            id: 0, unit_id: 1, function_code: 3, address: addr, alias: "".into(), data_type: "u16".into(),
+            hold_value: 0, sort_order: 0, device_instance_id: None, value_source: "hold".into(),
+            byte_order: "ABCD".into(), source_params: "{}".into(), interval_ms: 1000, unit: None, display_format: None,
+        }
+    }
+
+    #[test]
+    fn failed_profile_import_leaves_workspace_unchanged() {
+        let mut c = mem_db();
+        db_insert_register(&c, &hold_reg(5)).unwrap();
+        db_set_config(&c, &SimConfig { enabled: false, host: "0.0.0.0".into(), port: 1502, tick_ms: 100 }).unwrap();
+        // Fail late in the import (inserting the rule, after the clear and
+        // the register inserts).
+        c.execute_batch(
+            "CREATE TRIGGER fail_rule BEFORE INSERT ON sim_rules BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+        ).unwrap();
+        let profile = SimProfile {
+            version: 1,
+            config: SimConfig { enabled: false, host: "0.0.0.0".into(), port: 2502, tick_ms: 100 },
+            devices: Vec::new(),
+            registers: vec![hold_reg(7)],
+            rules: vec![SimRule {
+                id: 0, name: "r".into(), enabled: true,
+                trigger: "{\"type\":\"interval\",\"ms\":1000}".into(), actions: "[]".into(), sort_order: 0,
+            }],
+        };
+        assert!(apply_profile(&mut c, &profile).is_err());
+        assert_eq!(addresses(&c), vec![5], "registers untouched");
+        assert_eq!(db_get_config(&c).unwrap().port, 1502, "config untouched");
+    }
+
+    #[test]
+    fn profile_import_validates_config() {
+        let mut c = mem_db();
+        db_insert_register(&c, &hold_reg(5)).unwrap();
+        for config in [
+            SimConfig { enabled: false, host: "0.0.0.0".into(), port: 0, tick_ms: 100 },
+            SimConfig { enabled: false, host: "10.0.0.1".into(), port: 502, tick_ms: 100 },
+            SimConfig { enabled: false, host: "0.0.0.0".into(), port: 502, tick_ms: 5 },
+        ] {
+            let profile = SimProfile { version: 1, config, devices: Vec::new(), registers: Vec::new(), rules: Vec::new() };
+            assert!(apply_profile(&mut c, &profile).is_err());
+        }
+        assert_eq!(addresses(&c), vec![5], "rejected profile changed nothing");
+    }
+
+    #[test]
+    fn config_tick_ms_is_range_checked() {
+        let cfg = |tick_ms| SimConfig { enabled: false, host: "0.0.0.0".into(), port: 502, tick_ms };
+        assert!(validate_config(&cfg(9)).is_err());
+        assert!(validate_config(&cfg(60001)).is_err());
+        assert!(validate_config(&cfg(0)).is_err());
+        assert!(validate_config(&cfg(10)).is_ok());
+        assert!(validate_config(&cfg(60000)).is_ok());
     }
 }
