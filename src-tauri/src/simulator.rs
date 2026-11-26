@@ -560,6 +560,23 @@ impl SimService {
         // to respond) so scanners can tell absent units from present ones; a
         // missing register inside an existing unit still answers IllegalDataAddress.
         let bank = banks.get_mut(&unit).ok_or(ExceptionCode::GatewayTargetDevice)?;
+        // Protocol limits (Modbus Application Protocol v1.1b3): an out-of-range
+        // quantity is IllegalDataValue; a span running past the last address
+        // is IllegalDataAddress. Without this a 200-register read encodes a
+        // corrupt frame and a zero-quantity read "succeeds".
+        let (addr, qty, max_qty) = match &req {
+            Request::ReadCoils(a, c) | Request::ReadDiscreteInputs(a, c) => (*a, *c as usize, 2000),
+            Request::ReadHoldingRegisters(a, c) | Request::ReadInputRegisters(a, c) => (*a, *c as usize, 125),
+            Request::WriteMultipleCoils(a, v) => (*a, v.len(), 1968),
+            Request::WriteMultipleRegisters(a, v) => (*a, v.len(), 123),
+            _ => (0, 1, 1),
+        };
+        if qty == 0 || qty > max_qty {
+            return Err(ExceptionCode::IllegalDataValue);
+        }
+        if addr as usize + qty > 65536 {
+            return Err(ExceptionCode::IllegalDataAddress);
+        }
         match req {
             Request::ReadCoils(a, c) => Ok(Response::ReadCoils(bank.read_coils(a, c)?)),
             Request::ReadDiscreteInputs(a, c) => {
@@ -581,14 +598,21 @@ impl SimService {
                 self.push_write(unit, 3, a);
                 Ok(Response::WriteSingleRegister(a, v))
             }
+            // Multi-writes are all-or-nothing (see `write_bits`/`write_words`)
+            // and report every written address, so an `onWrite` rule on any
+            // address inside the span sees the write.
             Request::WriteMultipleCoils(a, vals) => {
                 bank.write_multiple_coils(a, &vals)?;
-                self.push_write(unit, 1, a);
+                for i in 0..vals.len() as u16 {
+                    self.push_write(unit, 1, a + i);
+                }
                 Ok(Response::WriteMultipleCoils(a, vals.len() as u16))
             }
             Request::WriteMultipleRegisters(a, vals) => {
                 bank.write_multiple_registers(a, &vals)?;
-                self.push_write(unit, 3, a);
+                for i in 0..vals.len() as u16 {
+                    self.push_write(unit, 3, a + i);
+                }
                 Ok(Response::WriteMultipleRegisters(a, vals.len() as u16))
             }
             _ => Err(ExceptionCode::IllegalFunction),
@@ -1049,26 +1073,28 @@ fn read_words(map: &HashMap<u16, u16>, addr: u16, cnt: u16) -> Result<Vec<u16>, 
     Ok(out)
 }
 
-fn write_bits(map: &mut HashMap<u16, bool>, addr: u16, vals: &[bool]) -> Result<(), ExceptionCode> {
-    for (i, &v) in vals.iter().enumerate() {
-        let a = addr.checked_add(i as u16).ok_or(ExceptionCode::IllegalDataAddress)?;
-        match map.get_mut(&a) {
-            Some(slot) => *slot = v,
-            None => return Err(ExceptionCode::IllegalDataAddress),
+/// Write `vals` at consecutive addresses from `addr`, all-or-nothing: every
+/// target address is checked first, so a span with one unconfigured address
+/// fails with IllegalDataAddress and changes nothing.
+fn write_span<T: Copy>(map: &mut HashMap<u16, T>, addr: u16, vals: &[T]) -> Result<(), ExceptionCode> {
+    for i in 0..vals.len() {
+        let a = u16::try_from(addr as usize + i).map_err(|_| ExceptionCode::IllegalDataAddress)?;
+        if !map.contains_key(&a) {
+            return Err(ExceptionCode::IllegalDataAddress);
         }
+    }
+    for (i, &v) in vals.iter().enumerate() {
+        map.insert(addr + i as u16, v);
     }
     Ok(())
 }
 
+fn write_bits(map: &mut HashMap<u16, bool>, addr: u16, vals: &[bool]) -> Result<(), ExceptionCode> {
+    write_span(map, addr, vals)
+}
+
 fn write_words(map: &mut HashMap<u16, u16>, addr: u16, vals: &[u16]) -> Result<(), ExceptionCode> {
-    for (i, &v) in vals.iter().enumerate() {
-        let a = addr.checked_add(i as u16).ok_or(ExceptionCode::IllegalDataAddress)?;
-        match map.get_mut(&a) {
-            Some(slot) => *slot = v,
-            None => return Err(ExceptionCode::IllegalDataAddress),
-        }
-    }
-    Ok(())
+    write_span(map, addr, vals)
 }
 
 impl SimBanks {
@@ -3365,6 +3391,92 @@ mod tests {
             service.handle(1, Request::ReadHoldingRegisters(50, 1)),
             Err(ExceptionCode::IllegalDataAddress)
         );
+    }
+
+    fn service_with(map: HashMap<u8, SimBanks>) -> SimService {
+        SimService {
+            banks: Arc::new(RwLock::new(map)),
+            clients: Arc::new(AtomicUsize::new(0)),
+            writes: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    #[test]
+    fn request_quantity_is_validated() {
+        // Unit 1 with holding/input/coils/discretes 0..=199 so a too-large
+        // request would otherwise "succeed" with an oversized frame.
+        let mut b = SimBanks::default();
+        for a in 0..200u16 {
+            b.holding.insert(a, 0);
+            b.input.insert(a, 0);
+            b.coils.insert(a, false);
+            b.discrete_inputs.insert(a, false);
+        }
+        b.holding.insert(65535, 0);
+        b.coils.insert(65535, false);
+        let mut map = HashMap::new();
+        map.insert(1u8, b);
+        let s = service_with(map);
+        let bad_value = Err(ExceptionCode::IllegalDataValue);
+        // FC3/FC4: 1..=125
+        assert_eq!(s.handle(1, Request::ReadHoldingRegisters(0, 0)), bad_value);
+        assert_eq!(s.handle(1, Request::ReadHoldingRegisters(0, 126)), bad_value);
+        assert_eq!(s.handle(1, Request::ReadInputRegisters(0, 0)), bad_value);
+        assert_eq!(s.handle(1, Request::ReadInputRegisters(0, 200)), bad_value);
+        assert!(s.handle(1, Request::ReadHoldingRegisters(0, 125)).is_ok());
+        // FC1/FC2: 1..=2000
+        assert_eq!(s.handle(1, Request::ReadCoils(0, 0)), bad_value);
+        assert_eq!(s.handle(1, Request::ReadCoils(0, 2001)), bad_value);
+        assert_eq!(s.handle(1, Request::ReadDiscreteInputs(0, 0)), bad_value);
+        assert_eq!(s.handle(1, Request::ReadDiscreteInputs(0, 2001)), bad_value);
+        // FC15: 1..=1968, FC16: 1..=123
+        assert_eq!(s.handle(1, Request::WriteMultipleCoils(0, vec![].into())), bad_value);
+        assert_eq!(s.handle(1, Request::WriteMultipleCoils(0, vec![false; 1969].into())), bad_value);
+        assert_eq!(s.handle(1, Request::WriteMultipleRegisters(0, vec![].into())), bad_value);
+        assert_eq!(s.handle(1, Request::WriteMultipleRegisters(0, vec![0; 124].into())), bad_value);
+        assert!(s.handle(1, Request::WriteMultipleRegisters(0, vec![0; 123].into())).is_ok());
+        // address + quantity past the 65536-address space → IllegalDataAddress
+        let bad_addr = Err(ExceptionCode::IllegalDataAddress);
+        assert_eq!(s.handle(1, Request::ReadHoldingRegisters(65535, 2)), bad_addr);
+        assert_eq!(s.handle(1, Request::ReadCoils(65535, 2)), bad_addr);
+        assert_eq!(s.handle(1, Request::WriteMultipleRegisters(65535, vec![1, 2].into())), bad_addr);
+        assert!(s.handle(1, Request::ReadHoldingRegisters(65535, 1)).is_ok());
+    }
+
+    #[test]
+    fn multi_writes_are_atomic() {
+        // holding 0,1 exist, 2 does not: a 3-register write must fail and
+        // leave 0 and 1 untouched (no partial write).
+        let mut map = HashMap::new();
+        map.insert(1u8, banks_with(&[(0, 7), (1, 8)], &[(0, false), (1, false)]));
+        let s = service_with(map);
+        assert_eq!(
+            s.handle(1, Request::WriteMultipleRegisters(0, vec![1, 2, 3].into())),
+            Err(ExceptionCode::IllegalDataAddress)
+        );
+        assert_eq!(
+            s.handle(1, Request::WriteMultipleCoils(0, vec![true, true, true].into())),
+            Err(ExceptionCode::IllegalDataAddress)
+        );
+        let g = s.banks.read().unwrap();
+        let b = g.get(&1).unwrap();
+        assert_eq!(b.holding.get(&0), Some(&7));
+        assert_eq!(b.holding.get(&1), Some(&8));
+        assert_eq!(b.coils.get(&0), Some(&false));
+        assert_eq!(b.coils.get(&1), Some(&false));
+        drop(g);
+        assert!(s.writes.lock().unwrap().is_empty(), "a rejected write records no write event");
+    }
+
+    #[test]
+    fn multi_writes_record_every_written_address() {
+        let mut map = HashMap::new();
+        map.insert(1u8, banks_with(&[(10, 0), (11, 0), (12, 0)], &[(0, false), (1, false)]));
+        let s = service_with(map);
+        s.handle(1, Request::WriteMultipleRegisters(10, vec![1, 2, 3].into())).unwrap();
+        s.handle(1, Request::WriteMultipleCoils(0, vec![true, true].into())).unwrap();
+        let w = s.writes.lock().unwrap().clone();
+        assert_eq!(w, vec![(1, 3, 10), (1, 3, 11), (1, 3, 12), (1, 1, 0), (1, 1, 1)]);
     }
 
     #[test]
