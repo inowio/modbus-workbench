@@ -49,6 +49,9 @@ All notable changes to this project are tracked here following [Keep a Changelog
   overlap; the number of labels now follows the tile width.
 - **Dark-mode dropdowns** — unavailable (greyed-out) options, such as
   "Add a variable in the Math tab first", are readable in dark mode.
+- **Analyzer tiles appear instantly** — switching tabs and focus-view cycling no
+  longer slide every tile into place; tiles only animate while editing the
+  layout, and trend charts update in place instead of being rebuilt.
 
 ### Changed
 - **Workspace upgrade** — when 0.6.0 starts, every workspace is upgraded as the

@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import AnalyzerTilesCard from "./AnalyzerTilesCard";
 
@@ -140,6 +140,19 @@ describe("AnalyzerTilesCard Escape and focus view", () => {
     expect(lastGridProps.isDraggable).toBe(false);
     expect(lastGridProps.isResizable).toBe(false);
     expect(screen.queryByText(/Drag tiles to move/)).not.toBeInTheDocument();
+  });
+
+  it("tiles animate only while editing the layout (instant placement when viewing and in focus view)", () => {
+    renderCard({ layoutEditMode: false });
+    expect(lastGridProps.className).toContain("analyzer-grid-static");
+    cleanup();
+
+    renderCard({ layoutEditMode: true });
+    expect(lastGridProps.className).not.toContain("analyzer-grid-static");
+    cleanup();
+
+    renderCard({ focusMode: true, layoutEditMode: true });
+    expect(lastGridProps.className).toContain("analyzer-grid-static");
   });
 
   it("in focus view a tile's information opens read-only; Escape closes it first (Review Focus 4)", () => {

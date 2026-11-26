@@ -223,20 +223,18 @@ export default function AnalyzerTrendTile(props: {
     }, 250);
   }, [props.points]);
 
+  // Rebuild the chart from scratch only when its structure changes (trend window, theme, title,
+  // binary/step mode); every other update — new points, the clock moving the axis and zoom window —
+  // is merged into the existing chart, which is far cheaper than recreating it several times a second.
+  const isBinaryNow = (option.series as { step?: unknown }[] | undefined)?.[0]?.step != null;
+  const structureKey = `${props.windowMs ?? "all"}|${isDark ? "dark" : "light"}|${props.title}|${isBinaryNow ? "step" : "line"}`;
+  // Compared with the last *committed* render (updated in an effect), so it stays correct when
+  // React renders twice before committing.
+  const committedStructureKeyRef = useRef<string | null>(null);
+  const rebuild = committedStructureKeyRef.current !== null && committedStructureKeyRef.current !== structureKey;
   useEffect(() => {
-    const inst = chartRef.current?.getEchartsInstance?.();
-    if (!inst?.dispatchAction) return;
-    if (props.windowMs == null) return;
-
-    const maxTs = props.nowTsMs;
-    const minTs = maxTs - props.windowMs;
-    inst.dispatchAction({
-      type: "dataZoom",
-      dataZoomIndex: 0,
-      startValue: minTs,
-      endValue: maxTs,
-    });
-  }, [props.nowTsMs, props.windowMs]);
+    committedStructureKeyRef.current = structureKey;
+  });
 
   return (
     <div ref={hostRef} className="h-full w-full" style={{ width: "100%", height: "100%" }}>
@@ -245,7 +243,7 @@ export default function AnalyzerTrendTile(props: {
         echarts={echarts}
         option={option}
         lazyUpdate
-        notMerge
+        notMerge={rebuild}
         opts={{ renderer: "canvas" }}
         onChartReady={() => {
           scheduleResize(80);

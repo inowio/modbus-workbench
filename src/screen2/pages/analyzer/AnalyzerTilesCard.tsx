@@ -216,11 +216,14 @@ export default function AnalyzerTilesCard(props: Props) {
       ) : (
         <div
           ref={props.gridHostRef}
-          className={`mt-3 transition-all duration-200 ${props.gridReady ? "opacity-100" : "pointer-events-none opacity-0"}`}
+          className={`mt-3 ${props.gridReady ? "" : "pointer-events-none opacity-0"}`}
         >
           {props.gridReady ? (
             <ResponsiveAny
-              className="layout"
+              // Tiles only animate while the layout is being edited (drag/resize feedback). Viewing,
+              // switching tabs and focus-view cycling place them instantly: no 200 ms slide of every
+              // tile and of the grid height, and no chart resizes on every animation frame.
+              className={editingLayout ? "layout" : "layout analyzer-grid-static"}
               width={props.effectiveGridWidth}
               layouts={effectiveLayouts as any}
               breakpoints={{ desktop: 768, mobile: 0 }}

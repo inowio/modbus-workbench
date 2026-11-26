@@ -105,6 +105,14 @@
   }
 }
 
+/* Analyzer grid outside Edit layout: place tiles instantly. react-grid-layout's stylesheet animates
+   every tile (left/top/width/height or transform) and the grid height over 200 ms, which made each
+   tab switch and focus-view cycle visibly "settle" and resized every chart on each frame. */
+.react-grid-layout.analyzer-grid-static,
+.react-grid-layout.analyzer-grid-static > .react-grid-item {
+  transition: none !important;
+}
+
 .react-resizable-handle {
   opacity: 0.9;
   z-index: 50;

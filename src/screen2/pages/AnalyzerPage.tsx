@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useOutletContext } from "react-router-dom";
 import type { Screen2OutletContext } from "../Screen2Layout";
 import ConfirmDialog from "../../components/ConfirmDialog";
@@ -448,7 +448,10 @@ export default function AnalyzerPage() {
 
   // The grid host only exists while the selected tab has tiles, so re-attach when that changes
   // (and when focus view hides or shows the chrome around it).
-  useEffect(() => {
+  // Measured before paint (layout effect), so tiles are placed at their final size on the first
+  // frame instead of rendering at a guessed width and then moving. Later resizes are coalesced
+  // to one measurement per animation frame.
+  useLayoutEffect(() => {
     const el = gridHostRef.current;
     if (!el) return;
 
@@ -461,24 +464,18 @@ export default function AnalyzerPage() {
       setGridWidth(next);
     };
 
-    const schedule = () => {
-      if (gridWidthMeasureTimerRef.current != null) {
-        window.clearTimeout(gridWidthMeasureTimerRef.current);
-      }
-      gridWidthMeasureTimerRef.current = window.setTimeout(measureAndSet, 120);
-    };
-
-    schedule();
+    measureAndSet();
 
     const ro = new ResizeObserver(() => {
-      schedule();
+      if (gridWidthMeasureTimerRef.current != null) return;
+      gridWidthMeasureTimerRef.current = window.requestAnimationFrame(measureAndSet);
     });
 
     ro.observe(el);
     return () => {
       ro.disconnect();
       if (gridWidthMeasureTimerRef.current != null) {
-        window.clearTimeout(gridWidthMeasureTimerRef.current);
+        window.cancelAnimationFrame(gridWidthMeasureTimerRef.current);
         gridWidthMeasureTimerRef.current = null;
       }
     };
