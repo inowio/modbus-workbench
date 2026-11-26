@@ -48,6 +48,36 @@ function seedSource(register: PageRegister): SourceState {
   };
 }
 
+/** Serialised source params for a value source; "hold" carries none. Used for both saving and dirty comparison. */
+function buildParamsJson(valueSource: string, s: SourceState): string {
+  return JSON.stringify(
+    valueSource === "generator" || valueSource === "device"
+      ? buildPeriodicParams(valueSource, { kind: s.kind, preset: s.preset, min: s.min, max: s.max, periodText: s.periodText })
+      : valueSource === "route"
+        ? {
+            slaveUnitId: s.sourceUnitId,
+            connectionKind: s.sourceConnectionKind,
+            functionCode: s.sourceFunctionCode,
+            address: s.sourceAddress,
+            scale: s.sourceScale,
+            offset: s.sourceOffset,
+            // Only persist a source order when it differs from ABCD/blank so the
+            // backend keeps its verbatim fast path by default.
+            ...(s.sourceByteOrder ? { srcByteOrder: s.sourceByteOrder } : {}),
+          }
+        : {},
+  );
+}
+
+/** Whole-number text in [min,max]; empty counts as 0. Returns null when invalid. */
+function parseIntText(text: string, min: number, max: number): number | null {
+  const t = text.trim();
+  if (t === "") return min <= 0 ? 0 : null;
+  if (!/^\d+$/.test(t)) return null;
+  const n = Number(t);
+  return n >= min && n <= max ? n : null;
+}
+
 /** True when two register records differ in any field other than sourceParams (null/""/undefined count as equal). */
 function registerFieldsDiffer(a: PageRegister, b: PageRegister): boolean {
   const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
@@ -123,6 +153,10 @@ export default function RegisterInspector(props: RegisterInspectorProps) {
   const [sourceOffset, setSourceOffset] = useState(0);
   const [sourceByteOrder, setSourceByteOrder] = useState("");
   const [addrText, setAddrText] = useState(() => (register ? fmtAddr(register.address, addrFmt) : ""));
+  const [unitText, setUnitText] = useState(() => (register ? String(register.unitId) : ""));
+  const [intervalText, setIntervalText] = useState(() => (register ? String(register.intervalMs ?? 0) : ""));
+  // Whether the user typed a period themselves (so switching source keeps it).
+  const [periodTouched, setPeriodTouched] = useState(false);
 
   useEffect(() => {
     if (!register) {
@@ -145,6 +179,9 @@ export default function RegisterInspector(props: RegisterInspectorProps) {
     setSourceOffset(seed.sourceOffset);
     setSourceByteOrder(seed.sourceByteOrder);
     setAddrText(fmtAddr(register.address, addrFmt));
+    setUnitText(String(register.unitId));
+    setIntervalText(String(register.intervalMs ?? 0));
+    setPeriodTouched(false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [register?.id]);
 
@@ -154,7 +191,8 @@ export default function RegisterInspector(props: RegisterInspectorProps) {
   };
   const dirty =
     !!register && !!reg && reg.id === register.id &&
-    (registerFieldsDiffer(reg, register) || JSON.stringify(srcNow) !== JSON.stringify(seedSource(register)));
+    (registerFieldsDiffer(reg, register) ||
+      buildParamsJson(reg.valueSource, srcNow) !== buildParamsJson(register.valueSource, seedSource(register)));
 
   // Tell the page whether there is anything to lose (and clear it on unmount).
   const onDirtyRef = useRef(onDirtyChange);
@@ -188,7 +226,13 @@ export default function RegisterInspector(props: RegisterInspectorProps) {
     isNew && parsedAddr !== null
       ? addressConflict(registers, reg.unitId, reg.functionCode, parsedAddr, reg.dataType, addrFmt)
       : null;
-  const blocked = addrError !== null || conflict !== null;
+  const unitError = isNew && parseIntText(unitText, 0, 255) === null ? "Enter a unit ID from 0 to 255." : null;
+  // The update interval only matters for generated / routed values.
+  const intervalError =
+    reg.valueSource !== "hold" && parseIntText(intervalText, 0, 2147483647) === null
+      ? "Enter the update interval as a whole number of milliseconds (0 = default)."
+      : null;
+  const blocked = addrError !== null || unitError !== null || conflict !== null || intervalError !== null;
 
   const set = (patch: Partial<PageRegister>) => setReg((r) => (r ? { ...r, ...patch } : r));
   const device = devices.find((d) => d.id === reg.deviceInstanceId);
@@ -216,6 +260,9 @@ export default function RegisterInspector(props: RegisterInspectorProps) {
       if (!MULTI_WORD_TYPES.includes(dataType)) patch.byteOrder = "ABCD";
       set(patch);
     } else {
+      // A device preset keeps its own default period unless the user typed one;
+      // don't carry over the 1000 ms shown for hold/generator registers.
+      if (valueSource === "device" && !periodTouched) setPeriodText("");
       set({ valueSource });
     }
   };
@@ -227,28 +274,11 @@ export default function RegisterInspector(props: RegisterInspectorProps) {
     set(patch);
   };
 
-  const buildSourceParams = () =>
-    JSON.stringify(
-      reg.valueSource === "generator" || reg.valueSource === "device"
-        ? buildPeriodicParams(reg.valueSource, { kind, preset, min, max, periodText })
-        : reg.valueSource === "route"
-        ? {
-            slaveUnitId: sourceUnitId,
-            connectionKind: sourceConnectionKind,
-            functionCode: sourceFunctionCode,
-            address: sourceAddress,
-            scale: sourceScale,
-            offset: sourceOffset,
-            // Only persist a source order when it differs from ABCD/blank so the
-            // backend keeps its verbatim fast path by default.
-            ...(sourceByteOrder ? { srcByteOrder: sourceByteOrder } : {}),
-          }
-        : {}
-    );
+  const buildSourceParams = () => buildParamsJson(reg.valueSource, srcNow);
 
   const handleSave = () => {
-    const sourceParams = buildSourceParams();
-    onSave({ ...reg, sourceParams });
+    if (intervalError) return;
+    onSave({ ...reg, sourceParams: buildSourceParams() });
   };
 
   const handleCreate = () => {
@@ -318,12 +348,16 @@ export default function RegisterInspector(props: RegisterInspectorProps) {
                   Unit ID
                   <input
                     aria-label="Unit ID"
-                    type="number"
-                    min={0}
-                    max={255}
-                    value={reg.unitId}
-                    onChange={(e) => set({ unitId: Number(e.target.value) })}
-                    className={INPUT_CLASS}
+                    type="text"
+                    inputMode="numeric"
+                    value={unitText}
+                    aria-invalid={unitError ? "true" : undefined}
+                    onChange={(e) => {
+                      setUnitText(e.target.value);
+                      const n = parseIntText(e.target.value, 0, 255);
+                      if (n !== null) set({ unitId: n });
+                    }}
+                    className={`${INPUT_CLASS} ${unitError ? "border-rose-500 dark:border-rose-500" : ""}`}
                   />
                 </label>
                 <label className={LABEL_CLASS}>
@@ -346,13 +380,13 @@ export default function RegisterInspector(props: RegisterInspectorProps) {
                     aria-label="Address"
                     type="text"
                     value={addrText}
-                    aria-invalid={blocked ? "true" : undefined}
+                    aria-invalid={addrError || conflict ? "true" : undefined}
                     onChange={(e) => {
                       setAddrText(e.target.value);
                       const n = parseAddressInput(e.target.value);
                       if (n !== null) set({ address: n });
                     }}
-                    className={`${INPUT_CLASS} ${blocked ? "border-rose-500 dark:border-rose-500" : ""}`}
+                    className={`${INPUT_CLASS} ${addrError || conflict ? "border-rose-500 dark:border-rose-500" : ""}`}
                   />
                 </label>
               </>
@@ -547,9 +581,35 @@ export default function RegisterInspector(props: RegisterInspectorProps) {
                 </label>
                 <label className={LABEL_CLASS}>
                   Period (ms)
-                  <input aria-label="Period ms" type="number" value={periodText} placeholder={periodPlaceholder(reg.valueSource)} onChange={(e) => setPeriodText(e.target.value)} className={INPUT_CLASS} />
+                  <input aria-label="Period ms" type="number" value={periodText} placeholder={periodPlaceholder(reg.valueSource)} onChange={(e) => { setPeriodTouched(true); setPeriodText(e.target.value); }} className={INPUT_CLASS} />
                 </label>
               </>
+            )}
+
+            {reg.valueSource !== "hold" && (
+              <div className="col-span-2 flex flex-col gap-1">
+                <label className={LABEL_CLASS}>
+                  Interval (ms)
+                  <input
+                    aria-label="Interval ms"
+                    type="number"
+                    min={0}
+                    step={1}
+                    value={intervalText}
+                    placeholder="1000"
+                    aria-invalid={intervalError ? "true" : undefined}
+                    onChange={(e) => {
+                      setIntervalText(e.target.value);
+                      const n = parseIntText(e.target.value, 0, 2147483647);
+                      if (n !== null) set({ intervalMs: n });
+                    }}
+                    className={`${INPUT_CLASS} ${intervalError ? "border-rose-500 dark:border-rose-500" : ""}`}
+                  />
+                </label>
+                <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                  How often the value is recomputed or re-read. Empty or 0 uses the default (1000 ms).
+                </p>
+              </div>
             )}
           </div>
         )}
@@ -584,7 +644,9 @@ export default function RegisterInspector(props: RegisterInspectorProps) {
         {blocked || error ? (
           <div role="alert" className="space-y-1 rounded-lg border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-xs text-rose-800 dark:text-rose-200">
             {addrError ? <p>{addrError}</p> : null}
+            {unitError ? <p>{unitError}</p> : null}
             {conflict ? <p>{conflict}</p> : null}
+            {intervalError ? <p>{intervalError}</p> : null}
             {error ? <p>{error}</p> : null}
           </div>
         ) : null}
@@ -663,7 +725,7 @@ export default function RegisterInspector(props: RegisterInspectorProps) {
             </button>
             <button
               type="button"
-              disabled={!dirty}
+              disabled={!dirty || intervalError !== null}
               onClick={handleSave}
               className="rounded-full border border-emerald-600/60 bg-emerald-500/10 px-4 py-2 text-sm font-semibold text-emerald-800 disabled:cursor-not-allowed disabled:opacity-50 dark:border-emerald-500/60 dark:text-emerald-200"
             >

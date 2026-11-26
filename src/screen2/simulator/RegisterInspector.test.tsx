@@ -199,6 +199,41 @@ describe("RegisterInspector", () => {
       expect(onDirtyChange).toHaveBeenLastCalledWith(true);
     });
 
+    it("a hold register switched to Device saves without a periodMs (I2)", () => {
+      const p = base();
+      const hold = { ...reg, id: 5, valueSource: "hold", dataType: "u16", sourceParams: "{}" };
+      render(<RegisterInspector {...p} register={hold} />);
+      fireEvent.click(screen.getByRole("tab", { name: /source/i }));
+      fireEvent.change(screen.getByLabelText(/value source/i), { target: { value: "device" } });
+      fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+      expect(JSON.parse((p.onSave.mock.calls[0][0] as PageRegister).sourceParams)).not.toHaveProperty("periodMs");
+    });
+
+    it("edits the update interval of a saved register and tracks it as dirty (I1)", () => {
+      const p = base();
+      render(<RegisterInspector {...p} />);
+      fireEvent.click(screen.getByRole("tab", { name: /source/i }));
+      expect((screen.getByLabelText("Interval ms") as HTMLInputElement).value).toBe("500");
+      fireEvent.change(screen.getByLabelText("Interval ms"), { target: { value: "2000" } });
+      fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+      expect(p.onSave).toHaveBeenCalledWith(expect.objectContaining({ intervalMs: 2000 }));
+    });
+
+    it("does not stay dirty after saving a non-canonical period like 02500 (M1)", () => {
+      const p = base();
+      const gen = { ...reg, id: 9, valueSource: "generator", sourceParams: JSON.stringify({ kind: "sine", min: 0, max: 10, periodMs: 1000 }) };
+      const { rerender } = render(<RegisterInspector {...p} register={gen} />);
+      fireEvent.click(screen.getByRole("tab", { name: /source/i }));
+      fireEvent.change(screen.getByLabelText(/period ms/i), { target: { value: "02500" } });
+      const save = screen.getByRole("button", { name: /^save$/i });
+      expect(save).not.toBeDisabled();
+      fireEvent.click(save);
+      const saved = p.onSave.mock.calls[0][0] as PageRegister;
+      rerender(<RegisterInspector {...p} register={saved} />);
+      expect(screen.getByRole("button", { name: /^save$/i })).toBeDisabled();
+      expect(screen.queryByText(/unsaved changes/i)).toBeNull();
+    });
+
     it("treats a source-param edit as unsaved", () => {
       render(<RegisterInspector {...base()} />);
       fireEvent.click(screen.getByRole("tab", { name: /source/i }));
@@ -299,6 +334,65 @@ describe("RegisterInspector", () => {
       fireEvent.click(screen.getByRole("button", { name: /^create$/i }));
       const sp = JSON.parse((p.onCreate as any).mock.calls[0][0].sourceParams);
       expect(sp).toMatchObject({ slaveUnitId: 7, functionCode: 4, connectionKind: "tcp" });
+    });
+
+    it("a draft switched to Device source carries no periodMs unless one is typed (I2)", () => {
+      const p = draftProps();
+      render(<RegisterInspector {...p} />);
+      fireEvent.click(screen.getByRole("tab", { name: /source/i }));
+      fireEvent.change(screen.getByLabelText(/value source/i), { target: { value: "device" } });
+      expect((screen.getByLabelText(/period ms/i) as HTMLInputElement).value).toBe("");
+      fireEvent.click(screen.getByRole("button", { name: /^create$/i }));
+      const sp = JSON.parse((p.onCreate as any).mock.calls[0][0].sourceParams);
+      expect(sp).not.toHaveProperty("periodMs");
+    });
+
+    it("keeps a period the user typed when switching to Device (I2)", () => {
+      const p = draftProps();
+      render(<RegisterInspector {...p} />);
+      fireEvent.click(screen.getByRole("tab", { name: /source/i }));
+      fireEvent.change(screen.getByLabelText(/value source/i), { target: { value: "generator" } });
+      fireEvent.change(screen.getByLabelText(/period ms/i), { target: { value: "2500" } });
+      fireEvent.change(screen.getByLabelText(/value source/i), { target: { value: "device" } });
+      fireEvent.click(screen.getByRole("button", { name: /^create$/i }));
+      expect(JSON.parse((p.onCreate as any).mock.calls[0][0].sourceParams).periodMs).toBe(2500);
+    });
+
+    it("sets the update interval on a draft and blocks an invalid one (I1)", () => {
+      const p = draftProps();
+      render(<RegisterInspector {...p} />);
+      fireEvent.click(screen.getByRole("tab", { name: /source/i }));
+      expect(screen.queryByLabelText("Interval ms")).toBeNull(); // hold: not applicable
+      fireEvent.change(screen.getByLabelText(/value source/i), { target: { value: "generator" } });
+      expect((screen.getByLabelText("Interval ms") as HTMLInputElement).value).toBe("1000");
+      fireEvent.change(screen.getByLabelText("Interval ms"), { target: { value: "250" } });
+      fireEvent.click(screen.getByRole("button", { name: /^create$/i }));
+      expect((p.onCreate as any).mock.calls[0][0].intervalMs).toBe(250);
+      fireEvent.change(screen.getByLabelText("Interval ms"), { target: { value: "1.5" } });
+      expect(screen.getByRole("button", { name: /^create$/i })).toBeDisabled();
+      fireEvent.change(screen.getByLabelText("Interval ms"), { target: { value: "" } });
+      fireEvent.click(screen.getByRole("button", { name: /^create$/i }));
+      expect((p.onCreate as any).mock.calls[1][0].intervalMs).toBe(0);
+    });
+
+    it("rejects a unit ID outside 0-255 and blocks Create (M5)", () => {
+      render(<RegisterInspector {...draftProps()} />);
+      fireEvent.change(screen.getByLabelText("Unit ID"), { target: { value: "300" } });
+      expect(screen.getByRole("alert").textContent).toMatch(/unit ID/i);
+      expect(screen.getByRole("button", { name: /^create$/i })).toBeDisabled();
+      fireEvent.change(screen.getByLabelText("Unit ID"), { target: { value: "255" } });
+      expect(screen.getByRole("button", { name: /^create$/i })).not.toBeDisabled();
+    });
+
+    it("blocks Create for a non-numeric address", () => {
+      const p = draftProps();
+      render(<RegisterInspector {...p} />);
+      fireEvent.change(screen.getByLabelText("Address"), { target: { value: "abc" } });
+      expect(screen.getByRole("alert").textContent).toMatch(/0 to 65535/);
+      const create = screen.getByRole("button", { name: /^create$/i });
+      expect(create).toBeDisabled();
+      fireEvent.click(create);
+      expect(p.onCreate).not.toHaveBeenCalled();
     });
 
     it("shows a save error inside the panel and keeps the entered values", () => {
