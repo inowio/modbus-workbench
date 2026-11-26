@@ -595,8 +595,16 @@ describe("SlaveScannerModal", () => {
       setup();
       const base = invokeMock.getMockImplementation()!;
       invokeMock.mockImplementation((command: string, args?: { request?: ScanRequest }) =>
-        command === "scan_default_ip_range" ? Promise.resolve(defaultRange) : base(command, args),
+        command === "scan_default_ip_range"
+          ? Promise.resolve(defaultRange)
+          : command === "scan_local_ipv4"
+            ? Promise.resolve(defaultRange ? "192.168.68.128" : null)
+            : base(command, args),
       );
+    }
+
+    function openCustom() {
+      fireEvent.click(screen.getByRole("button", { name: "Custom range (CIDR or across subnets)" }));
     }
 
     async function openRangeMode() {
@@ -609,28 +617,34 @@ describe("SlaveScannerModal", () => {
     it("shows range fields, pre-filled from scan_default_ip_range", async () => {
       setupRange();
       await openRangeMode();
-      await waitFor(() => expect(screen.getByLabelText("Range")).toHaveValue("192.168.68.1-254"));
-      expect(screen.getByText("254 addresses")).toBeInTheDocument();
+      await waitFor(() => expect(screen.getByLabelText("Network")).toHaveValue("192.168.68"));
+      expect(screen.getByLabelText("From")).toHaveValue(1);
+      expect(screen.getByLabelText("To")).toHaveValue(254);
+      expect(screen.getByText("This PC: 192.168.68.128")).toBeInTheDocument();
+      expect(screen.getByText("192.168.68.1 → 192.168.68.254 · 254 addresses")).toBeInTheDocument();
       expect(screen.getByLabelText("TCP port")).toHaveValue(502);
-      expect(screen.getByLabelText("Connect wait (ms)")).toHaveValue(300);
-      expect(screen.getByLabelText("Parallel hosts")).toHaveValue(64);
+      expect(screen.queryByLabelText("Range")).toBeNull();
+      expect(screen.queryByLabelText("Connect wait (ms)")).toBeNull();
       expect(screen.queryByLabelText("Host")).toBeNull();
       expect(screen.getByLabelText("Start")).toBeInTheDocument();
       expect(screen.getByLabelText("Check with")).toBeInTheDocument();
       expect(screen.getByText(/Finding hosts: about 2 s, then about/)).toBeInTheDocument();
     });
 
-    it("leaves the range empty when there is no default", async () => {
+    it("leaves the network empty when there is no default", async () => {
       setupRange(null);
       await openRangeMode();
-      expect(screen.getByLabelText("Range")).toHaveValue("");
+      expect(screen.getByLabelText("Network")).toHaveValue("");
+      expect(screen.getAllByText("Enter the network, like 192.168.68").length).toBeGreaterThan(0);
+      expect(screen.queryByRole("button", { name: "Use my network" })).toBeNull();
       expect(screen.getByRole("button", { name: "Scan" })).toBeDisabled();
     });
 
     it("an invalid range shows the reason and disables Scan", async () => {
       setupRange();
       await openRangeMode();
-      await waitFor(() => expect(screen.getByLabelText("Range")).toHaveValue("192.168.68.1-254"));
+      await waitFor(() => expect(screen.getByLabelText("Network")).toHaveValue("192.168.68"));
+      openCustom();
       fireEvent.change(screen.getByLabelText("Range"), { target: { value: "10.0.0.0/21" } });
       expect(screen.getAllByText("Too many addresses (2046) — the limit is 1024").length).toBeGreaterThan(0);
       expect(screen.getByRole("button", { name: "Scan" })).toBeDisabled();
@@ -639,9 +653,10 @@ describe("SlaveScannerModal", () => {
     it("validates connect wait and parallel hosts", async () => {
       setupRange();
       await openRangeMode();
-      await waitFor(() => expect(screen.getByLabelText("Range")).toHaveValue("192.168.68.1-254"));
+      await waitFor(() => expect(screen.getByLabelText("Network")).toHaveValue("192.168.68"));
+      fireEvent.click(screen.getByRole("button", { name: /Advanced/ }));
       fireEvent.change(screen.getByLabelText("Connect wait (ms)"), { target: { value: "10" } });
-      expect(screen.getByText("Connect wait must be 50–5000 ms")).toBeInTheDocument();
+      expect(screen.getAllByText("Connect wait must be 50–5000 ms").length).toBeGreaterThan(0);
       fireEvent.change(screen.getByLabelText("Connect wait (ms)"), { target: { value: "300" } });
       fireEvent.change(screen.getByLabelText("Parallel hosts"), { target: { value: "300" } });
       expect(screen.getByText("Parallel hosts must be 1–256")).toBeInTheDocument();
@@ -650,8 +665,8 @@ describe("SlaveScannerModal", () => {
     it("sends a tcpRange request", async () => {
       setupRange();
       await openRangeMode();
-      await waitFor(() => expect(screen.getByLabelText("Range")).toHaveValue("192.168.68.1-254"));
-      fireEvent.change(screen.getByLabelText("Range"), { target: { value: " 192.168.68.1-20 " } });
+      await waitFor(() => expect(screen.getByLabelText("Network")).toHaveValue("192.168.68"));
+      fireEvent.change(screen.getByLabelText("To"), { target: { value: "20" } });
       await startScan();
       const req = (startCalls()[0][1] as { request: ScanRequest }).request;
       expect(req).toMatchObject({
@@ -664,6 +679,101 @@ describe("SlaveScannerModal", () => {
         serial: null,
         sweep: null,
       });
+    });
+
+    it("invalid simple input disables Scan", async () => {
+      setupRange();
+      await openRangeMode();
+      await waitFor(() => expect(screen.getByLabelText("Network")).toHaveValue("192.168.68"));
+      fireEvent.change(screen.getByLabelText("To"), { target: { value: "255" } });
+      expect(screen.getAllByText("From and To must be 1–254").length).toBeGreaterThan(0);
+      expect(screen.getByRole("button", { name: "Scan" })).toBeDisabled();
+      fireEvent.change(screen.getByLabelText("To"), { target: { value: "20" } });
+      fireEvent.change(screen.getByLabelText("From"), { target: { value: "30" } });
+      expect(screen.getAllByText("From must not be after To").length).toBeGreaterThan(0);
+      expect(screen.getByRole("button", { name: "Scan" })).toBeDisabled();
+    });
+
+    it("Use my network restores the defaults", async () => {
+      setupRange();
+      await openRangeMode();
+      await waitFor(() => expect(screen.getByLabelText("Network")).toHaveValue("192.168.68"));
+      fireEvent.change(screen.getByLabelText("Network"), { target: { value: "10.0.0" } });
+      fireEvent.change(screen.getByLabelText("To"), { target: { value: "9" } });
+      fireEvent.click(screen.getByRole("button", { name: "Use my network" }));
+      expect(screen.getByLabelText("Network")).toHaveValue("192.168.68");
+      expect(screen.getByLabelText("From")).toHaveValue(1);
+      expect(screen.getByLabelText("To")).toHaveValue(254);
+    });
+
+    it("custom range sends the free text", async () => {
+      setupRange();
+      await openRangeMode();
+      await waitFor(() => expect(screen.getByLabelText("Network")).toHaveValue("192.168.68"));
+      expect(screen.queryByLabelText("Range")).toBeNull();
+      openCustom();
+      const toggle = screen.getByRole("button", { name: "Custom range (CIDR or across subnets)" });
+      expect(toggle).toHaveAttribute("aria-expanded", "true");
+      expect(screen.getByLabelText("Network")).toBeDisabled();
+      fireEvent.change(screen.getByLabelText("Range"), { target: { value: " 10.0.0.0/22 " } });
+      expect(screen.getByText("1022 addresses")).toBeInTheDocument();
+      await startScan();
+      expect((startCalls()[0][1] as { request: ScanRequest }).request.range).toBe("10.0.0.0/22");
+    });
+
+    it("collapsing the custom range sends the simple range", async () => {
+      setupRange();
+      await openRangeMode();
+      await waitFor(() => expect(screen.getByLabelText("Network")).toHaveValue("192.168.68"));
+      openCustom();
+      fireEvent.change(screen.getByLabelText("Range"), { target: { value: "10.0.0.0/22" } });
+      openCustom();
+      expect(screen.queryByLabelText("Range")).toBeNull();
+      expect(screen.getByLabelText("Network")).toBeEnabled();
+      await startScan();
+      expect((startCalls()[0][1] as { request: ScanRequest }).request.range).toBe("192.168.68.1-254");
+    });
+
+    it("Advanced is collapsed with a summary, expands, and opens itself on an invalid value", async () => {
+      setupRange();
+      await openRangeMode();
+      await waitFor(() => expect(screen.getByLabelText("Network")).toHaveValue("192.168.68"));
+      const advanced = screen.getByRole("button", { name: /Advanced/ });
+      expect(advanced).toHaveAttribute("aria-expanded", "false");
+      expect(screen.getByText("Connect wait 300 ms · Parallel hosts 64")).toBeInTheDocument();
+      expect(screen.queryByLabelText("Connect wait (ms)")).toBeNull();
+      fireEvent.click(advanced);
+      expect(advanced).toHaveAttribute("aria-expanded", "true");
+      expect(screen.getByLabelText("Connect wait (ms)")).toHaveValue(300);
+      expect(screen.getByLabelText("Parallel hosts")).toHaveValue(64);
+      fireEvent.change(screen.getByLabelText("Connect wait (ms)"), { target: { value: "10" } });
+      fireEvent.click(advanced);
+      // Still invalid, so it stays open and the error is visible.
+      expect(screen.getByLabelText("Connect wait (ms)")).toBeInTheDocument();
+      expect(screen.getAllByText("Connect wait must be 50–5000 ms").length).toBeGreaterThan(0);
+    });
+
+    it("defaults to 247 units per host in range mode and restores the single-host default", async () => {
+      setupRange();
+      renderModal();
+      await loaded();
+      fireEvent.click(screen.getByRole("radio", { name: "TCP" }));
+      expect(screen.getByLabelText("Quantity")).toHaveValue(255);
+      fireEvent.click(screen.getByRole("radio", { name: "IP range" }));
+      expect(screen.getByLabelText("Start")).toHaveValue(1);
+      expect(screen.getByLabelText("Quantity")).toHaveValue(247);
+      fireEvent.click(screen.getByRole("radio", { name: "Single host" }));
+      expect(screen.getByLabelText("Quantity")).toHaveValue(255);
+    });
+
+    it("keeps an edited quantity when switching modes", async () => {
+      setupRange();
+      renderModal();
+      await loaded();
+      fireEvent.click(screen.getByRole("radio", { name: "TCP" }));
+      fireEvent.change(screen.getByLabelText("Quantity"), { target: { value: "10" } });
+      fireEvent.click(screen.getByRole("radio", { name: "IP range" }));
+      expect(screen.getByLabelText("Quantity")).toHaveValue(10);
     });
 
     it("single host mode is unchanged", async () => {
@@ -698,7 +808,7 @@ describe("SlaveScannerModal", () => {
       async function startRangeScan(): Promise<string> {
         setupRange();
         await openRangeMode();
-        await waitFor(() => expect(screen.getByLabelText("Range")).toHaveValue("192.168.68.1-254"));
+        await waitFor(() => expect(screen.getByLabelText("Network")).toHaveValue("192.168.68"));
         return startScan();
       }
 

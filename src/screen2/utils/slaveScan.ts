@@ -197,3 +197,30 @@ export function estimateRangeSeconds(args: {
   const { addresses, connectWaitMs, retries, hostConcurrency } = args;
   return Math.ceil((addresses * connectWaitMs * (retries + 1)) / Math.max(1, hostConcurrency) / 1000);
 }
+
+/** Splits a default range such as `192.168.68.1-254` into network, first and last host. */
+export function splitDefaultRange(s: string | null): { net: string; from: string; to: string } | null {
+  const m = s === null ? null : /^(\d{1,3}\.\d{1,3}\.\d{1,3})\.(\d{1,3})-(\d{1,3})$/.exec(s.trim());
+  return m ? { net: m[1], from: m[2], to: m[3] } : null;
+}
+
+/** First problem with the simple range inputs (network, first and last host), or null. */
+export function simpleRangeProblem(net: string, from: string, to: string): string | null {
+  const octets = net.trim().split(".");
+  const netOk =
+    octets.length === 3 &&
+    octets.every((o) => /^\d{1,3}$/.test(o) && Number(o) <= 255 && (o.length === 1 || !o.startsWith("0"))) &&
+    Number(octets[0]) !== 0 &&
+    Number(octets[0]) < 224;
+  if (!netOk) return "Enter the network, like 192.168.68";
+  const host = (v: string) => (/^\d+$/.test(v.trim()) && Number(v) >= 1 && Number(v) <= 254 ? Number(v) : null);
+  const f = host(from);
+  const t = host(to);
+  if (f === null || t === null) return "From and To must be 1–254";
+  if (f > t) return "From must not be after To";
+  return null;
+}
+
+export function simpleRangeText(net: string, from: string, to: string): string {
+  return `${net.trim()}.${from.trim()}-${to.trim()}`;
+}

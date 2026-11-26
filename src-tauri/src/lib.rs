@@ -282,6 +282,7 @@ pub fn run() {
             slave_scan::start_slave_scan,
             slave_scan::cancel_slave_scan,
             slave_scan::scan_default_ip_range,
+            slave_scan::scan_local_ipv4,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

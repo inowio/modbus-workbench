@@ -359,6 +359,12 @@ pub fn scan_default_ip_range() -> Option<String> {
     crate::simulator::primary_local_ipv4().and_then(default_range_for)
 }
 
+/// This PC's primary IPv4 address as text, for the "This PC" hint. Any address is fine, private or not.
+#[tauri::command]
+pub fn scan_local_ipv4() -> Option<String> {
+    crate::simulator::primary_local_ipv4().map(|ip| ip.to_string())
+}
+
 #[tauri::command]
 pub fn cancel_slave_scan(
     scan_state: tauri::State<'_, SlaveScanState>,

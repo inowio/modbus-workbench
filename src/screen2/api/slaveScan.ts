@@ -127,3 +127,8 @@ export async function cancelSlaveScan(workspace: string, scanId: string): Promis
 export async function scanDefaultIpRange(): Promise<string | null> {
   return (await invoke<string | null>("scan_default_ip_range")) ?? null;
 }
+
+/** This PC's primary IPv4 address, for the "This PC" hint, or null when unknown. */
+export async function scanLocalIpv4(): Promise<string | null> {
+  return (await invoke<string | null>("scan_local_ipv4")) ?? null;
+}

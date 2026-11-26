@@ -14,6 +14,9 @@ import {
   isAlreadyInWorkspace,
   newScanId,
   parseIpRange,
+  simpleRangeProblem,
+  simpleRangeText,
+  splitDefaultRange,
   suggestSlaveName,
   unitRange,
 } from "./slaveScan";
@@ -205,5 +208,30 @@ describe("estimateRangeSeconds", () => {
   it("is addresses x connect wait x attempts / parallel hosts", () => {
     expect(estimateRangeSeconds({ addresses: 254, connectWaitMs: 300, retries: 0, hostConcurrency: 64 })).toBe(2);
     expect(estimateRangeSeconds({ addresses: 254, connectWaitMs: 300, retries: 1, hostConcurrency: 1 })).toBe(153);
+  });
+});
+
+describe("simple range helpers", () => {
+  it("splits a default range", () => {
+    expect(splitDefaultRange("192.168.68.1-254")).toEqual({ net: "192.168.68", from: "1", to: "254" });
+    expect(splitDefaultRange(null)).toBeNull();
+    expect(splitDefaultRange("abc")).toBeNull();
+  });
+
+  it("reports the first problem with the simple inputs", () => {
+    const NET = "Enter the network, like 192.168.68";
+    for (const net of ["", "192.168", "192.168.68.1", "0.1.2", "224.0.0", "192.168.068", "192.168.256"]) {
+      expect(simpleRangeProblem(net, "1", "254")).toBe(NET);
+    }
+    const HOSTS = "From and To must be 1–254";
+    expect(simpleRangeProblem("192.168.68", "0", "10")).toBe(HOSTS);
+    expect(simpleRangeProblem("192.168.68", "1", "255")).toBe(HOSTS);
+    expect(simpleRangeProblem("192.168.68", "abc", "10")).toBe(HOSTS);
+    expect(simpleRangeProblem("192.168.68", "20", "10")).toBe("From must not be after To");
+    expect(simpleRangeProblem("192.168.68", "1", "254")).toBeNull();
+  });
+
+  it("builds the range text", () => {
+    expect(simpleRangeText("192.168.68", "1", "254")).toBe("192.168.68.1-254");
   });
 });

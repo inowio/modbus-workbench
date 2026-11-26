@@ -1,7 +1,19 @@
-import { useId, useMemo, type Dispatch, type ReactNode, type SetStateAction } from "react";
+import { useId, useMemo, useState, type Dispatch, type ReactNode, type SetStateAction } from "react";
+
+import { FiChevronDown, FiChevronRight } from "react-icons/fi";
 
 import type { ProbeKind, ScanKind, ScanRequest, SerialParams, SerialParity } from "../api/slaveScan";
-import { SCAN_BAUDS, SCAN_PARITIES, defaultQuantity, defaultWaitMs, parseIpRange, unitRange } from "../utils/slaveScan";
+import {
+  SCAN_BAUDS,
+  SCAN_PARITIES,
+  defaultQuantity,
+  defaultWaitMs,
+  parseIpRange,
+  simpleRangeProblem,
+  simpleRangeText,
+  splitDefaultRange,
+  unitRange,
+} from "../utils/slaveScan";
 import type { ConnectionSettings, PortItem } from "./ConnectionSettingsForm";
 
 export type FormState = {
@@ -17,6 +29,13 @@ export type FormState = {
   sweepParities: SerialParity[];
   host: string;
   tcpMode: "single" | "range";
+  /** Which range input is active: the structured one, or the free-text one. */
+  rangeInput: "simple" | "custom";
+  /** First three octets, for example "192.168.68". */
+  net: string;
+  fromHost: string;
+  toHost: string;
+  /** The free-text range, used only while `rangeInput` is "custom". */
   range: string;
   connectWaitMs: string;
   hostConcurrency: string;
@@ -109,6 +128,10 @@ export function initialForm(ws: ConnectionSettings): FormState {
     sweepParities: [],
     host: ws.tcpHost ?? "127.0.0.1",
     tcpMode: "single",
+    rangeInput: "simple",
+    net: "",
+    fromHost: "1",
+    toHost: "254",
     range: "",
     connectWaitMs: "300",
     hostConcurrency: "64",
@@ -130,6 +153,18 @@ function intIn(value: string, min: number, max: number): number | null {
   return n >= min && n <= max ? n : null;
 }
 
+/** The range text a range scan would send, or null while the active input is invalid. */
+export function effectiveRange(f: FormState): string | null {
+  const text =
+    f.rangeInput === "simple"
+      ? simpleRangeProblem(f.net, f.fromHost, f.toHost) === null
+        ? simpleRangeText(f.net, f.fromHost, f.toHost)
+        : null
+      : f.range.trim();
+  if (text === null) return null;
+  return "error" in parseIpRange(text) ? null : text;
+}
+
 /** First reason the form cannot be scanned, or null. The backend validates again. */
 export function formProblem(f: FormState): string | null {
   const { min, max } = unitRange(f.kind);
@@ -145,7 +180,11 @@ export function formProblem(f: FormState): string | null {
     }
   } else {
     if (f.tcpMode === "range") {
-      const parsed = parseIpRange(f.range);
+      if (f.rangeInput === "simple") {
+        const problem = simpleRangeProblem(f.net, f.fromHost, f.toHost);
+        if (problem !== null) return problem;
+      }
+      const parsed = parseIpRange(f.rangeInput === "simple" ? simpleRangeText(f.net, f.fromHost, f.toHost) : f.range);
       if ("error" in parsed) return parsed.error;
     } else if (!f.host.trim()) {
       return "Enter a host";
@@ -187,7 +226,7 @@ export function buildRequest(f: FormState, scanId: string): ScanRequest {
       sweep: null,
       tcp: { host: "", port: Number(f.tcpPort) },
       concurrency: Number(f.concurrency),
-      range: f.range.trim(),
+      range: effectiveRange(f) ?? "",
       hostConcurrency: Number(f.hostConcurrency),
       connectWaitMs: Number(f.connectWaitMs),
     };
@@ -224,6 +263,10 @@ export function buildRequest(f: FormState, scanId: string): ScanRequest {
 }
 
 export type SlaveScanFormProps = {
+  /** This PC's IPv4 address, shown as a hint next to the range. */
+  localIp?: string | null;
+  /** The detected local range such as `192.168.68.1-254`; enables "Use my network". */
+  defaultRange?: string | null;
   form: FormState;
   setForm: Dispatch<SetStateAction<FormState>>;
   portItems: PortItem[];
@@ -232,8 +275,16 @@ export type SlaveScanFormProps = {
 };
 
 /** The scanner's connection and range fields. */
-export default function SlaveScanForm({ form, setForm, portItems, disabled }: SlaveScanFormProps) {
+export default function SlaveScanForm({
+  form,
+  setForm,
+  portItems,
+  disabled,
+  localIp = null,
+  defaultRange = null,
+}: SlaveScanFormProps) {
   const id = useId();
+  const [advancedOpen, setAdvancedOpen] = useState(false);
   const fieldId = (name: string) => `${id}-${name}`;
 
   const portOptions = useMemo(() => {
@@ -283,6 +334,25 @@ export default function SlaveScanForm({ form, setForm, portItems, disabled }: Sl
     });
   }
 
+  function setTcpMode(tcpMode: "single" | "range") {
+    setForm((prev) => {
+      if (prev.tcpMode === tcpMode) return prev;
+      if (prev.quantityEdited) return { ...prev, tcpMode };
+      if (tcpMode === "range") return { ...prev, tcpMode, start: "1", quantity: "247" };
+      const startNum = intIn(prev.start, unitRange("tcp").min, unitRange("tcp").max);
+      return {
+        ...prev,
+        tcpMode,
+        quantity: startNum === null ? prev.quantity : String(defaultQuantity("tcp", startNum)),
+      };
+    });
+  }
+
+  function useMyNetwork() {
+    const split = splitDefaultRange(defaultRange);
+    if (split) patch({ net: split.net, fromHost: split.from, toHost: split.to });
+  }
+
   function toggleSweep(on: boolean) {
     setForm((prev) => ({
       ...prev,
@@ -300,6 +370,16 @@ export default function SlaveScanForm({ form, setForm, portItems, disabled }: Sl
 
   const range = unitRange(form.kind);
   const rangeParsed = form.tcpMode === "range" ? parseIpRange(form.range) : null;
+  const simpleProblem = simpleRangeProblem(form.net, form.fromHost, form.toHost);
+  const simpleParsed = simpleProblem === null ? parseIpRange(simpleRangeText(form.net, form.fromHost, form.toHost)) : null;
+  const simpleError = simpleProblem ?? (simpleParsed !== null && "error" in simpleParsed ? simpleParsed.error : null);
+  const simpleCount = simpleParsed !== null && "count" in simpleParsed ? simpleParsed.count : 0;
+  const hasDefault = splitDefaultRange(defaultRange) !== null;
+  const customActive = form.rangeInput === "custom";
+  const advancedInvalid = intIn(form.connectWaitMs, 50, 5000) === null || intIn(form.hostConcurrency, 1, 256) === null;
+  const showAdvanced = advancedOpen || advancedInvalid;
+  const disclosureCls =
+    "inline-flex w-fit items-center gap-1 rounded-md text-xs font-medium text-slate-600 transition hover:opacity-80 dark:text-slate-300";
 
   return (
     <fieldset disabled={disabled} className="flex min-w-0 flex-col gap-6 disabled:opacity-80">
@@ -539,7 +619,7 @@ export default function SlaveScanForm({ form, setForm, portItems, disabled }: Sl
                   name={fieldId("tcpmode")}
                   value={opt.value}
                   checked={form.tcpMode === opt.value}
-                  onChange={() => patch({ tcpMode: opt.value })}
+                  onChange={() => setTcpMode(opt.value)}
                 />
                 {opt.label}
               </label>
@@ -547,25 +627,83 @@ export default function SlaveScanForm({ form, setForm, portItems, disabled }: Sl
           </div>
           <div className="grid grid-cols-2 gap-3">
             {form.tcpMode === "range" ? (
-              <div className="col-span-2 flex flex-col gap-1">
-                <label className={labelCls} htmlFor={fieldId("range")}>
-                  Range
-                </label>
-                <input
-                  id={fieldId("range")}
-                  className={inputCls}
-                  value={form.range}
-                  placeholder="e.g. 192.168.1.1-254 or 192.168.1.0/24"
-                  aria-describedby={fieldId("range-info")}
-                  onChange={(e) => patch({ range: e.currentTarget.value })}
-                />
-                <span id={fieldId("range-info")} className="text-xs text-slate-500 dark:text-slate-400">
-                  {rangeParsed === null || form.range.trim() === "" ? null : "error" in rangeParsed ? (
-                    <span className="text-rose-700 dark:text-rose-300">{rangeParsed.error}</span>
-                  ) : (
-                    `${rangeParsed.count} ${rangeParsed.count === 1 ? "address" : "addresses"}`
-                  )}
-                </span>
+              <div className="col-span-2 flex flex-col gap-2">
+                <div className={`flex items-end gap-2 ${customActive ? "opacity-50" : ""}`}>
+                  <div className="flex min-w-0 flex-1 flex-col gap-1">
+                    <label className={labelCls} htmlFor={fieldId("net")}>
+                      Network
+                    </label>
+                    <div className="flex items-center gap-1">
+                      <input
+                        id={fieldId("net")}
+                        className={inputCls}
+                        value={form.net}
+                        disabled={customActive}
+                        placeholder="192.168.68"
+                        onChange={(e) => patch({ net: e.currentTarget.value })}
+                      />
+                      <span aria-hidden="true" className="font-mono text-sm text-slate-500">
+                        .
+                      </span>
+                    </div>
+                  </div>
+                  <div className="flex w-20 flex-col gap-1">
+                    <label className={labelCls} htmlFor={fieldId("from")}>
+                      From
+                    </label>
+                    <input
+                      id={fieldId("from")}
+                      type="number"
+                      min={1}
+                      max={254}
+                      className={inputCls}
+                      value={form.fromHost}
+                      disabled={customActive}
+                      onChange={(e) => patch({ fromHost: e.currentTarget.value })}
+                    />
+                  </div>
+                  <div className="flex w-20 flex-col gap-1">
+                    <label className={labelCls} htmlFor={fieldId("to")}>
+                      To
+                    </label>
+                    <input
+                      id={fieldId("to")}
+                      type="number"
+                      min={1}
+                      max={254}
+                      className={inputCls}
+                      value={form.toHost}
+                      disabled={customActive}
+                      onChange={(e) => patch({ toHost: e.currentTarget.value })}
+                    />
+                  </div>
+                </div>
+                {localIp || hasDefault ? (
+                  <div className="flex items-center gap-3 text-xs text-slate-500 dark:text-slate-400">
+                    {localIp ? <span>{`This PC: ${localIp}`}</span> : null}
+                    {hasDefault ? (
+                      <button
+                        type="button"
+                        disabled={customActive}
+                        className="rounded-md font-medium text-emerald-700 transition hover:underline disabled:opacity-50 dark:text-emerald-300"
+                        onClick={useMyNetwork}
+                      >
+                        Use my network
+                      </button>
+                    ) : null}
+                  </div>
+                ) : null}
+                {customActive ? null : (
+                  <p className="text-xs">
+                    {simpleError !== null ? (
+                      <span className="text-rose-700 dark:text-rose-300">{simpleError}</span>
+                    ) : (
+                      <span className="text-slate-600 dark:text-slate-300">
+                        {`${form.net.trim()}.${form.fromHost.trim()} → ${form.net.trim()}.${form.toHost.trim()} · ${simpleCount} ${simpleCount === 1 ? "address" : "addresses"}`}
+                      </span>
+                    )}
+                  </p>
+                )}
               </div>
             ) : (
               <div className="col-span-2 flex flex-col gap-1">
@@ -609,39 +747,95 @@ export default function SlaveScanForm({ form, setForm, portItems, disabled }: Sl
                 onChange={(e) => patch({ concurrency: e.currentTarget.value })}
               />
             </div>
-            {form.tcpMode === "range" ? (
-              <>
-                <div className="flex flex-col gap-1">
-                  <label className={labelCls} htmlFor={fieldId("connectwait")}>
-                    Connect wait (ms)
-                  </label>
-                  <input
-                    id={fieldId("connectwait")}
-                    type="number"
-                    min={50}
-                    max={5000}
-                    className={inputCls}
-                    value={form.connectWaitMs}
-                    onChange={(e) => patch({ connectWaitMs: e.currentTarget.value })}
-                  />
-                </div>
-                <div className="flex flex-col gap-1">
-                  <label className={labelCls} htmlFor={fieldId("hostconcurrency")}>
-                    Parallel hosts
-                  </label>
-                  <input
-                    id={fieldId("hostconcurrency")}
-                    type="number"
-                    min={1}
-                    max={256}
-                    className={inputCls}
-                    value={form.hostConcurrency}
-                    onChange={(e) => patch({ hostConcurrency: e.currentTarget.value })}
-                  />
-                </div>
-              </>
-            ) : null}
           </div>
+          {form.tcpMode === "range" ? (
+            <div className="flex flex-col gap-2">
+              <button
+                type="button"
+                className={disclosureCls}
+                aria-expanded={customActive}
+                onClick={() => patch({ rangeInput: customActive ? "simple" : "custom" })}
+              >
+                {customActive ? (
+                  <FiChevronDown className="h-3.5 w-3.5 text-slate-500" aria-hidden="true" />
+                ) : (
+                  <FiChevronRight className="h-3.5 w-3.5 text-slate-500" aria-hidden="true" />
+                )}
+                Custom range (CIDR or across subnets)
+              </button>
+              {customActive ? (
+                <div className="flex flex-col gap-1">
+                  <label className={labelCls} htmlFor={fieldId("range")}>
+                    Range
+                  </label>
+                  <input
+                    id={fieldId("range")}
+                    className={inputCls}
+                    value={form.range}
+                    placeholder="e.g. 192.168.1.1-254 or 192.168.1.0/24"
+                    aria-describedby={fieldId("range-info")}
+                    onChange={(e) => patch({ range: e.currentTarget.value })}
+                  />
+                  <span id={fieldId("range-info")} className="text-xs text-slate-500 dark:text-slate-400">
+                    {rangeParsed === null || form.range.trim() === "" ? null : "error" in rangeParsed ? (
+                      <span className="text-rose-700 dark:text-rose-300">{rangeParsed.error}</span>
+                    ) : (
+                      `${rangeParsed.count} ${rangeParsed.count === 1 ? "address" : "addresses"}`
+                    )}
+                  </span>
+                </div>
+              ) : null}
+              <button
+                type="button"
+                className={disclosureCls}
+                aria-expanded={showAdvanced}
+                onClick={() => setAdvancedOpen((v) => !v)}
+              >
+                {showAdvanced ? (
+                  <FiChevronDown className="h-3.5 w-3.5 text-slate-500" aria-hidden="true" />
+                ) : (
+                  <FiChevronRight className="h-3.5 w-3.5 text-slate-500" aria-hidden="true" />
+                )}
+                Advanced
+              </button>
+              {showAdvanced ? (
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="flex flex-col gap-1">
+                    <label className={labelCls} htmlFor={fieldId("connectwait")}>
+                      Connect wait (ms)
+                    </label>
+                    <input
+                      id={fieldId("connectwait")}
+                      type="number"
+                      min={50}
+                      max={5000}
+                      className={inputCls}
+                      value={form.connectWaitMs}
+                      onChange={(e) => patch({ connectWaitMs: e.currentTarget.value })}
+                    />
+                  </div>
+                  <div className="flex flex-col gap-1">
+                    <label className={labelCls} htmlFor={fieldId("hostconcurrency")}>
+                      Parallel hosts
+                    </label>
+                    <input
+                      id={fieldId("hostconcurrency")}
+                      type="number"
+                      min={1}
+                      max={256}
+                      className={inputCls}
+                      value={form.hostConcurrency}
+                      onChange={(e) => patch({ hostConcurrency: e.currentTarget.value })}
+                    />
+                  </div>
+                </div>
+              ) : (
+                <p className="pl-4.5 text-xs text-slate-500 dark:text-slate-400">
+                  {`Connect wait ${form.connectWaitMs} ms · Parallel hosts ${form.hostConcurrency}`}
+                </p>
+              )}
+            </div>
+          ) : null}
           <p className="text-xs text-slate-500 dark:text-slate-400">
             Behind a TCP-to-RTU gateway, use 1 parallel check and a wait longer than the gateway&apos;s own timeout.
           </p>

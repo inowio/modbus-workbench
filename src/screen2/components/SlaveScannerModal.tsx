@@ -7,6 +7,7 @@ import {
   SLAVE_SCAN_EVENTS,
   cancelSlaveScan,
   scanDefaultIpRange,
+  scanLocalIpv4,
   startSlaveScan,
   type ScanDoneEvent,
   type ScanFoundEvent,
@@ -24,6 +25,7 @@ import {
   isAlreadyInWorkspace,
   newScanId,
   parseIpRange,
+  splitDefaultRange,
   suggestSlaveName,
 } from "../utils/slaveScan";
 import { normalizeConnectionSettings, type ConnectionSettings, type PortItem } from "./ConnectionSettingsForm";
@@ -31,6 +33,7 @@ import ScanHostsList from "./ScanHostsList";
 import ScanResultsList from "./ScanResultsList";
 import SlaveScanForm, {
   buildRequest,
+  effectiveRange,
   formProblem,
   initialForm,
   sweptBauds,
@@ -90,6 +93,9 @@ export default function SlaveScannerModal({ open, workspaceName, existingSlaves,
   const [results, setResults] = useState<ScanFoundEvent[]>([]);
   /** Whether the running or last scan was an IP-range scan (results grouped by host, no Add). */
   const [rangeScan, setRangeScan] = useState(false);
+  /** Detected local range and address, for the range hints. */
+  const [defaultRange, setDefaultRange] = useState<string | null>(null);
+  const [localIp, setLocalIp] = useState<string | null>(null);
   /** Latest status per host ("ip:port") of the range scan. */
   const [hosts, setHosts] = useState<Map<string, ScanHostEvent>>(() => new Map());
   /** Addresses in the range of the running or last range scan. */
@@ -150,10 +156,11 @@ export default function SlaveScannerModal({ open, workspaceName, existingSlaves,
     setSummary(null);
     setFinalChecked(null);
     void (async () => {
-      const [settingsRes, portsRes, rangeRes] = await Promise.allSettled([
+      const [settingsRes, portsRes, rangeRes, localRes] = await Promise.allSettled([
         invoke<ConnectionSettings>("get_connection_settings", { name: workspaceName }),
         invoke<PortItem[]>("list_serial_ports"),
         scanDefaultIpRange(),
+        scanLocalIpv4(),
       ]);
       if (stale) return;
       const loaded = normalizeConnectionSettings(
@@ -164,7 +171,14 @@ export default function SlaveScannerModal({ open, workspaceName, existingSlaves,
       setPortItems(portsRes.status === "fulfilled" && Array.isArray(portsRes.value) ? portsRes.value : []);
       const defaultRange = rangeRes.status === "fulfilled" ? rangeRes.value : null;
       const fresh = initialForm(loaded);
-      setForm(defaultRange && !fresh.range ? { ...fresh, range: defaultRange } : fresh);
+      const split = splitDefaultRange(defaultRange);
+      setDefaultRange(split ? defaultRange : null);
+      setLocalIp(localRes.status === "fulfilled" ? localRes.value : null);
+      setForm(
+        split && defaultRange
+          ? { ...fresh, net: split.net, fromHost: split.from, toHost: split.to, range: defaultRange }
+          : fresh,
+      );
       setLoading(false);
     })();
     return () => {
@@ -251,7 +265,8 @@ export default function SlaveScannerModal({ open, workspaceName, existingSlaves,
   const estimate = useMemo(() => {
     if (formProblem(form) !== null) return null;
     const serial = form.kind === "serial";
-    const rangeParsed = form.tcpMode === "range" && !serial ? parseIpRange(form.range) : null;
+    const effective = form.tcpMode === "range" && !serial ? effectiveRange(form) : null;
+    const rangeParsed = effective === null ? null : parseIpRange(effective);
     const ports = Math.max(1, form.ports.length);
     const combos = serial && form.sweepOn ? sweptBauds(form).length * form.sweepParities.length : 1;
     // Serial: every port scans the whole range in parallel; TCP: `concurrency` workers share it.
@@ -293,7 +308,7 @@ export default function SlaveScannerModal({ open, workspaceName, existingSlaves,
     scanWorkspaceRef.current = workspaceName;
     setPhase("scanning");
     setResultKind(request.kind === "serial" ? "serial" : "tcp");
-    const rangeParsed = request.kind === "tcpRange" ? parseIpRange(form.range) : null;
+    const rangeParsed = request.kind === "tcpRange" ? parseIpRange(request.range ?? "") : null;
     setRangeScan(request.kind === "tcpRange");
     setRangeAddresses(rangeParsed !== null && !("error" in rangeParsed) ? rangeParsed.count : 0);
     setHosts(new Map());
@@ -439,7 +454,14 @@ export default function SlaveScannerModal({ open, workspaceName, existingSlaves,
               {loading ? (
                 <div className="text-sm text-slate-600 dark:text-slate-300">Loading connection settings…</div>
               ) : (
-                <SlaveScanForm form={form} setForm={setForm} portItems={portItems} disabled={busy} />
+                <SlaveScanForm
+                  form={form}
+                  setForm={setForm}
+                  portItems={portItems}
+                  disabled={busy}
+                  localIp={localIp}
+                  defaultRange={defaultRange}
+                />
               )}
             </div>
 
