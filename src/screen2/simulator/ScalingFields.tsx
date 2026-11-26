@@ -54,6 +54,9 @@ export function validateScaling(text: ScalingText, isBitBank: boolean): ScalingC
   return { scale, offset, decimals, scaleError, offsetError, decimalsError, error: scaleError ?? offsetError ?? decimalsError };
 }
 
+/** Raw value previewed when there is no hold/live value to convert. */
+const SAMPLE_RAW = 1000;
+
 /** The Scaling block shared by the simulator side panel and the virtual-device editor. */
 export default function ScalingFields(props: {
   dataType: string;
@@ -62,8 +65,8 @@ export default function ScalingFields(props: {
   text: ScalingText;
   onTextChange: (field: keyof ScalingText, text: string) => void;
   check: ScalingCheck;
-  /** Raw value the preview line converts. */
-  previewRaw: number;
+  /** Raw value the preview line converts; null (no meaningful value) shows a sample raw. */
+  previewRaw: number | null;
   /** Suffix for accessible names (e.g. " 2"); empty keeps "Scale", "Offset", "Decimals". */
   nameSuffix?: string;
   /** Accessible name of the offset field (the virtual-device editor already has a register "Offset"). */
@@ -83,6 +86,7 @@ export default function ScalingFields(props: {
   });
   const bad = (e: string | null) => (e ? "border-rose-500 dark:border-rose-500" : "");
   const unitId = props.unitInputId ?? "register-unit";
+  const previewRaw = props.previewRaw ?? SAMPLE_RAW;
   return (
     <fieldset className={props.className ?? "col-span-2 space-y-2 rounded-lg border border-slate-200 p-3 dark:border-slate-800"}>
       <legend className="px-1 text-xs font-semibold text-slate-600 dark:text-slate-300">Scaling</legend>
@@ -132,7 +136,7 @@ export default function ScalingFields(props: {
         </label>
       </div>
       <p className="text-[11px] text-slate-500 dark:text-slate-400">
-        {check.error ? "—" : `raw ${props.previewRaw} = ${formatEng(engFromRaw(props.previewRaw, sc.scale, sc.offset), sc.decimals, sc.unit, sc.trim)}`}
+        {check.error ? "—" : `raw ${previewRaw} = ${formatEng(engFromRaw(previewRaw, sc.scale, sc.offset), sc.decimals, sc.unit, sc.trim)}`}
       </p>
       <p className="text-[11px] text-slate-500 dark:text-slate-400">
         Value = raw × scale + offset. Generator, preset and rule values are entered in these units.

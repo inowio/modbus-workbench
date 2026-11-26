@@ -302,6 +302,29 @@ describe("TemplateEditorModal", () => {
       expect(screen.getByText("Register 2: Scale can't be zero.")).toBeInTheDocument();
     });
 
+    it("labels generator and preset Min/Max with the unit", () => {
+      const gen = reg(0, { ...scaled, valueSource: "generator", sourceParams: '{"kind":"sine","min":20,"max":30}' });
+      const dev = reg(1, { ...scaled, valueSource: "device", sourceParams: '{"preset":"temperature","min":0,"max":5}' });
+      render(<TemplateEditorModal open initial={withRegs([gen, dev, reg(2, { valueSource: "generator", sourceParams: "{}" })])} takenKeys={[]} onClose={vi.fn()} onSave={vi.fn()} />);
+      expect(screen.getByText("Min (°C)")).toBeInTheDocument();
+      expect(screen.getByText("Max (°C)")).toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: /^Register 2:/ }));
+      expect(screen.getByText("Min (°C)")).toBeInTheDocument();
+      expect(screen.getByLabelText("Min 1")).toHaveValue(0);
+      // No unit → plain labels.
+      fireEvent.click(screen.getByRole("button", { name: /^Register 3:/ }));
+      expect(screen.getByText("Min")).toBeInTheDocument();
+      expect(screen.queryByText("Min (°C)")).not.toBeInTheDocument();
+    });
+
+    it("previews a sample raw value (not raw 0) for non-hold registers", () => {
+      const gen = reg(0, { ...scaled, valueSource: "generator", sourceParams: '{"kind":"sine","min":20,"max":30}' });
+      render(<TemplateEditorModal open initial={withRegs([gen])} takenKeys={[]} onClose={vi.fn()} onSave={vi.fn()} />);
+      // 1000 × 0.1 − 40 = 60.0 °C
+      expect(screen.getByText("raw 1000 = 60.0 °C")).toBeInTheDocument();
+      expect(screen.queryByText(/^raw 0 =/)).not.toBeInTheDocument();
+    });
+
     it("drops scaling when the register becomes a bit bank", () => {
       const onSave = vi.fn();
       render(<TemplateEditorModal open initial={withRegs([reg(0, scaled)])} takenKeys={[]} onClose={vi.fn()} onSave={onSave} />);

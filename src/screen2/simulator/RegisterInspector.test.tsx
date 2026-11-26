@@ -421,6 +421,12 @@ describe("RegisterInspector scaling", () => {
     expect(screen.queryByLabelText("Scale")).toBeNull();
   });
 
+  it("previews a sample raw for a stopped non-hold register instead of raw 0", () => {
+    const gen = { ...scaled, id: 34, valueSource: "generator", sourceParams: JSON.stringify({ kind: "sine", min: 20, max: 30 }) };
+    render(<RegisterInspector {...base()} running={false} liveRaw={null} register={gen} />);
+    expect(screen.getByText("raw 1000 = 100.0 °C")).toBeInTheDocument();
+  });
+
   it("rejects scale 0 inside the panel and blocks Save and Create", () => {
     const p = base();
     const { unmount } = render(<RegisterInspector {...p} register={scaled} />);

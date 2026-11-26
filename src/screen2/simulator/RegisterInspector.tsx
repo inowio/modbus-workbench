@@ -337,7 +337,7 @@ export default function RegisterInspector(props: RegisterInspectorProps) {
     });
     set({ holdValue: holdRawFromText(holdText, next.scale, next.offset, reg.dataType) });
   };
-  const previewRaw = running && liveRaw !== null ? liveRaw : reg.valueSource === "hold" ? reg.holdValue : liveRaw ?? 0;
+  const previewRaw = running && liveRaw !== null ? liveRaw : reg.valueSource === "hold" ? reg.holdValue : liveRaw; // null → sample raw
   const holdShown = holdText ?? engText(reg.holdValue, sc.scale, sc.offset);
   const showRawHold = !isBitBank && (sc.scale !== 1 || sc.offset !== 0);
 

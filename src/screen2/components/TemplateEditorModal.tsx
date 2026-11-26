@@ -668,7 +668,7 @@ function RegisterEditor(props: {
           text={scalingText}
           onTextChange={editScaling}
           check={scalingCheck}
-          previewRaw={r.valueSource === "hold" ? r.holdValue ?? 0 : 0}
+          previewRaw={r.valueSource === "hold" ? r.holdValue ?? 0 : null}
           nameSuffix={` ${i}`}
           offsetName="Scaling offset"
           unitInputId={`template-unit-${i}`}
@@ -718,6 +718,9 @@ function ParamsEditor(props: {
   };
 
   const hasParams = r.valueSource !== "hold";
+  // Generator/preset ranges are engineering values: label them with the unit.
+  const unitLabel = r.bank === 1 || r.bank === 2 ? "" : (r.unit ?? "").trim();
+  const unitSuffix = unitLabel ? ` (${unitLabel})` : "";
 
   return (
     <div className="mt-3 rounded-lg border border-slate-200 bg-white/70 p-3 dark:border-slate-700 dark:bg-slate-900/40">
@@ -750,7 +753,7 @@ function ParamsEditor(props: {
         </div>
       ) : (
         <ParamsForm index={i} source={r.valueSource} params={params} isMulti={isMulti} byteOrder={r.byteOrder}
-          patch={patch} setParams={(p) => onChange(JSON.stringify(p))} />
+          unitSuffix={unitSuffix} patch={patch} setParams={(p) => onChange(JSON.stringify(p))} />
       )}
     </div>
   );
@@ -778,10 +781,12 @@ function ParamsForm(props: {
   params: Params;
   isMulti: boolean;
   byteOrder: string;
+  /** " (°C)" when the register has a unit, else "". */
+  unitSuffix: string;
   patch: (p: Params) => void;
   setParams: (p: Params) => void;
 }) {
-  const { index: i, source, params, isMulti, byteOrder, patch, setParams } = props;
+  const { index: i, source, params, isMulti, byteOrder, unitSuffix, patch, setParams } = props;
 
   if (source === "generator") {
     return (
@@ -791,10 +796,10 @@ function ParamsForm(props: {
             {GENERATOR_KINDS.map((k) => <option key={k} value={k}>{k}</option>)}
           </select>
         </label>
-        <label className={labelCls}>Min
+        <label className={labelCls}>{`Min${unitSuffix}`}
           <input aria-label={`Min ${i}`} type="number" value={numOr(params.min, 0)} onChange={(e) => patch({ min: Number(e.target.value) })} className={inputCls} />
         </label>
-        <label className={labelCls}>Max
+        <label className={labelCls}>{`Max${unitSuffix}`}
           <input aria-label={`Max ${i}`} type="number" value={numOr(params.max, 100)} onChange={(e) => patch({ max: Number(e.target.value) })} className={inputCls} />
         </label>
         <GeneratorPeriod index={i} periodMs={params.periodMs} onChange={(periodMs) => patch({ periodMs })} />
@@ -810,10 +815,10 @@ function ParamsForm(props: {
             {DEVICE_PRESETS.map((p) => <option key={p} value={p}>{p}</option>)}
           </select>
         </label>
-        <label className={labelCls}>Min
+        <label className={labelCls}>{`Min${unitSuffix}`}
           <input aria-label={`Min ${i}`} type="number" value={numOr(params.min, 0)} onChange={(e) => patch({ min: Number(e.target.value) })} className={inputCls} />
         </label>
-        <label className={labelCls}>Max
+        <label className={labelCls}>{`Max${unitSuffix}`}
           <input aria-label={`Max ${i}`} type="number" value={numOr(params.max, 100)} onChange={(e) => patch({ max: Number(e.target.value) })} className={inputCls} />
         </label>
         <label className={labelCls}>Period (ms)
