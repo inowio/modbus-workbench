@@ -9,6 +9,16 @@ use crate::models::SimRegister;
 
 const MAX_SAFE: f64 = 9_007_199_254_740_992.0; // 2^53
 
+/// The shortest decimal that round-trips to the same f32 (230.6999969… → 230.7).
+/// An f32 holds ~7 significant digits; decoding it to the nearest f64 would
+/// otherwise surface float noise in rules and display. Non-finite values pass through.
+pub fn f32_shortest(v: f64) -> f64 {
+    if !v.is_finite() {
+        return v;
+    }
+    format!("{}", v as f32).parse::<f64>().unwrap_or(v)
+}
+
 /// Engineering value for a raw register value.
 pub fn eng_from_raw(raw: f64, scale: f64, offset: f64) -> f64 {
     raw * scale + offset
@@ -171,6 +181,16 @@ mod tests {
         assert_eq!(effective_decimals(None, 1.0, 0.25, "u16"), 2);
         assert_eq!(effective_decimals(None, 0.1, -40.5, "i16"), 1);
         assert_eq!(effective_decimals(None, 0.1, 0.125, "i16"), 3);
+    }
+
+    #[test]
+    fn f32_shortest_drops_float_noise() {
+        assert_eq!(f32_shortest(230.7f32 as f64), 230.7);
+        assert_eq!(f32_shortest(23.3f32 as f64), 23.3);
+        assert_eq!(f32_shortest(49.95f32 as f64), 49.95);
+        assert_eq!(f32_shortest(35.5), 35.5);
+        assert!(f32_shortest(f64::NAN).is_nan());
+        assert_eq!(f32_shortest(f64::INFINITY), f64::INFINITY);
     }
 
     #[test]

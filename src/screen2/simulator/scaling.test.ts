@@ -79,6 +79,24 @@ describe("decodeRegisterRaw / liveValueText", () => {
     const words: Record<number, number> = { 10: 0x420e, 11: 0x0000 };
     expect(decodeRegisterRaw({ dataType: "f32", byteOrder: "ABCD", address: 10 }, (a) => words[a] ?? null)).toBe(35.5);
   });
+  it("decodes f32 to its shortest round-trip decimal (no float noise)", () => {
+    const f32Words = (v: number): Record<number, number> => {
+      const dv = new DataView(new ArrayBuffer(4));
+      dv.setFloat32(0, v);
+      return { 1: dv.getUint16(0), 2: dv.getUint16(2) };
+    };
+    for (const [v, text] of [[230.7, "230.7 V"], [23.3, "23.3 V"], [49.95, "49.95 V"]] as const) {
+      const w = f32Words(v);
+      expect(decodeRegisterRaw({ dataType: "f32", byteOrder: "ABCD", address: 1 }, (a) => w[a] ?? null)).toBe(v);
+      const snap = (_u: number, _f: number, a: number) => (a in w ? { valueWord: w[a], valueBit: null } : undefined);
+      expect(liveValueText({ unitId: 1, functionCode: 3, address: 1, dataType: "f32", unit: "V" }, snap)).toBe(text);
+    }
+    // f64 is untouched.
+    const dv = new DataView(new ArrayBuffer(8));
+    dv.setFloat64(0, 0.1 + 0.2);
+    const w64: Record<number, number> = { 0: dv.getUint16(0), 1: dv.getUint16(2), 2: dv.getUint16(4), 3: dv.getUint16(6) };
+    expect(decodeRegisterRaw({ dataType: "f64", address: 0 }, (a) => w64[a] ?? null)).toBe(0.1 + 0.2);
+  });
   it("is null when any word is missing", () => {
     expect(decodeRegisterRaw({ dataType: "u32", address: 10 }, (a) => (a === 10 ? 1 : null))).toBeNull();
   });

@@ -32,7 +32,7 @@ use tokio_modbus::prelude::*;
 use tokio_modbus::server::tcp::{accept_tcp_connection, Server};
 use tokio_modbus::server::Service;
 
-use crate::sim_scaling::{build_reg_meta, eng_from_raw, raw_from_eng, round_to, RegMetaMap};
+use crate::sim_scaling::{build_reg_meta, eng_from_raw, f32_shortest, raw_from_eng, round_to, RegMetaMap};
 
 /// Number of 16-bit words a data type occupies (1-, 2- and 4-word types).
 pub fn word_count(data_type: &str) -> usize {
@@ -2918,7 +2918,9 @@ fn read_typed(banks: &HashMap<u8, SimBanks>, unit: u8, bank: u8, addr: u16, data
     for i in 0..wc as u16 {
         words.push(read_word(banks, unit, bank, addr.wrapping_add(i))?);
     }
-    decode_value(data_type, byte_order, &words)
+    let v = decode_value(data_type, byte_order, &words)?;
+    // f32 → its shortest round-trip decimal so rules see 230.7, not 230.6999969.
+    Some(if data_type == "f32" { f32_shortest(v) } else { v })
 }
 
 /// Legacy path (target without register metadata). For single-word/bit targets (`data_type`
@@ -6659,6 +6661,29 @@ mod tests {
         // A hold "bool" on a word bank reads its word as-is.
         let meta = cmeta(&[(1, 3, 1, "bool", 1.0)]);
         assert_eq!(read_eng(&b, &meta, 1, 3, 1), Some(7.0));
+    }
+
+    #[test]
+    fn f32_reads_shortest_round_trip_so_set_value_conditions_fire() {
+        for v in [230.7, 23.3, 49.95] {
+            let mut b = banks1(&[(1, 3, 0, 0), (1, 3, 1, 0)]);
+            let meta = cmeta(&[(1, 3, 0, "f32", 1.0)]);
+            apply_timed_action(&mut b, &meta, &timed(Action::Set { unit: 1, bank: 3, address: 0, value: v }), 0);
+            assert_eq!(read_eng(&b, &meta, 1, 3, 0), Some(v), "f32 noise for {v}");
+            for op in [">=", "==", "<="] {
+                let rules = vec![cond_rule(1, Join::All, vec![cnd(1, 3, 0, op, v, 0.0)])];
+                let mut st = HashMap::new();
+                assert_eq!(eval_rules(&rules, &mut st, &b, &meta, 0.0, &[]).len(), 1, "{op} {v}");
+            }
+            // The legacy stored-type path (no meta) decodes the same way.
+            assert_eq!(read_typed(&b, 1, 3, 0, "f32", "ABCD"), Some(v));
+        }
+        // Scaled f32: raw 230.7 × 0.5 + 1 = 116.35.
+        let mut b = HashMap::new();
+        place_words(&mut b, 1, 4, 0, &encode_value("f32", "ABCD", 230.7).unwrap());
+        let mut meta = cmeta(&[(1, 4, 0, "f32", 0.5)]);
+        meta.get_mut(&(1, 4, 0)).unwrap().offset = 1.0;
+        assert_eq!(read_eng(&b, &meta, 1, 4, 0), Some(230.7 * 0.5 + 1.0));
     }
 
     #[tokio::test]

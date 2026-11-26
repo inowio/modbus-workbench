@@ -108,6 +108,20 @@ export function isIdentityScaling(reg: ScalableRegister): boolean {
   return s.scale === 1 && s.offset === 0;
 }
 
+/**
+ * The shortest decimal that round-trips to the same f32 (230.6999969… → 230.7),
+ * mirroring Rust `f32_shortest`. An f32 holds ~7 significant digits; without this
+ * the 6-decimal float display would show the noise. Non-finite values pass through.
+ */
+export function f32Shortest(x: number): number {
+  if (!Number.isFinite(x)) return x;
+  for (let p = 1; p <= 9; p++) {
+    const candidate = Number(x.toPrecision(p));
+    if (Math.fround(candidate) === x) return candidate;
+  }
+  return x;
+}
+
 function spanOf(dataType: string): number {
   if (dataType === "u64" || dataType === "i64" || dataType === "f64") return 4;
   if (dataType === "u32" || dataType === "i32" || dataType === "f32") return 2;
@@ -126,7 +140,9 @@ export function decodeRegisterRaw(
     words.push(w);
   }
   const res = decodeWordsInAddressOrder(reg.dataType, reg.byteOrder ?? "ABCD", words);
-  return res.ok ? Number(res.value) : null;
+  if (!res.ok) return null;
+  const value = Number(res.value);
+  return reg.dataType === "f32" ? f32Shortest(value) : value;
 }
 
 type SnapRow = { valueWord: number | null; valueBit: boolean | null } | undefined;
