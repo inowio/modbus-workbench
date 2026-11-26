@@ -146,17 +146,15 @@ export default function Screen2Layout() {
     void getCurrentWebviewWindow().setTitle(title);
   }, [workspaceName]);
 
+  // Leaving a workspace stops its Analyzer polling and TCP simulator and closes
+  // its connections (waiting until the serial port is really free), so another
+  // workspace or the slave scanner can open the same port straight away.
   async function disconnectAll(name: string) {
     if (!name.trim()) return;
     try {
-      await invoke<void>("modbus_tcp_disconnect", { name });
+      await invoke<void>("close_workspace_connections", { name });
     } catch {
-      // ignore
-    }
-    try {
-      await invoke<void>("modbus_rtu_disconnect", { name });
-    } catch {
-      // ignore
+      // ignore — best effort on the way out
     }
   }
 

@@ -77,8 +77,7 @@ function setupInvoke(options?: { logsPaneOpen?: boolean }) {
         return Promise.resolve();
       case "prune_app_logs":
         return Promise.resolve();
-      case "modbus_tcp_disconnect":
-      case "modbus_rtu_disconnect":
+      case "close_workspace_connections":
         return Promise.resolve();
       default:
         return Promise.resolve(null);
@@ -123,6 +122,27 @@ describe("Screen2Layout", () => {
         }),
       ),
     );
+  });
+
+  it("Exit Workspace closes the workspace's connections (polling, simulator, serial port)", async () => {
+    setupInvoke();
+    render(
+      <MemoryRouter initialEntries={["/app/UnitTest/workspace"]}>
+        <Routes>
+          <Route path="/app/:workspaceName/*" element={<Screen2Layout />}>
+            <Route path="workspace" element={<div />} />
+          </Route>
+          <Route path="/" element={<div>Picker</div>} />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    const [exitButton] = await screen.findAllByRole("button", { name: /exit workspace/i });
+    fireEvent.click(exitButton);
+
+    await screen.findByText("Picker");
+    expect(invokeMock).toHaveBeenCalledWith("close_workspace_connections", { name: "UnitTest" });
+    expect(invokeMock).not.toHaveBeenCalledWith("modbus_rtu_disconnect", expect.anything());
   });
 
   it("focus mode hides the sidebar navigation and the app header", async () => {

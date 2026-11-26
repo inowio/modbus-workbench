@@ -23,6 +23,7 @@ mod simulator;
 
 mod modbus;
 mod slave_scan;
+mod workspace_close;
 use modbus::{
     modbus_rtu_connect, modbus_rtu_diagnostics_echo, modbus_rtu_disconnect,
     modbus_rtu_mask_write_register, modbus_rtu_read_device_identification,
@@ -260,6 +261,7 @@ pub fn run() {
             simulator::simulator_delete_rule,
             simulator::simulator_start,
             simulator::simulator_stop,
+            workspace_close::close_workspace_connections,
             simulator::simulator_status,
             simulator::simulator_events,
             simulator::simulator_export_profile,

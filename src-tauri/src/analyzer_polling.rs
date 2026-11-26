@@ -34,6 +34,12 @@ impl AnalyzerPollingState {
         workers.get(ws.trim()).is_some_and(|h| !h.inner().is_finished())
     }
 
+    /// Removes and returns the polling worker for `ws`, if any.
+    pub(crate) fn take_worker(&self, ws: &str) -> Option<JoinHandle<()>> {
+        let mut workers = self.workers.lock().unwrap_or_else(|e| e.into_inner());
+        workers.remove(ws.trim())
+    }
+
     /// Registers a worker as if polling had started for `ws`.
     #[cfg(test)]
     pub(crate) fn insert_worker_for_test(&self, ws: &str, handle: JoinHandle<()>) {
@@ -1117,15 +1123,7 @@ pub fn stop_analyzer_polling(
         return Ok(());
     }
 
-    let handle = {
-        let mut guard = state
-            .workers
-            .lock()
-            .map_err(|_| "analyzer polling state lock poisoned".to_string())?;
-        guard.remove(&workspace)
-    };
-
-    if let Some(h) = handle {
+    if let Some(h) = state.take_worker(&workspace) {
         h.abort();
     }
 
