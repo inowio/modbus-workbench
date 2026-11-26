@@ -128,6 +128,13 @@ fn outcome_of(reply: tokio_modbus::Result<()>) -> ProbeOutcome {
     }
 }
 
+/// Windows `ERROR_OPERATION_ABORTED`: an overlapped read was cancelled, not a lost link.
+const ERROR_OPERATION_ABORTED: i32 = 995;
+
+fn is_aborted(reply: &tokio_modbus::Result<()>) -> bool {
+    matches!(reply, Err(Error::Transport(e)) if e.raw_os_error() == Some(ERROR_OPERATION_ABORTED))
+}
+
 fn is_decode_error(reply: &tokio_modbus::Result<()>) -> bool {
     matches!(reply, Err(Error::Transport(e)) if e.kind() == io::ErrorKind::InvalidData)
 }
@@ -209,7 +216,15 @@ impl Session {
 
     async fn request(&mut self, unit: u8, function_code: u8) -> tokio_modbus::Result<()> {
         self.ctx.set_slave(Slave(unit));
-        let reply = self.read_one(function_code).await;
+        let mut reply = self.read_one(function_code).await;
+        if is_aborted(&reply) {
+            // Windows aborted the read that was waiting on the port (os error
+            // 995) — some USB-serial drivers do that when the port's settings
+            // change. The link is fine: start clean and ask this unit once more.
+            self.ctx = (self.attach)();
+            self.ctx.set_slave(Slave(unit));
+            reply = self.read_one(function_code).await;
+        }
         if is_decode_error(&reply) {
             // After a decode error tokio-util's `Framed` ends its stream once,
             // so the next request would fail as if the link were gone. A
@@ -418,7 +433,12 @@ where
     }
 }
 
-/// Applies `params` to an open port and drops anything still buffered from the previous setting.
+/// Applies `params` to an open port.
+///
+/// It deliberately does not purge the port's buffers: on Windows that aborts
+/// the read already waiting on the port (os error 995). Stray bytes from the
+/// previous setting don't matter, because the Modbus client empties its read
+/// buffer before every request.
 fn reconfigure_serial(stream: &mut tokio_serial::SerialStream, params: &SerialParams) -> Result<(), String> {
     use tokio_serial::SerialPort;
     let setting = |e: tokio_serial::Error| format!("could not apply {}: {e}", format_settings(params));
@@ -435,7 +455,6 @@ fn reconfigure_serial(stream: &mut tokio_serial::SerialStream, params: &SerialPa
     stream
         .set_flow_control(parse_serial_flow_control(Some(params.flow_control.clone()))?)
         .map_err(setting)?;
-    stream.clear(tokio_serial::ClearBuffer::All).map_err(setting)?;
     Ok(())
 }
 
@@ -997,6 +1016,62 @@ mod tests {
             }
         });
         SerialProber::attach(ours)
+    }
+
+    /// A stream whose first `aborts` reads fail with os error 995, like a
+    /// Windows driver cancelling the pending read when port settings change.
+    struct Aborting<T> {
+        inner: T,
+        aborts: u32,
+    }
+
+    impl<T: AsyncRead + Unpin> AsyncRead for Aborting<T> {
+        fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            if self.aborts > 0 {
+                self.aborts -= 1;
+                return Poll::Ready(Err(io::Error::from_raw_os_error(ERROR_OPERATION_ABORTED)));
+            }
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl<T: AsyncWrite + Unpin> AsyncWrite for Aborting<T> {
+        fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, b: &[u8]) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.inner).poll_write(cx, b)
+        }
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    /// An RTU device at unit 1 behind a stream that aborts its first `aborts` reads.
+    fn aborting_device(aborts: u32) -> SerialProber {
+        let (ours, mut theirs) = tokio::io::duplex(256);
+        tokio::spawn(async move {
+            let mut req = [0u8; 8];
+            while theirs.read_exact(&mut req).await.is_ok() {
+                if req[0] == 1 && theirs.write_all(&rtu_frame(&[1, req[1], 2, 0, 42])).await.is_err() {
+                    return;
+                }
+            }
+        });
+        SerialProber::attach(Aborting { inner: ours, aborts })
+    }
+
+    #[tokio::test]
+    async fn a_read_aborted_once_is_asked_again() {
+        // The sweep's next setting: the driver aborted the waiting read (os error 995).
+        let mut p = aborting_device(1);
+        assert_eq!(p.read(1, 3, WAIT).await, ProbeOutcome::Value);
+    }
+
+    #[tokio::test]
+    async fn a_port_that_keeps_aborting_is_a_link_error() {
+        let mut p = aborting_device(u32::MAX);
+        assert!(matches!(p.read(1, 3, WAIT).await, ProbeOutcome::LinkError(_)));
     }
 
     #[tokio::test]
