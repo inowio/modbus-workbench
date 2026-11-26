@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 type SimConfig = { enabled: boolean; host: string; port: number; tickMs: number };
 type ListenInfo = { bound: string; port: number; addresses: string[] };
@@ -21,6 +21,56 @@ type Props = {
 };
 
 const CARD_CLASS = "rounded-2xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-white/5";
+
+/**
+ * Integer input that edits a local draft and commits only on blur/Enter when
+ * the draft is valid. Escape reverts. Invalid drafts show a red border + message.
+ */
+function DraftIntInput({
+  value, min, max, label, message, className, disabled, onCommit,
+}: {
+  value: number;
+  min: number;
+  max: number;
+  label: string;
+  message: string;
+  className: string;
+  disabled?: boolean;
+  onCommit: (n: number) => void;
+}) {
+  const [draft, setDraft] = useState(String(value));
+  useEffect(() => { setDraft(String(value)); }, [value]);
+
+  const trimmed = draft.trim();
+  const n = Number(trimmed);
+  const valid = /^\d+$/.test(trimmed) && n >= min && n <= max;
+  const invalid = !valid;
+
+  const commit = () => {
+    if (valid && n !== value) onCommit(n);
+  };
+
+  return (
+    <>
+      <input
+        type="text"
+        inputMode="numeric"
+        aria-label={label}
+        aria-invalid={invalid ? "true" : undefined}
+        className={`${className} ${invalid ? "border-rose-500 dark:border-rose-500" : "border-slate-300 dark:border-slate-700"}`}
+        value={draft}
+        disabled={disabled}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={commit}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") { e.preventDefault(); commit(); }
+          else if (e.key === "Escape") { e.preventDefault(); setDraft(String(value)); }
+        }}
+      />
+      {invalid ? <span role="alert" className="text-xs text-rose-600 dark:text-rose-300">{message}</span> : null}
+    </>
+  );
+}
 
 export default function SimStatusDashboard({
   config,
@@ -99,17 +149,18 @@ export default function SimStatusDashboard({
           {status.running ? (
             <p className="mt-1 text-sm text-slate-900 dark:text-slate-100">{config?.tickMs ?? 0} ms</p>
           ) : (
-            <label className="mt-1 flex items-center gap-2 text-sm">
-              <input
-                type="number"
-                aria-label="Tick interval (ms)"
-                className="min-w-0 flex-1 rounded-lg border border-slate-300 bg-white px-2 py-1 dark:border-slate-700 dark:bg-slate-900"
+            <div className="mt-1 flex flex-wrap items-center gap-2 text-sm">
+              <DraftIntInput
+                label="Tick interval (ms)"
                 value={config?.tickMs ?? 0}
-                min={1}
-                onChange={(e) => onSaveConfig({ tickMs: Number(e.target.value) })}
+                min={10}
+                max={60000}
+                message="Enter 10–60000 ms."
+                className="min-w-0 flex-1 rounded-lg border bg-white px-2 py-1 dark:bg-slate-900"
+                onCommit={(tickMs) => onSaveConfig({ tickMs })}
               />
               <span className="shrink-0 text-slate-500 dark:text-slate-400">ms</span>
-            </label>
+            </div>
           )}
         </div>
       </div>
@@ -138,15 +189,15 @@ export default function SimStatusDashboard({
 
           <label className="flex items-center gap-2 text-sm">
             Port
-            <input
-              type="number"
-              aria-label="Port"
-              className="w-24 rounded-lg border border-slate-300 bg-white px-2 py-1 dark:border-slate-700 dark:bg-slate-900"
+            <DraftIntInput
+              label="Port"
               value={port}
               min={1}
               max={65535}
+              message="Enter 1–65535."
+              className="w-24 rounded-lg border bg-white px-2 py-1 dark:bg-slate-900"
               disabled={status.running}
-              onChange={(e) => onChangePort(Number(e.target.value))}
+              onCommit={onChangePort}
             />
           </label>
 

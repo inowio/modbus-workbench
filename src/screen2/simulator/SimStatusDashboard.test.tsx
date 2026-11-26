@@ -24,4 +24,69 @@ describe("SimStatusDashboard", () => {
     expect(screen.getByText(/192\.168\.1\.10:502/)).toBeInTheDocument();
     expect(screen.getByText(/and 1 more/i)).toBeInTheDocument();
   });
+
+  describe("Port and Tick drafts", () => {
+    it("does not save per keystroke; saves a valid port on blur", () => {
+      const onChangePort = vi.fn();
+      render(<SimStatusDashboard {...base} onChangePort={onChangePort} />);
+      const port = screen.getByLabelText("Port");
+      fireEvent.change(port, { target: { value: "5" } });
+      fireEvent.change(port, { target: { value: "50" } });
+      fireEvent.change(port, { target: { value: "5020" } });
+      expect(onChangePort).not.toHaveBeenCalled();
+      fireEvent.blur(port);
+      expect(onChangePort).toHaveBeenCalledTimes(1);
+      expect(onChangePort).toHaveBeenCalledWith(5020);
+    });
+
+    it("saves on Enter", () => {
+      const onChangePort = vi.fn();
+      render(<SimStatusDashboard {...base} onChangePort={onChangePort} />);
+      const port = screen.getByLabelText("Port");
+      fireEvent.change(port, { target: { value: "1502" } });
+      fireEvent.keyDown(port, { key: "Enter" });
+      expect(onChangePort).toHaveBeenCalledWith(1502);
+    });
+
+    it("rejects an out-of-range port with a message and does not save", () => {
+      const onChangePort = vi.fn();
+      render(<SimStatusDashboard {...base} onChangePort={onChangePort} />);
+      const port = screen.getByLabelText("Port");
+      fireEvent.change(port, { target: { value: "70000" } });
+      fireEvent.blur(port);
+      expect(onChangePort).not.toHaveBeenCalled();
+      expect(port).toHaveAttribute("aria-invalid", "true");
+      expect(port.className).toMatch(/rose/);
+      expect(screen.getByText(/1.65535/)).toBeInTheDocument();
+    });
+
+    it("reverts the draft on Escape", () => {
+      render(<SimStatusDashboard {...base} />);
+      const port = screen.getByLabelText("Port") as HTMLInputElement;
+      fireEvent.change(port, { target: { value: "70000" } });
+      fireEvent.keyDown(port, { key: "Escape" });
+      expect(port.value).toBe("502");
+      expect(port).not.toHaveAttribute("aria-invalid", "true");
+    });
+
+    it("validates tick 10-60000 and saves valid values on blur", () => {
+      const onSaveConfig = vi.fn();
+      render(<SimStatusDashboard {...base} onSaveConfig={onSaveConfig} />);
+      const tick = screen.getByLabelText("Tick interval (ms)");
+      fireEvent.change(tick, { target: { value: "5" } });
+      fireEvent.blur(tick);
+      expect(onSaveConfig).not.toHaveBeenCalled();
+      expect(screen.getByText(/10.60000/)).toBeInTheDocument();
+      fireEvent.change(tick, { target: { value: "250" } });
+      fireEvent.blur(tick);
+      expect(onSaveConfig).toHaveBeenCalledWith({ tickMs: 250 });
+    });
+
+    it("does not re-save an unchanged value", () => {
+      const onChangePort = vi.fn();
+      render(<SimStatusDashboard {...base} onChangePort={onChangePort} />);
+      fireEvent.blur(screen.getByLabelText("Port"));
+      expect(onChangePort).not.toHaveBeenCalled();
+    });
+  });
 });
