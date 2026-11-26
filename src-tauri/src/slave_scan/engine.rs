@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 use serde::Serialize;
@@ -22,7 +22,7 @@ use super::types::{
 };
 
 const FLOOD_THRESHOLD: usize = 16;
-const PROGRESS_GAP: Duration = Duration::from_millis(100);
+pub(crate) const PROGRESS_GAP: Duration = Duration::from_millis(100);
 
 const TCP_FLOOD_NOTICE: &str =
     "This device answers every unit ID — it probably ignores the unit ID; use 1 (or 255)";
@@ -114,6 +114,15 @@ pub struct ScanCurrent {
     pub settings: Option<SerialParams>,
 }
 
+/// Which stage a progress event belongs to. Only IP range scans have a
+/// `hosts` stage (finding open hosts); every unit-ID check is `units`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ScanPhase {
+    Units,
+    Hosts,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScanProgress {
@@ -122,6 +131,11 @@ pub struct ScanProgress {
     pub checked: u64,
     pub total: u64,
     pub current: ScanCurrent,
+    pub phase: ScanPhase,
+    /// IP range unit checks only: the checked host's place (from 1) among
+    /// the open hosts, and how many open hosts there are.
+    pub host_index: Option<u32>,
+    pub host_count: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -144,6 +158,32 @@ pub struct ScanDone {
     pub found: u64,
 }
 
+/// What an IP range scan knows about one host: `open` as soon as it accepts
+/// a connection, then its final status once its unit IDs are scanned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum HostStatus {
+    Open,
+    Devices,
+    AnswersAll,
+    Gateway,
+    NoModbus,
+    Lost,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScanHost {
+    pub workspace: String,
+    pub scan_id: String,
+    /// "ip:port"
+    pub host: String,
+    pub status: HostStatus,
+    pub connect_ms: Option<u64>,
+    pub found: u64,
+    pub gateway: bool,
+}
+
 /// Receives scan events. Calls are synchronous and must not block for long:
 /// progress is sent while a short-lived std mutex is held so events stay in
 /// order.
@@ -151,6 +191,7 @@ pub trait ScanSink: Send + Sync + 'static {
     fn found(&self, e: ScanFound);
     fn progress(&self, e: ScanProgress);
     fn notice(&self, e: ScanNotice);
+    fn host(&self, e: ScanHost);
     fn done(&self, e: ScanDone);
 }
 
@@ -223,23 +264,97 @@ struct ProgressState {
     last_checked_sent: u64,
 }
 
-struct Ctx<S: ScanSink> {
-    workspace: String,
-    scan_id: String,
+/// The open hosts of an IP range scan, by "ip:port" target.
+struct HostIndex {
+    by_target: HashMap<String, u32>,
+    count: u32,
+}
+
+/// State shared by every task of one scan: the sink, the scan-wide counters
+/// and the unit-check progress throttle. Per-host state (pool, flood guard,
+/// gateway) lives in each host's `Pool`.
+pub(crate) struct Ctx<S: ScanSink> {
+    pub(crate) workspace: String,
+    pub(crate) scan_id: String,
     sink: Arc<S>,
     /// Grows when a TCP scan re-checks units after spotting a gateway.
-    total: AtomicU64,
-    checked: AtomicU64,
-    found: AtomicU64,
+    pub(crate) total: AtomicU64,
+    pub(crate) checked: AtomicU64,
+    pub(crate) found: AtomicU64,
     progress: Mutex<ProgressState>,
-    cancel_seen: AtomicBool,
+    pub(crate) cancel_seen: AtomicBool,
     /// Serial: whether any open succeeded, and the first open failure.
     opened_any: AtomicBool,
     first_open_error: Mutex<Option<String>>,
+    /// IP range scans: set once, before the unit checks start.
+    hosts: OnceLock<HostIndex>,
 }
 
 impl<S: ScanSink> Ctx<S> {
-    fn notice(&self, message: String) {
+    pub(crate) fn new(workspace: String, scan_id: String, sink: Arc<S>, total: u64) -> Self {
+        Self {
+            workspace,
+            scan_id,
+            sink,
+            total: AtomicU64::new(total),
+            checked: AtomicU64::new(0),
+            found: AtomicU64::new(0),
+            progress: Mutex::new(ProgressState {
+                throttle: ProgressThrottle::new(PROGRESS_GAP),
+                last_checked_sent: 0,
+            }),
+            cancel_seen: AtomicBool::new(false),
+            opened_any: AtomicBool::new(false),
+            first_open_error: Mutex::new(None),
+            hosts: OnceLock::new(),
+        }
+    }
+
+    /// IP range scans: the open hosts' targets in order, so unit-check
+    /// progress can say which host (from 1) it is about.
+    pub(crate) fn set_hosts(&self, targets: &[String]) {
+        let by_target: HashMap<String, u32> =
+            targets.iter().zip(1u32..).map(|(t, i)| (t.clone(), i)).collect();
+        let count = u32::try_from(targets.len()).unwrap_or(u32::MAX);
+        // Set once per scan; a second call would be a bug and is ignored.
+        let _ = self.hosts.set(HostIndex { by_target, count });
+    }
+
+    pub(crate) fn host(
+        &self,
+        host: String,
+        status: HostStatus,
+        connect_ms: Option<u64>,
+        found: u64,
+        gateway: bool,
+    ) {
+        self.sink.host(ScanHost {
+            workspace: self.workspace.clone(),
+            scan_id: self.scan_id.clone(),
+            host,
+            status,
+            connect_ms,
+            found,
+            gateway,
+        });
+    }
+
+    /// Sends an IP range scan's host-finding progress as is; the caller
+    /// throttles it.
+    pub(crate) fn hosts_progress(&self, checked: u64, total: u64, target: String) {
+        self.sink.progress(ScanProgress {
+            workspace: self.workspace.clone(),
+            scan_id: self.scan_id.clone(),
+            checked,
+            total,
+            current: ScanCurrent { target, unit_id: 0, settings: None },
+            phase: ScanPhase::Hosts,
+            host_index: None,
+            host_count: None,
+        });
+    }
+
+    pub(crate) fn notice(&self, message: String) {
         self.sink.notice(ScanNotice {
             workspace: self.workspace.clone(),
             scan_id: self.scan_id.clone(),
@@ -247,7 +362,7 @@ impl<S: ScanSink> Ctx<S> {
         });
     }
 
-    fn saw_cancel(&self) {
+    pub(crate) fn saw_cancel(&self) {
         self.cancel_seen.store(true, Ordering::SeqCst);
     }
 
@@ -303,6 +418,10 @@ impl<S: ScanSink> Ctx<S> {
             return;
         }
         st.last_checked_sent = checked;
+        let (host_index, host_count) = match self.hosts.get() {
+            Some(h) => (h.by_target.get(target).copied(), Some(h.count)),
+            None => (None, None),
+        };
         self.sink.progress(ScanProgress {
             workspace: self.workspace.clone(),
             scan_id: self.scan_id.clone(),
@@ -313,6 +432,9 @@ impl<S: ScanSink> Ctx<S> {
                 unit_id: unit,
                 settings: settings.cloned(),
             },
+            phase: ScanPhase::Units,
+            host_index,
+            host_count,
         });
     }
 }
@@ -336,21 +458,7 @@ pub async fn run_scan<O: Opener, C: Connector, S: ScanSink>(
         ScanKind::Serial => units * scan.combos.len() as u64 * scan.ports.len() as u64,
         ScanKind::Tcp | ScanKind::TcpRange => units,
     };
-    let ctx = Arc::new(Ctx {
-        workspace,
-        scan_id: scan.scan_id.clone(),
-        sink,
-        total: AtomicU64::new(total),
-        checked: AtomicU64::new(0),
-        found: AtomicU64::new(0),
-        progress: Mutex::new(ProgressState {
-            throttle: ProgressThrottle::new(PROGRESS_GAP),
-            last_checked_sent: 0,
-        }),
-        cancel_seen: AtomicBool::new(false),
-        opened_any: AtomicBool::new(false),
-        first_open_error: Mutex::new(None),
-    });
+    let ctx = Arc::new(Ctx::new(workspace, scan.scan_id.clone(), sink, total));
     let scan = Arc::new(scan);
 
     let result = match scan.kind {
@@ -359,8 +467,8 @@ pub async fn run_scan<O: Opener, C: Connector, S: ScanSink>(
             Some(c) => scan_tcp_pool(scan, ctx.clone(), c, cancel).await,
             None => Err("internal error: no TCP connector for a TCP scan".to_string()),
         },
-        // The range engine arrives in a later task (Task 2).
-        ScanKind::TcpRange => Err("IP range scans are not available yet".to_string()),
+        // Range scans have their own entry point, `range::run_range_scan`.
+        ScanKind::TcpRange => Err("internal error: range scans use run_range_scan".to_string()),
     };
 
     // A serial scan that could not open any port at any setting failed.
@@ -539,12 +647,18 @@ struct PoolState {
     suspects: Vec<u8>,
     /// Units already put back once for a re-check.
     rechecked: HashSet<u8>,
+    /// This host's found units (the scan-wide count is `Ctx.found`).
+    found: u64,
+    /// Some check got an answer of any kind (found, gateway or garbled).
+    any_reply: bool,
 }
 
 struct Pool {
     state: Mutex<PoolState>,
     /// Wakes idle workers when a unit is put back, finishes, or the pool stops.
     changed: Notify,
+    /// Put in front of this pool's notices (IP range scans: "ip:port: ").
+    notice_prefix: Option<Arc<str>>,
 }
 
 enum Take {
@@ -591,7 +705,7 @@ struct Finished {
 
 impl Pool {
     /// Worker 0 is already connected (live); all `workers` are unsettled.
-    fn new(units: VecDeque<u8>, workers: usize) -> Self {
+    fn new(units: VecDeque<u8>, workers: usize, notice_prefix: Option<Arc<str>>) -> Self {
         Self {
             state: Mutex::new(PoolState {
                 queue: units,
@@ -606,9 +720,21 @@ impl Pool {
                 gateway: false,
                 suspects: Vec::new(),
                 rechecked: HashSet::new(),
+                found: 0,
+                any_reply: false,
             }),
             changed: Notify::new(),
+            notice_prefix,
         }
+    }
+
+    /// Sends one of this pool's notices, prefixed when the pool has a prefix.
+    fn notice<S: ScanSink>(&self, ctx: &Ctx<S>, message: &str) {
+        let message = match &self.notice_prefix {
+            Some(prefix) => format!("{prefix}{message}"),
+            None => message.to_string(),
+        };
+        ctx.notice(message);
     }
 
     fn try_take(&self) -> Take {
@@ -695,6 +821,12 @@ impl Pool {
         let result = {
             let mut st = lock(&self.state);
             let overlapped = ticket.close(&mut st);
+            if category.is_some() {
+                st.any_reply = true;
+            }
+            if category == Some(Category::Found) {
+                st.found += 1;
+            }
             let flooded = st.flood.record(category) == FloodVerdict::AllFound;
             let mut recheck = Vec::new();
             if no_reply && overlapped && !st.rechecked.contains(&unit) {
@@ -782,9 +914,27 @@ fn control_unit(units: &[u8]) -> Option<u8> {
     (0..=255u8).rev().find(|u| !units.contains(u))
 }
 
-fn send_fallback_notice<S: ScanSink>(ctx: &Ctx<S>, due: Option<usize>) {
+fn send_fallback_notice<S: ScanSink>(ctx: &Ctx<S>, pool: &Pool, due: Option<usize>) {
     if let Some(n) = due {
-        ctx.notice(tcp_fallback_notice(n));
+        pool.notice(ctx, &tcp_fallback_notice(n));
+    }
+}
+
+/// How one host's unit-ID scan ended. `found`, `gateway`, `answers_all` and
+/// `any_reply` describe this host only, and are filled in on every path.
+pub(crate) struct HostOutcome {
+    pub(crate) result: Result<(), String>,
+    pub(crate) found: u64,
+    pub(crate) gateway: bool,
+    /// The host answered the control unit too: it ignores the unit ID.
+    pub(crate) answers_all: bool,
+    /// Some check got an answer of any kind.
+    pub(crate) any_reply: bool,
+}
+
+impl HostOutcome {
+    fn nothing(result: Result<(), String>) -> Self {
+        Self { result, found: 0, gateway: false, answers_all: false, any_reply: false }
     }
 }
 
@@ -792,24 +942,41 @@ async fn scan_tcp_pool<C: Connector, S: ScanSink>(
     scan: Arc<ValidScan>,
     ctx: Arc<Ctx<S>>,
     connector: Arc<C>,
-    mut cancel: Cancel,
+    cancel: Cancel,
 ) -> Result<(), String> {
     let target: Arc<str> = match &scan.tcp {
         Some(t) => format!("{}:{}", t.host, t.port).into(),
         None => return Err("internal error: TCP scan without a target".to_string()),
     };
+    scan_tcp_host(scan, ctx, connector, target, None, cancel).await.result
+}
+
+/// Scans the unit IDs of one TCP host with its own worker pool, flood guard
+/// and gateway state. Unit checks are counted and reported through `ctx`;
+/// this host's own counts come back in the outcome.
+pub(crate) async fn scan_tcp_host<C: Connector, S: ScanSink>(
+    scan: Arc<ValidScan>,
+    ctx: Arc<Ctx<S>>,
+    connector: Arc<C>,
+    target: Arc<str>,
+    notice_prefix: Option<Arc<str>>,
+    mut cancel: Cancel,
+) -> HostOutcome {
     let first = tokio::select! {
         biased;
         _ = cancel.cancelled() => {
             ctx.saw_cancel();
-            return Ok(());
+            return HostOutcome::nothing(Ok(()));
         }
         r = connector.connect() => r,
     };
-    let first = first.map_err(|e| format!("could not connect to {target}: {e}"))?;
+    let first = match first {
+        Ok(p) => p,
+        Err(e) => return HostOutcome::nothing(Err(format!("could not connect to {target}: {e}"))),
+    };
 
     let workers = scan.concurrency.min(scan.units.len()).max(1);
-    let pool = Arc::new(Pool::new(scan.units.iter().copied().collect(), workers));
+    let pool = Arc::new(Pool::new(scan.units.iter().copied().collect(), workers, notice_prefix));
     let mut set = JoinSet::new();
     set.spawn(tcp_worker(
         first,
@@ -829,14 +996,24 @@ async fn scan_tcp_pool<C: Connector, S: ScanSink>(
             cancel.clone(),
         ));
     }
-    join_all(&mut set).await?;
+    let joined = join_all(&mut set).await;
 
     let st = lock(&pool.state);
-    if !st.stopped && !st.queue.is_empty() && !ctx.cancel_seen.load(Ordering::SeqCst) {
-        let err = st.last_error.as_deref().unwrap_or("connection lost");
-        return Err(format!("{target} stopped responding: {err}"));
+    let result = joined.and_then(|()| {
+        if !st.stopped && !st.queue.is_empty() && !ctx.cancel_seen.load(Ordering::SeqCst) {
+            let err = st.last_error.as_deref().unwrap_or("connection lost");
+            return Err(format!("{target} stopped responding: {err}"));
+        }
+        Ok(())
+    });
+    HostOutcome {
+        result,
+        found: st.found,
+        gateway: st.gateway,
+        // The pool is only stopped when the control unit answered too.
+        answers_all: st.stopped,
+        any_reply: st.any_reply,
     }
-    Ok(())
 }
 
 async fn tcp_connect_then_work<C: Connector, S: ScanSink>(
@@ -855,11 +1032,11 @@ async fn tcp_connect_then_work<C: Connector, S: ScanSink>(
     match connected {
         None => {
             ctx.saw_cancel();
-            send_fallback_notice(&ctx, pool.settle());
+            send_fallback_notice(&ctx, &pool, pool.settle());
         }
         Some(Err(e)) => {
             log::info!("slave scan: extra connection to {target} refused: {e}");
-            send_fallback_notice(&ctx, pool.connect_failed());
+            send_fallback_notice(&ctx, &pool, pool.connect_failed());
         }
         Some(Ok(prober)) => {
             pool.connected();
@@ -919,7 +1096,7 @@ async fn tcp_worker<P: Prober, S: ScanSink>(
             }
             Some((ProbeOutcome::LinkError(e), _, _)) => {
                 log::info!("slave scan: connection to {target} lost: {e}");
-                send_fallback_notice(&ctx, pool.retire(ticket, e, !settled));
+                send_fallback_notice(&ctx, &pool, pool.retire(ticket, e, !settled));
                 return;
             }
             Some((outcome, fc, ms)) => {
@@ -928,16 +1105,16 @@ async fn tcp_worker<P: Prober, S: ScanSink>(
                 let fin = pool.finish(ticket, no_reply, category, !settled, &ctx.total);
                 settled = true;
                 ctx.record(&target, unit, None, &outcome, fc, ms);
-                send_fallback_notice(&ctx, fin.notice);
+                send_fallback_notice(&ctx, &pool, fin.notice);
                 if fin.gateway_now {
-                    ctx.notice(GATEWAY_NOTICE.to_string());
+                    pool.notice(&ctx, GATEWAY_NOTICE);
                 }
                 if fin.flooded {
                     match check_control(&mut prober, &scan, &mut cancel).await {
                         Control::Continue => {}
                         Control::Stop => {
                             pool.stop();
-                            ctx.notice(TCP_FLOOD_NOTICE.to_string());
+                            pool.notice(&ctx, TCP_FLOOD_NOTICE);
                         }
                         Control::Cancelled => {
                             ctx.saw_cancel();
@@ -949,7 +1126,7 @@ async fn tcp_worker<P: Prober, S: ScanSink>(
         }
     }
     if !settled {
-        send_fallback_notice(&ctx, pool.settle());
+        send_fallback_notice(&ctx, &pool, pool.settle());
     }
 }
 
@@ -1181,6 +1358,7 @@ mod tests {
         Found(ScanFound),
         Progress(ScanProgress),
         Notice(ScanNotice),
+        Host(ScanHost),
         Done(ScanDone),
     }
 
@@ -1198,6 +1376,9 @@ mod tests {
         }
         fn notice(&self, e: ScanNotice) {
             self.events.lock().unwrap().push(Ev::Notice(e));
+        }
+        fn host(&self, e: ScanHost) {
+            self.events.lock().unwrap().push(Ev::Host(e));
         }
         fn done(&self, e: ScanDone) {
             self.events.lock().unwrap().push(Ev::Done(e));
@@ -1291,6 +1472,14 @@ mod tests {
             events.iter().filter_map(|e| if let Ev::Done(d) = e { Some(d) } else { None }).collect();
         assert_eq!(dones.len(), 1, "exactly one done event");
         assert!(matches!(events.last(), Some(Ev::Done(_))), "done is the last event");
+        let hosts: Vec<&ScanHost> =
+            events.iter().filter_map(|e| if let Ev::Host(h) = e { Some(h) } else { None }).collect();
+        assert!(hosts.is_empty(), "only range scans send host events: {hosts:?}");
+        assert!(
+            events.iter().all(|e| !matches!(e, Ev::Progress(p)
+                if p.phase != ScanPhase::Units || p.host_index.is_some() || p.host_count.is_some())),
+            "single-host and serial progress is phase units, without host fields"
+        );
         Run { done, events }
     }
 
@@ -1881,6 +2070,9 @@ mod tests {
             checked: 1,
             total: 2,
             current: ScanCurrent { target: "t".into(), unit_id: 1, settings: Some(combo(9600, "none")) },
+            phase: ScanPhase::Units,
+            host_index: None,
+            host_count: None,
         };
         let v = serde_json::to_value(&p).unwrap();
         assert_eq!(v["current"]["unitId"], 1);

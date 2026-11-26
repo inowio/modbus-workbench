@@ -616,7 +616,7 @@ impl Prober for TcpProber {
 mod tests {
     use super::*;
     use crate::slave_scan::engine::{
-        cancel_pair, run_scan, ScanDone, ScanFound, ScanNotice, ScanProgress, ScanSink,
+        cancel_pair, run_scan, ScanDone, ScanFound, ScanHost, ScanNotice, ScanProgress, ScanSink,
     };
     use crate::slave_scan::types::{Category, ProbeKind, ScanKind, TcpTarget, ValidScan};
     use std::future;
@@ -1126,6 +1126,7 @@ mod tests {
         }
         fn progress(&self, _e: ScanProgress) {}
         fn notice(&self, _e: ScanNotice) {}
+        fn host(&self, _e: ScanHost) {}
         fn done(&self, e: ScanDone) {
             self.done.lock().unwrap().push(e);
         }

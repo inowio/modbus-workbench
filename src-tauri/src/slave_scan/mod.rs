@@ -3,6 +3,10 @@
 //! [`transport`].
 
 pub mod engine;
+// `run_range_scan` and its traits are wired into `start_slave_scan` next
+// (TcpReach, the per-host connector factory); until then nothing calls them.
+#[allow(dead_code)]
+pub mod range;
 pub mod transport;
 pub mod types;
 
@@ -23,7 +27,7 @@ use crate::modbus::{
 use crate::settings::get_client_settings;
 use crate::workspace::validate_workspace_name;
 use engine::{
-    cancel_pair, run_scan, Cancel, Connector, Opener, ScanDone, ScanFound, ScanNotice,
+    cancel_pair, run_scan, Cancel, Connector, Opener, ScanDone, ScanFound, ScanHost, ScanNotice,
     ScanProgress, ScanSink,
 };
 use transport::{SerialOpener, TcpConnector};
@@ -126,6 +130,9 @@ impl ScanSink for AppSink {
     }
     fn notice(&self, e: ScanNotice) {
         self.emit("slave_scan_notice", e);
+    }
+    fn host(&self, e: ScanHost) {
+        self.emit("slave_scan_host", e);
     }
     fn done(&self, e: ScanDone) {
         self.emit("slave_scan_done", e);
@@ -397,6 +404,7 @@ mod tests {
         fn found(&self, _e: ScanFound) {}
         fn progress(&self, _e: ScanProgress) {}
         fn notice(&self, _e: ScanNotice) {}
+        fn host(&self, _e: ScanHost) {}
         fn done(&self, e: ScanDone) {
             self.0.lock().unwrap().push(e);
         }
@@ -549,6 +557,7 @@ mod tests {
         fn found(&self, _e: ScanFound) {}
         fn progress(&self, _e: ScanProgress) {}
         fn notice(&self, _e: ScanNotice) {}
+        fn host(&self, _e: ScanHost) {}
         fn done(&self, e: ScanDone) {
             let flag_clear = !self.scanning.lock().unwrap().contains_key("ws");
             let entry_clear = !lock_scans(&self.scans).contains_key("ws");
