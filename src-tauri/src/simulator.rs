@@ -363,9 +363,32 @@ pub fn dyn_value(d: &DynReg, elapsed_ms: f64) -> f64 {
     }
 }
 
+/// Overwrite `words` at consecutive addresses starting at `address`, but ONLY
+/// where an address is already configured: a missing unit is a no-op and a
+/// missing address inside the span is skipped. This is the runtime write path
+/// (rule actions, generator/device/route updates) — nothing but configured
+/// registers ever exists, and a register deleted or moved while the tick was
+/// computing its value is not resurrected ("ghost register"). Seeding
+/// (`registers_to_banks`, `apply_to_running`) uses `place_words` instead.
+pub fn update_existing_words(banks: &mut HashMap<u8, SimBanks>, unit: u8, bank: u8, address: u16, words: &[u16]) {
+    let Some(b) = banks.get_mut(&unit) else { return };
+    for (i, &w) in words.iter().enumerate() {
+        let Ok(addr) = u16::try_from(address as usize + i) else { break };
+        match bank {
+            1 => { if let Some(slot) = b.coils.get_mut(&addr) { *slot = w != 0; } }
+            2 => { if let Some(slot) = b.discrete_inputs.get_mut(&addr) { *slot = w != 0; } }
+            3 => { if let Some(slot) = b.holding.get_mut(&addr) { *slot = w; } }
+            4 => { if let Some(slot) = b.input.get_mut(&addr) { *slot = w; } }
+            _ => {}
+        }
+    }
+}
+
 /// Write `words` at consecutive addresses starting at `address`, in the bank
 /// selected by Modbus function code (1=coils, 2=discrete inputs, 3=holding,
-/// 4=input). Bit banks store a word as `!= 0`.
+/// 4=input), CREATING the unit/addresses as needed. Bit banks store a word as
+/// `!= 0`. Only for seeding configured registers — runtime updates go through
+/// `update_existing_words`.
 pub fn place_words(banks: &mut HashMap<u8, SimBanks>, unit: u8, bank: u8, address: u16, words: &[u16]) {
     let b = banks.entry(unit).or_default();
     for (i, &w) in words.iter().enumerate() {
@@ -930,7 +953,7 @@ impl SimEngine {
                         {
                             let Ok(mut guard) = tick_banks.write() else { continue };
                             for (u, b, a, w) in &updates {
-                                place_words(&mut guard, *u, *b, *a, w);
+                                update_existing_words(&mut guard, *u, *b, *a, w);
                             }
                             // Rules run last, synchronously, under the same
                             // write lock: they see this tick's generator/route
@@ -2351,25 +2374,24 @@ pub fn read_word(banks: &HashMap<u8, SimBanks>, unit: u8, bank: u8, addr: u16) -
 }
 
 /// Apply a rule `Action` to the in-memory banks, mutating the target
-/// word/bit. `Set`/`Toggle`/`Inc`/`Dec`/`Randomize` upsert the target
-/// (created if absent, default current value `0`); `Copy` and `Inc`/`Dec`
-/// no-op if their source isn't present (documented limitation — there is
-/// nothing sensible to increment/copy from). `Randomize` uses the
-/// deterministic `unit_random(rng_seed)` from Plan 2.
+/// word/bit. Writes go through `update_existing_words`: an action whose
+/// target unit/address isn't configured does nothing (it never creates a
+/// register). `Copy` also no-ops if its source isn't present. `Randomize` uses
+/// the deterministic `unit_random(rng_seed)`.
 pub fn apply_action(banks: &mut HashMap<u8, SimBanks>, action: &Action, rng_seed: u64) {
     match *action {
         Action::Set { unit, bank, address, value } => {
-            place_words(banks, unit, bank, address, &[value as u16]);
+            update_existing_words(banks, unit, bank, address, &[value as u16]);
         }
         Action::Inc { unit, bank, address, by } => {
             let cur = read_word(banks, unit, bank, address).unwrap_or(0);
             let next = cur.wrapping_add(by as u16);
-            place_words(banks, unit, bank, address, &[next]);
+            update_existing_words(banks, unit, bank, address, &[next]);
         }
         Action::Dec { unit, bank, address, by } => {
             let cur = read_word(banks, unit, bank, address).unwrap_or(0);
             let next = cur.wrapping_sub(by as u16);
-            place_words(banks, unit, bank, address, &[next]);
+            update_existing_words(banks, unit, bank, address, &[next]);
         }
         Action::Toggle { unit, bank, address } => {
             let cur = read_word(banks, unit, bank, address).unwrap_or(0);
@@ -2377,18 +2399,18 @@ pub fn apply_action(banks: &mut HashMap<u8, SimBanks>, action: &Action, rng_seed
                 1 | 2 => if cur != 0 { 0 } else { 1 },
                 _ => if cur == 0 { 1 } else { 0 },
             };
-            place_words(banks, unit, bank, address, &[next]);
+            update_existing_words(banks, unit, bank, address, &[next]);
         }
         Action::Copy { src_unit, src_bank, src_addr, unit, bank, address, scale, offset } => {
             if let Some(src) = read_word(banks, src_unit, src_bank, src_addr) {
                 let next = ((src as f64) * scale + offset) as i64 as u16;
-                place_words(banks, unit, bank, address, &[next]);
+                update_existing_words(banks, unit, bank, address, &[next]);
             }
         }
         Action::Randomize { unit, bank, address, min, max } => {
             let span = (max - min + 1).max(1);
             let value = min + (unit_random(rng_seed) * span as f64) as i64;
-            place_words(banks, unit, bank, address, &[value as u16]);
+            update_existing_words(banks, unit, bank, address, &[value as u16]);
         }
     }
 }
@@ -2451,7 +2473,7 @@ pub fn apply_timed_action(banks: &mut HashMap<u8, SimBanks>, ta: &TimedAction, r
         Action::Toggle { .. } => { apply_action(banks, &ta.action, rng_seed); return; }
     };
     if let Ok(words) = encode_value(dt, bo, result) {
-        place_words(banks, unit, bank, address, &words);
+        update_existing_words(banks, unit, bank, address, &words);
     }
 }
 
@@ -2488,7 +2510,7 @@ fn compare(cur: i64, op: &str, value: i64, last_value: Option<i64>) -> bool {
 ///   `next_due = elapsed_ms + ms`.
 /// - `Condition`: edge-fired — reads the current word/bit, compares it, and
 ///   fires only on the false→true transition; `last_condition`/`last_value`
-///   are updated every call (fired or not).
+///   are updated every call (fired or not). A missing register is "not met".
 /// - `OnWrite`: fires if any drained write matches `unit`/`bank`, and either
 ///   `address` is `None` (match-any) or equals the write's address.
 pub fn eval_rules(
@@ -2511,7 +2533,16 @@ pub fn eval_rules(
                 }
             }
             Trigger::Condition { unit, bank, address, op, value } => {
-                let cur = read_word(banks, *unit, *bank, *address).unwrap_or(0) as i64;
+                // A condition on a register that doesn't exist is "not met"
+                // (it never fires) rather than reading as 0. Its history is
+                // reset so `changed` treats a later appearance as a first
+                // observation.
+                let Some(cur) = read_word(banks, *unit, *bank, *address) else {
+                    state.last_condition = false;
+                    state.last_value = None;
+                    continue;
+                };
+                let cur = cur as i64;
                 let c = compare(cur, op, *value, state.last_value);
                 let fired = if op == "changed" {
                     // `changed` is itself a transition, not a level to be
@@ -3915,7 +3946,8 @@ mod tests {
     #[test]
     fn timed_action_sets_multi_word_register() {
         // A `set` targeting an f32 holding register writes 2 words (ABCD).
-        let mut b = HashMap::new();
+        // The register must be configured (seeded) — actions never create.
+        let mut b = banks1(&[(1, 3, 10, 0), (1, 3, 11, 0)]);
         let one = TimedAction {
             action: Action::Set { unit: 1, bank: 3, address: 10, value: 1 },
             delay_ms: 0.0, data_type: "f32".into(), byte_order: "ABCD".into(),
@@ -3929,7 +3961,7 @@ mod tests {
     #[test]
     fn timed_action_inc_reads_and_writes_multi_word() {
         // Seed an f32 register = 10.0, inc by 5 → 15.0.
-        let mut b = HashMap::new();
+        let mut b = banks1(&[(1, 3, 0, 0), (1, 3, 1, 0)]);
         let seed = TimedAction { action: Action::Set { unit: 1, bank: 3, address: 0, value: 10 }, delay_ms: 0.0, data_type: "f32".into(), byte_order: "ABCD".into() };
         apply_timed_action(&mut b, &seed, 0);
         let inc = TimedAction { action: Action::Inc { unit: 1, bank: 3, address: 0, by: 5 }, ..seed.clone() };
@@ -4377,7 +4409,12 @@ mod tests {
             interval_ms: 50, sort_order: 0, device_instance_id: None,
             unit: None, display_format: None,
         };
-        engine.set_dynamics([reg].iter().filter_map(parse_dynamic).collect());
+        // Mirror `simulator_add_register` → `apply_to_running`: seed the
+        // register's t=0 words (the only path that creates addresses), then
+        // hand the tick its new live list.
+        let d = parse_dynamic(&reg).unwrap();
+        engine.apply_words(1, 4, 0, &encode_value(&d.data_type, &d.byte_order, dyn_value(&d, 0.0)).unwrap());
+        engine.set_dynamics(vec![d]);
 
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         let first = client.read_input_registers(0, 2).await.unwrap().unwrap();
@@ -4535,8 +4572,12 @@ mod tests {
             unit: 1, bank: 3, address: 0, data_type: "u16".into(), byte_order: "ABCD".into(), interval_ms: 50.0,
             kind: DynKind::Route { slave_unit: 7, connection_kind: "tcp".into(), src_fc: 3, src_addr: 0, count: 1, scale: 1.0, offset: 0.0, src_byte_order: "ABCD".into() },
         };
+        // Start seeds every configured register (route ones at 0), as
+        // `registers_to_banks` does; the route only ever updates it.
+        let mut bbanks = HashMap::new();
+        place_words(&mut bbanks, 1, 3, 0, &[0]);
         let mut b = SimEngine::new();
-        let binfo = b.start(NoopSink, "ws".into(), "127.0.0.1", 0, 100, HashMap::new(), vec![route], tcp_map, rtu_map, Vec::new()).await.unwrap();
+        let binfo = b.start(NoopSink, "ws".into(), "127.0.0.1", 0, 100, bbanks, vec![route], tcp_map, rtu_map, Vec::new()).await.unwrap();
         let baddr: std::net::SocketAddr = binfo.bound.parse().unwrap();
 
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -4796,5 +4837,71 @@ mod tests {
         db_update_register(&c, &reg).unwrap();
         let got2 = db_list_registers(&c).unwrap().into_iter().find(|r| r.id == id).unwrap();
         assert_eq!(got2.unit.as_deref(), Some("kPa"));
+    }
+
+    #[test]
+    fn rule_actions_never_create_registers() {
+        // Unit 1 exists with holding[0] only. Actions on a missing address,
+        // a missing unit, or a multi-word target with a missing tail must not
+        // create anything.
+        let mut b = banks1(&[(1, 3, 0, 5)]);
+        apply_action(&mut b, &Action::Set { unit: 1, bank: 3, address: 9, value: 1 }, 0);
+        apply_action(&mut b, &Action::Toggle { unit: 1, bank: 1, address: 2 }, 0);
+        apply_action(&mut b, &Action::Inc { unit: 1, bank: 3, address: 9, by: 1 }, 0);
+        apply_action(&mut b, &Action::Randomize { unit: 1, bank: 4, address: 0, min: 0, max: 9 }, 0);
+        apply_action(&mut b, &Action::Copy { src_unit: 1, src_bank: 3, src_addr: 0, unit: 1, bank: 3, address: 7, scale: 1.0, offset: 0.0 }, 0);
+        apply_action(&mut b, &Action::Set { unit: 9, bank: 3, address: 0, value: 1 }, 0);
+        let multi = TimedAction {
+            action: Action::Set { unit: 1, bank: 3, address: 20, value: 1 },
+            delay_ms: 0.0, data_type: "f32".into(), byte_order: "ABCD".into(),
+        };
+        apply_timed_action(&mut b, &multi, 0);
+        assert!(!b.contains_key(&9), "no new unit created");
+        let u1 = b.get(&1).unwrap();
+        assert_eq!(u1.holding.len(), 1, "no new holding address: {:?}", u1.holding);
+        assert_eq!(u1.holding.get(&0), Some(&5), "configured register untouched");
+        assert!(u1.coils.is_empty() && u1.input.is_empty());
+        // The configured register itself is still writable.
+        apply_action(&mut b, &Action::Set { unit: 1, bank: 3, address: 0, value: 42 }, 0);
+        assert_eq!(read_word(&b, 1, 3, 0), Some(42));
+    }
+
+    #[test]
+    fn condition_on_missing_register_never_fires() {
+        // `holding[5] == 0` on a register that doesn't exist must not read as
+        // 0 and fire; it is simply "not met".
+        let rules = vec![rule(1, Trigger::Condition { unit: 1, bank: 3, address: 5, op: "==".into(), value: 0 }, vec![Action::Set { unit: 1, bank: 3, address: 0, value: 1 }])];
+        let mut st = HashMap::new();
+        let b = banks1(&[(1, 3, 0, 0)]);
+        assert!(eval_rules(&rules, &mut st, &b, 0.0, &[]).is_empty());
+        assert!(eval_rules(&rules, &mut st, &b, 10.0, &[]).is_empty());
+        let empty = HashMap::new();
+        assert!(eval_rules(&rules, &mut st, &empty, 20.0, &[]).is_empty());
+        // Once the register exists and the condition holds, it fires.
+        let present = banks1(&[(1, 3, 5, 0)]);
+        assert_eq!(eval_rules(&rules, &mut st, &present, 30.0, &[]).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn tick_does_not_resurrect_a_cleared_register() {
+        // A generator is live in the tick list; the register is then removed
+        // from the banks (delete/move) before the tick list is refreshed. An
+        // in-flight tick must not re-create ("ghost") the address.
+        let reg = SimRegister {
+            id: 1, unit_id: 1, function_code: 4, address: 0, alias: "".into(), data_type: "f32".into(),
+            hold_value: 0, value_source: "generator".into(), byte_order: "ABCD".into(),
+            source_params: "{\"kind\":\"ramp\",\"min\":0,\"max\":100,\"periodMs\":1000}".into(),
+            interval_ms: 20, sort_order: 0, device_instance_id: None, unit: None, display_format: None,
+        };
+        let banks = registers_to_banks(&[reg.clone()]);
+        let dynamics: Vec<DynReg> = [reg].iter().filter_map(parse_dynamic).collect();
+        let mut engine = SimEngine::new();
+        engine.start(NoopSink, "ws".into(), "127.0.0.1", 0, 20, banks, dynamics, Default::default(), Default::default(), Vec::new()).await.unwrap();
+        engine.clear_span(1, 4, 0, 2);
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let snap = engine.snapshot();
+        let input = snap.get(&1).map(|b| b.input.clone()).unwrap_or_default();
+        engine.stop().await;
+        assert!(input.is_empty(), "cleared register was resurrected by the tick: {input:?}");
     }
 }
