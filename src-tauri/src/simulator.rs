@@ -1593,6 +1593,18 @@ pub struct TemplateRegister {
     pub source_params: String,
     #[serde(default)]
     pub alias: String,
+    /// Engineering unit label (e.g. "°C"), carried to `SimRegister.unit`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+    /// Display format (e.g. "dec", "hex"), carried to `SimRegister.display_format`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_format: Option<String>,
+    /// Update interval for dynamic registers; `None` → 1000 ms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval_ms: Option<i64>,
+    /// Initial Hold value; `None` → 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold_value: Option<i64>,
 }
 
 fn default_u16() -> String { "u16".into() }
@@ -1600,7 +1612,8 @@ fn default_abcd() -> String { "ABCD".into() }
 fn default_hold() -> String { "hold".into() }
 fn default_empty_obj() -> String { "{}".into() }
 
-/// A built-in (or, in a later plan, custom) device register-map template.
+/// A device register-map template: built-in, custom (user-authored or
+/// imported, stored app-globally), or a synthetic workspace-slave template.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct DeviceTemplate {
@@ -1628,6 +1641,10 @@ fn treg(offset: u16, bank: u8, data_type: &str, byte_order: &str, value_source: 
         value_source: value_source.into(),
         source_params: source_params.into(),
         alias: alias.into(),
+        unit: None,
+        display_format: None,
+        interval_ms: None,
+        hold_value: None,
     }
 }
 
@@ -1642,10 +1659,10 @@ pub fn builtin_templates() -> Vec<DeviceTemplate> {
             description: "Learn Modbus with mixed live values".into(),
             icon: "🎓".into(),
             registers: vec![
-                treg(0, 1, "bool", "ABCD", "hold", "{}", ""),
-                treg(1, 1, "bool", "ABCD", "hold", "{}", ""),
-                treg(2, 1, "bool", "ABCD", "hold", "{}", ""),
-                treg(3, 1, "bool", "ABCD", "hold", "{}", ""),
+                treg(0, 1, "bool", "ABCD", "hold", "{}", "Coil 0"),
+                treg(1, 1, "bool", "ABCD", "hold", "{}", "Coil 1"),
+                treg(2, 1, "bool", "ABCD", "hold", "{}", "Coil 2"),
+                treg(3, 1, "bool", "ABCD", "hold", "{}", "Coil 3"),
                 treg(0, 3, "u16", "ABCD", "hold", "{}", "Setpoint"),
                 treg(1, 3, "u16", "ABCD", "generator", r#"{"kind":"sine","min":0,"max":1000,"periodMs":5000}"#, "Sine"),
                 treg(2, 3, "u16", "ABCD", "generator", r#"{"kind":"ramp","min":0,"max":100,"periodMs":4000}"#, "Ramp"),
@@ -1735,49 +1752,116 @@ fn custom_templates_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, S
     Ok(dir.join("custom_device_templates.json"))
 }
 
-/// Read the custom template catalog (empty if the file is absent or invalid).
-fn read_custom_templates(app: &tauri::AppHandle) -> Vec<DeviceTemplate> {
-    let Ok(path) = custom_templates_path(app) else { return Vec::new() };
-    let Ok(text) = std::fs::read_to_string(&path) else { return Vec::new() };
-    serde_json::from_str(&text).unwrap_or_default()
+/// Read the custom template catalog from `path`. A missing (or empty) file is
+/// an empty catalog. A file that can't be read or parsed is an ERROR, never an
+/// empty list — otherwise the next save would overwrite the user's templates.
+/// A corrupt file is first copied aside (see `backup_corrupt_file`) and left
+/// in place untouched.
+fn read_templates_file(path: &std::path::Path) -> Result<Vec<DeviceTemplate>, String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("failed to read custom virtual devices file {}: {e}", path.display())),
+    };
+    if text.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    serde_json::from_str(&text).map_err(|parse_err| {
+        let saved = match backup_corrupt_file(path, &text) {
+            Ok(bak) => format!("a backup was saved as {}", bak.display()),
+            Err(e) => format!("a backup could not be saved ({e})"),
+        };
+        format!(
+            "The custom virtual devices file {} is corrupt ({parse_err}); {saved}. \
+             Fix or remove the file — it will not be modified until then.",
+            path.display()
+        )
+    })
+}
+
+/// Copy a corrupt catalog to `<file>.bak`. An existing `.bak` is never
+/// overwritten: a different backup gets a timestamp suffix
+/// (`<file>.bak.<epoch-ms>`). If an identical backup already exists it is
+/// reused, so repeated reads of the same corrupt file don't pile up copies.
+fn backup_corrupt_file(path: &std::path::Path, text: &str) -> Result<std::path::PathBuf, String> {
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .ok_or_else(|| "invalid catalog path".to_string())?;
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let prefix = format!("{file_name}.bak");
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with(&prefix) && std::fs::read_to_string(entry.path()).ok().as_deref() == Some(text) {
+                return Ok(entry.path());
+            }
+        }
+    }
+    let mut bak = dir.join(&prefix);
+    if bak.exists() {
+        bak = dir.join(format!("{prefix}.{}", now_ms()));
+    }
+    std::fs::write(&bak, text).map_err(|e| e.to_string())?;
+    Ok(bak)
+}
+
+/// Write the catalog atomically: write a temp file in the same directory,
+/// then rename it over the real one, so a crash mid-write can't leave a
+/// truncated catalog.
+fn write_templates_file(path: &std::path::Path, templates: &[DeviceTemplate]) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(templates).map_err(|e| e.to_string())?;
+    let mut tmp_name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    tmp_name.push(".tmp");
+    let tmp = path.with_file_name(tmp_name);
+    std::fs::write(&tmp, json).map_err(|e| format!("failed to write template catalog: {e}"))?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("failed to write template catalog: {e}")
+    })
+}
+
+fn read_custom_templates(app: &tauri::AppHandle) -> Result<Vec<DeviceTemplate>, String> {
+    read_templates_file(&custom_templates_path(app)?)
 }
 
 fn write_custom_templates(app: &tauri::AppHandle, templates: &[DeviceTemplate]) -> Result<(), String> {
-    let path = custom_templates_path(app)?;
-    let json = serde_json::to_string_pretty(templates).map_err(|e| e.to_string())?;
-    std::fs::write(&path, json).map_err(|e| format!("failed to write template catalog: {e}"))
+    write_templates_file(&custom_templates_path(app)?, templates)
 }
 
-/// Validate a template before it enters the catalog: keys/name present and
-/// every register well-formed (bank/type/order), reusing `validate_register`
-/// against a probe instance at base 0.
+/// Key prefix reserved for the synthetic workspace-slave templates built by
+/// `simulator_list_slave_device_templates`.
+const RESERVED_TEMPLATE_PREFIX: &str = "ws-slave:";
+
+/// Validate a template before it enters the catalog: the shape checks of
+/// `validate_template_shape`, plus the key must not use the reserved
+/// `ws-slave:` prefix.
 fn validate_template(t: &DeviceTemplate) -> Result<(), String> {
+    validate_template_shape(t)?;
+    if t.template_key.trim().starts_with(RESERVED_TEMPLATE_PREFIX) {
+        return Err(format!("template keys starting with '{RESERVED_TEMPLATE_PREFIX}' are reserved; choose a different key"));
+    }
+    Ok(())
+}
+
+/// Shape checks shared by catalog and inline templates: key/name present,
+/// every register well-formed (bank/type/order, via `validate_register` on a
+/// probe instance at base 0), and no two register spans overlapping
+/// (span-aware via `word_count`, same rule as `validate_no_overlap`).
+fn validate_template_shape(t: &DeviceTemplate) -> Result<(), String> {
     if t.template_key.trim().is_empty() {
         return Err("template key is required".into());
     }
     if t.name.trim().is_empty() {
         return Err("template name is required".into());
     }
-    for r in &t.registers {
-        let probe = SimRegister {
-            id: 0,
-            unit_id: 1,
-            function_code: r.bank as i64,
-            address: r.offset as i64,
-            alias: r.alias.clone(),
-            data_type: r.data_type.clone(),
-            hold_value: 0,
-            sort_order: 0,
-            device_instance_id: None,
-            value_source: r.value_source.clone(),
-            byte_order: r.byte_order.clone(),
-            source_params: r.source_params.clone(),
-            interval_ms: 1000,
-            unit: None,
-            display_format: None,
-        };
-        validate_register(&probe).map_err(|e| format!("register '{}': {e}", r.alias))?;
+    let probes = template_to_registers(t, 1, 0);
+    for (r, probe) in t.registers.iter().zip(&probes) {
+        validate_register(probe).map_err(|e| format!("register '{}': {e}", r.alias))?;
     }
+    validate_no_overlap(&[], &probes).map_err(|_| {
+        "two registers in this template overlap (a multi-word register spans the next address)".to_string()
+    })?;
     Ok(())
 }
 
@@ -1786,7 +1870,7 @@ fn validate_template(t: &DeviceTemplate) -> Result<(), String> {
 /// new custom templates are appended.
 #[tauri::command]
 pub fn simulator_list_device_templates(app: tauri::AppHandle) -> Result<Vec<DeviceTemplate>, String> {
-    let custom = read_custom_templates(&app);
+    let custom = read_custom_templates(&app)?;
     let mut out = builtin_templates();
     for c in custom {
         if let Some(existing) = out.iter_mut().find(|t| t.template_key == c.template_key) {
@@ -1798,11 +1882,11 @@ pub fn simulator_list_device_templates(app: tauri::AppHandle) -> Result<Vec<Devi
     Ok(out)
 }
 
-/// Just the custom (user-authored) templates, for the Device Builder's library
-/// management (built-ins are read-only; customs can be edited/deleted).
+/// Just the custom (user-authored) templates, for the Virtual Devices
+/// library management (built-ins are read-only; customs can be edited/deleted).
 #[tauri::command]
 pub fn simulator_list_custom_templates(app: tauri::AppHandle) -> Result<Vec<DeviceTemplate>, String> {
-    Ok(read_custom_templates(&app))
+    read_custom_templates(&app)
 }
 
 /// Upsert a custom template (by `templateKey`) into the app-global catalog.
@@ -1814,7 +1898,7 @@ pub fn simulator_save_custom_template(app: tauri::AppHandle, template: DeviceTem
         return Err(format!("'{}' is a built-in template key; choose a different key", template.template_key));
     }
     let (name, key) = (template.name.clone(), template.template_key.clone());
-    let mut custom = read_custom_templates(&app);
+    let mut custom = read_custom_templates(&app)?;
     let existed = custom.iter().any(|t| t.template_key == key);
     if let Some(existing) = custom.iter_mut().find(|t| t.template_key == template.template_key) {
         *existing = template;
@@ -1835,7 +1919,7 @@ pub fn simulator_save_custom_template(app: tauri::AppHandle, template: DeviceTem
 /// Delete a custom template from the catalog by key.
 #[tauri::command]
 pub fn simulator_delete_custom_template(app: tauri::AppHandle, template_key: String) -> Result<(), String> {
-    let mut custom = read_custom_templates(&app);
+    let mut custom = read_custom_templates(&app)?;
     let before = custom.len();
     custom.retain(|t| t.template_key != template_key);
     if custom.len() == before {
@@ -1874,7 +1958,7 @@ pub async fn simulator_import_custom_template(app: tauri::AppHandle) -> Result<O
     if builtin_templates().iter().any(|b| b.template_key == template.template_key) {
         return Err(format!("'{}' clashes with a built-in template key; rename it before importing", template.template_key));
     }
-    let mut custom = read_custom_templates(&app);
+    let mut custom = read_custom_templates(&app)?;
     if let Some(existing) = custom.iter_mut().find(|t| t.template_key == template.template_key) {
         *existing = template.clone();
     } else {
@@ -1941,16 +2025,8 @@ pub fn simulator_device_to_template(
     let regs = db_list_registers_for_device(&conn, device_id).map_err(|e| e.to_string())?;
     let base = device.base_address;
     let registers: Vec<TemplateRegister> = regs
-        .into_iter()
-        .map(|r| TemplateRegister {
-            offset: (r.address - base).max(0) as u16,
-            bank: r.function_code as u8,
-            data_type: r.data_type,
-            byte_order: r.byte_order,
-            value_source: r.value_source,
-            source_params: r.source_params,
-            alias: r.alias,
-        })
+        .iter()
+        .map(|r| sim_register_to_template_register(r, base))
         .collect();
     Ok(DeviceTemplate {
         template_key,
@@ -1960,6 +2036,24 @@ pub fn simulator_device_to_template(
         icon,
         registers,
     })
+}
+
+/// One device register as a base-relative template register, keeping every
+/// field a template can carry (unit, display format, interval, hold value).
+pub fn sim_register_to_template_register(r: &SimRegister, base: i64) -> TemplateRegister {
+    TemplateRegister {
+        offset: (r.address - base).clamp(0, 65535) as u16,
+        bank: r.function_code as u8,
+        data_type: r.data_type.clone(),
+        byte_order: r.byte_order.clone(),
+        value_source: r.value_source.clone(),
+        source_params: r.source_params.clone(),
+        alias: r.alias.clone(),
+        unit: r.unit.clone(),
+        display_format: r.display_format.clone(),
+        interval_ms: Some(r.interval_ms),
+        hold_value: Some(r.hold_value),
+    }
 }
 
 /// Expand a `DeviceTemplate` into concrete `SimRegister`s for a device
@@ -1976,15 +2070,15 @@ pub fn template_to_registers(t: &DeviceTemplate, unit_id: i64, base: i64) -> Vec
             address: base + r.offset as i64,
             alias: r.alias.clone(),
             data_type: r.data_type.clone(),
-            hold_value: 0,
+            hold_value: r.hold_value.unwrap_or(0),
             sort_order: 0,
             device_instance_id: None,
             value_source: r.value_source.clone(),
             byte_order: r.byte_order.clone(),
             source_params: r.source_params.clone(),
-            interval_ms: 1000,
-            unit: None,
-            display_format: None,
+            interval_ms: r.interval_ms.filter(|ms| *ms > 0).unwrap_or(1000),
+            unit: r.unit.clone(),
+            display_format: r.display_format.clone(),
         })
         .collect()
 }
@@ -2077,7 +2171,9 @@ pub fn simulator_add_inline_device(
     base_address: i64,
 ) -> Result<i64, String> {
     let ws = validate_workspace_name(&name)?;
-    validate_template(&template)?;
+    // Inline templates are the synthetic `ws-slave:` ones, so only the shape
+    // is checked here (the reserved-prefix rule is for the shared catalog).
+    validate_template_shape(&template)?;
     let key = template.template_key.clone();
     instantiate_device(&app, &state, &ws, &template, key, device_name, unit_id, base_address)
 }
@@ -2179,6 +2275,7 @@ fn slave_row_to_route_register(
     alias: &str,
     data_type: &str,
     order: &str,
+    display_format: Option<&str>,
 ) -> TemplateRegister {
     let is_bit = fc == 1 || fc == 2;
     let source_params = serde_json::json!({
@@ -2198,6 +2295,10 @@ fn slave_row_to_route_register(
         value_source: "route".into(),
         source_params,
         alias: alias.to_string(),
+        unit: None,
+        display_format: display_format.map(str::trim).filter(|f| !f.is_empty()).map(str::to_string),
+        interval_ms: None,
+        hold_value: None,
     }
 }
 
@@ -2235,7 +2336,7 @@ pub fn simulator_list_slave_device_templates(
         let conn_kind = if conn_kind_raw.is_empty() { "tcp".to_string() } else { conn_kind_raw };
         let mut row_stmt = conn
             .prepare(
-                "SELECT function_code, address, alias, data_type, \"order\"
+                "SELECT function_code, address, alias, data_type, \"order\", display_format
                  FROM slave_register_rows
                  WHERE slave_id = ?1 AND function_code IN (1,2,3,4)
                  ORDER BY function_code ASC, address ASC;",
@@ -2248,7 +2349,10 @@ pub fn simulator_list_slave_device_templates(
                 let alias: String = r.get::<_, Option<String>>(2)?.unwrap_or_default();
                 let data_type: String = r.get::<_, Option<String>>(3)?.unwrap_or_else(|| "u16".into());
                 let order: String = r.get::<_, Option<String>>(4)?.unwrap_or_default();
-                Ok(slave_row_to_route_register(unit_id, &conn_kind, fc, addr, &alias, &data_type, &order))
+                let display_format: Option<String> = r.get::<_, Option<String>>(5)?;
+                Ok(slave_row_to_route_register(
+                    unit_id, &conn_kind, fc, addr, &alias, &data_type, &order, display_format.as_deref(),
+                ))
             })
             .map_err(|e| e.to_string())?
             .collect::<Result<_, _>>()
@@ -3951,6 +4055,7 @@ mod tests {
             registers: vec![TemplateRegister {
                 offset: 0, bank: 4, data_type: "f32".into(), byte_order: "CDAB".into(),
                 value_source: "device".into(), source_params: "{\"preset\":\"analog\"}".into(), alias: "V".into(),
+                unit: None, display_format: None, interval_ms: None, hold_value: None,
             }],
         };
         assert!(validate_template(&good).is_ok());
@@ -4865,7 +4970,7 @@ mod tests {
     #[test]
     fn slave_row_maps_to_route_register() {
         // Holding register on unit 3 over serial → route reg mirroring it.
-        let r = slave_row_to_route_register(3, "serial", 3, 40, "Temperature", "u16", "");
+        let r = slave_row_to_route_register(3, "serial", 3, 40, "Temperature", "u16", "", None);
         assert_eq!(r.bank, 3);
         assert_eq!(r.offset, 40);
         assert_eq!(r.data_type, "u16");
@@ -4879,19 +4984,19 @@ mod tests {
         assert_eq!(p["address"], 40);
         assert_eq!(p["scale"], 1.0);
         assert_eq!(p["offset"], 0.0);
-        // The synthetic template must survive catalog validation (so inline add works).
+        // The synthetic template must survive inline-add validation.
         let t = DeviceTemplate {
             template_key: "ws-slave:1".into(), name: "SHT20".into(), category: "Workspace".into(),
             description: "".into(), icon: "🔗".into(), registers: vec![r],
         };
-        assert!(validate_template(&t).is_ok());
+        assert!(validate_template_shape(&t).is_ok());
     }
 
     #[test]
     fn slave_bit_row_maps_to_u16_and_preserves_order_for_words() {
         // Coil/discrete → u16/ABCD (0/1) regardless of stored type/order:
         // `bool` is reserved for Hold, so a route bit bank must use u16.
-        let bit = slave_row_to_route_register(1, "tcp", 1, 5, "Run", "u16", "DCBA");
+        let bit = slave_row_to_route_register(1, "tcp", 1, 5, "Run", "u16", "DCBA", None);
         assert_eq!(bit.data_type, "u16");
         assert_eq!(bit.byte_order, "ABCD");
         assert_eq!(bit.value_source, "route");
@@ -4901,9 +5006,9 @@ mod tests {
             template_key: "ws-slave:9".into(), name: "Relay".into(), category: "Workspace".into(),
             description: "".into(), icon: "🔗".into(), registers: vec![bit],
         };
-        assert!(validate_template(&t).is_ok());
+        assert!(validate_template_shape(&t).is_ok());
         // Multi-word holding preserves a real byte order.
-        let word = slave_row_to_route_register(1, "tcp", 3, 100, "Power", "f32", "CDAB");
+        let word = slave_row_to_route_register(1, "tcp", 3, 100, "Power", "f32", "CDAB", None);
         assert_eq!(word.data_type, "f32");
         assert_eq!(word.byte_order, "CDAB");
     }
@@ -5452,5 +5557,154 @@ mod tests {
         assert_eq!(encode_value("u32", "ABCD", 5e9).unwrap(), vec![0xFFFF, 0xFFFF]);
         assert_eq!(encode_value("i32", "ABCD", 3e9).unwrap(), vec![0x7FFF, 0xFFFF]);
         assert_eq!(encode_value("i32", "ABCD", -3e9).unwrap(), vec![0x8000, 0x0000]);
+    }
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("mw-sim-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn backups_in(dir: &std::path::Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".bak"))
+            .collect();
+        v.sort();
+        v
+    }
+
+    fn sample_template(key: &str) -> DeviceTemplate {
+        DeviceTemplate {
+            template_key: key.into(), name: "X".into(), category: "Custom".into(),
+            description: "".into(), icon: "📟".into(),
+            registers: vec![treg(0, 3, "u16", "ABCD", "hold", "{}", "A")],
+        }
+    }
+
+    #[test]
+    fn missing_template_file_is_an_empty_catalog() {
+        let dir = temp_dir("missing");
+        let path = dir.join("custom_device_templates.json");
+        assert!(read_templates_file(&path).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupt_template_file_is_backed_up_and_reported() {
+        let dir = temp_dir("corrupt");
+        let path = dir.join("custom_device_templates.json");
+        std::fs::write(&path, "[{ not json").unwrap();
+        let err = read_templates_file(&path).unwrap_err();
+        assert!(err.contains("custom_device_templates.json.bak"), "error names the backup: {err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[{ not json", "original left in place");
+        assert_eq!(std::fs::read_to_string(dir.join("custom_device_templates.json.bak")).unwrap(), "[{ not json");
+        // Reading the same corrupt file again doesn't pile up backups.
+        assert!(read_templates_file(&path).is_err());
+        assert_eq!(backups_in(&dir), vec!["custom_device_templates.json.bak".to_string()]);
+        // A different corrupt file never overwrites the existing .bak.
+        std::fs::write(&path, "{{ also broken").unwrap();
+        assert!(read_templates_file(&path).is_err());
+        let baks = backups_in(&dir);
+        assert_eq!(baks.len(), 2, "{baks:?}");
+        assert_eq!(std::fs::read_to_string(dir.join("custom_device_templates.json.bak")).unwrap(), "[{ not json");
+        let stamped = baks.iter().find(|n| *n != "custom_device_templates.json.bak").unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join(stamped)).unwrap(), "{{ also broken");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn template_file_writes_are_atomic_replacements() {
+        let dir = temp_dir("write");
+        let path = dir.join("custom_device_templates.json");
+        write_templates_file(&path, &[sample_template("a")]).unwrap();
+        write_templates_file(&path, &[sample_template("a"), sample_template("b")]).unwrap();
+        let back = read_templates_file(&path).unwrap();
+        assert_eq!(back.iter().map(|t| t.template_key.as_str()).collect::<Vec<_>>(), vec!["a", "b"]);
+        let names: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(names, vec!["custom_device_templates.json".to_string()], "no temp file left behind");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn template_validation_rejects_overlaps_and_reserved_keys() {
+        // f32 at offset 0 spans 0-1: a u16 at offset 1 in the same bank overlaps.
+        let overlapping = DeviceTemplate {
+            registers: vec![
+                treg(0, 3, "f32", "ABCD", "generator", "{}", "A"),
+                treg(1, 3, "u16", "ABCD", "hold", "{}", "B"),
+            ],
+            ..sample_template("custom_overlap")
+        };
+        assert!(validate_template(&overlapping).is_err());
+        // Same offset in a different bank is fine.
+        let other_bank = DeviceTemplate {
+            registers: vec![
+                treg(0, 3, "f32", "ABCD", "generator", "{}", "A"),
+                treg(1, 4, "u16", "ABCD", "hold", "{}", "B"),
+            ],
+            ..sample_template("custom_ok")
+        };
+        assert!(validate_template(&other_bank).is_ok());
+        // `ws-slave:` keys are reserved for the synthetic workspace templates.
+        let reserved = sample_template("ws-slave:3");
+        assert!(validate_template(&reserved).is_err());
+        assert!(validate_template_shape(&reserved).is_ok(), "inline add still accepts its own synthetic keys");
+    }
+
+    #[test]
+    fn register_playground_coils_have_aliases() {
+        let pg = builtin_templates().into_iter().find(|t| t.template_key == "register_playground").unwrap();
+        let coils: Vec<&str> = pg.registers.iter().filter(|r| r.bank == 1).map(|r| r.alias.as_str()).collect();
+        assert_eq!(coils, vec!["Coil 0", "Coil 1", "Coil 2", "Coil 3"]);
+        for t in builtin_templates() {
+            for r in &t.registers {
+                assert!(!r.alias.trim().is_empty(), "{} has a register without an alias", t.template_key);
+            }
+        }
+    }
+
+    #[test]
+    fn template_round_trip_keeps_unit_format_interval_and_hold_value() {
+        let original = SimRegister {
+            id: 9, unit_id: 2, function_code: 3, address: 105, alias: "Setpoint".into(),
+            data_type: "i16".into(), hold_value: -7, sort_order: 0, device_instance_id: Some(4),
+            value_source: "hold".into(), byte_order: "BADC".into(), source_params: "{}".into(),
+            interval_ms: 250, unit: Some("°C".into()), display_format: Some("dec2".into()),
+        };
+        let tr = sim_register_to_template_register(&original, 100);
+        assert_eq!(tr.offset, 5);
+        // Serialized names are the camelCase ones the frontend uses.
+        let json = serde_json::to_value(&tr).unwrap();
+        assert_eq!(json["unit"], "°C");
+        assert_eq!(json["displayFormat"], "dec2");
+        assert_eq!(json["intervalMs"], 250);
+        assert_eq!(json["holdValue"], -7);
+        let t = DeviceTemplate { registers: vec![tr], ..sample_template("custom_rt") };
+        let back = &template_to_registers(&t, 2, 100)[0];
+        assert_eq!(back.address, original.address);
+        assert_eq!(back.unit, original.unit);
+        assert_eq!(back.display_format, original.display_format);
+        assert_eq!(back.interval_ms, original.interval_ms);
+        assert_eq!(back.hold_value, original.hold_value);
+        assert_eq!(back.byte_order, original.byte_order);
+        // Old templates without the fields keep today's defaults.
+        let old: TemplateRegister = serde_json::from_str(r#"{"offset":0,"bank":3}"#).unwrap();
+        let t = DeviceTemplate { registers: vec![old], ..sample_template("custom_old") };
+        let r = &template_to_registers(&t, 1, 0)[0];
+        assert_eq!((r.interval_ms, r.hold_value, r.unit.clone(), r.display_format.clone()), (1000, 0, None, None));
+    }
+
+    #[test]
+    fn slave_route_register_carries_display_format() {
+        let r = slave_row_to_route_register(1, "tcp", 3, 10, "Temp", "u16", "", Some("hex"));
+        assert_eq!(r.display_format.as_deref(), Some("hex"));
+        let r = slave_row_to_route_register(1, "tcp", 3, 10, "Temp", "u16", "", Some("  "));
+        assert_eq!(r.display_format, None);
+        let r = slave_row_to_route_register(1, "tcp", 3, 10, "Temp", "u16", "", None);
+        assert_eq!(r.display_format, None);
     }
 }
