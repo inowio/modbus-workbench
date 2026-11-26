@@ -87,7 +87,7 @@ const simulatorSection: HelpSectionDefinition = {
     "delete device",
   ],
   searchText:
-    "Learn how the TCP Simulator turns the workbench into a Modbus TCP server external masters can query. Covers the tabbed workspace (Registers, Devices, Rules, Live Values, Activity), the status dashboard (Exposed, Accessible At, Connected Clients, Tick Interval) and footer, the Expose toggle (LAN 0.0.0.0 vs Local only 127.0.0.1), the port, Start/Stop, the resolved Listening/Accessible-At address, serving all four register banks (Coils, Discrete Inputs, Holding, Input) across multiple Unit IDs, value sources (Hold, Device presets, Generators—sine/ramp/decrement/step/random/toggle, and Route from slave) with u16/i16/u32/i32/f32/u64/i64/f64 data types and byte order (ABCD/BADC/CDAB/DCBA), per-register update intervals, adding whole virtual devices via Add Device (built-in, custom, or a workspace slave routed as a gateway), the live value view, the ok/stale/missing route source-status badge, scale/offset transforms on routed values, the Activity tab (uptime, connected-clients list, event log), workspace Profile export/import, the global running-status chip with client count, and automation rules pairing a trigger (interval / register condition / on client write) with actions (set/inc/dec/toggle/copy/randomize) including per-action delay and multi-word targets.",
+    "Learn how the TCP Simulator turns the workbench into a Modbus TCP server external masters can query. Covers the tabbed workspace (Registers, Devices, Rules, Live Values, Activity), the status dashboard (Exposed, Accessible At, Connected Clients, Uptime, with the Tick Interval next to the port) and footer, the Expose toggle (LAN 0.0.0.0 vs Local only 127.0.0.1), the port, Start/Stop, the resolved Listening/Accessible-At address, serving all four register banks (Coils, Discrete Inputs, Holding, Input) across multiple Unit IDs, value sources (Hold, Device presets, Generators—sine/ramp/decrement/step/random/toggle, and Route from slave) with u16/i16/u32/i32/f32/u64/i64/f64 data types and byte order (ABCD/BADC/CDAB/DCBA), per-register update intervals (the Interval field in the side panel), adding whole virtual devices via Add Device (built-in, custom, or a workspace slave routed as a gateway), the live value view, the ok/stale/missing route source-status badge, scale/offset transforms on routed values, the Activity tab (uptime, connected-clients list, event log), workspace Profile export/import, the global running-status chip with client count, and automation rules pairing a trigger (interval / register condition / on client write) with actions (set/inc/dec/toggle/copy/randomize) including per-action delay and multi-word targets.",
   anchors: [
     { id: "overview", label: "What the TCP Simulator does" },
     { id: "tabs", label: "The five tabs" },
@@ -179,7 +179,7 @@ const simulatorSection: HelpSectionDefinition = {
           <li><strong>Exposed</strong> — how many registers / units / devices are being served.</li>
           <li><strong>Accessible At</strong> — the bound socket, e.g. <code>192.168.68.127:502</code>. Use this verbatim when configuring the master.</li>
           <li><strong>Connected Clients</strong> — the current live client count.</li>
-          <li><strong>Tick Interval</strong> — how often the simulator recomputes values and applies rules.</li>
+          <li><strong>Uptime</strong> — how long the server has been running. The <strong>Tick Interval</strong> setting sits next to the port.</li>
         </ul>
         <p>
           A footer strip repeats the essentials across the bottom (Running, Port, Tick, clients, Up-time, last update). If Expose is LAN (<code>0.0.0.0</code>), point external masters at this machine's real LAN IP (e.g. <code>192.168.1.42:502</code>).
@@ -188,17 +188,18 @@ const simulatorSection: HelpSectionDefinition = {
 
       <SectionBlock section="simulator" anchor="registers" title="Registers & banks across Unit IDs">
         <p>
-          The simulator serves multiple <strong>Unit IDs</strong> on the same port—each unit is a separate virtual device to the master. Add a register with <strong>+ Add Register</strong>:
+          The simulator serves multiple <strong>Unit IDs</strong> on the same port—each unit is a separate virtual device to the master. Add a register with <strong>+ Add Register</strong>, which opens a <strong>New register</strong> panel beside the table (a drawer on narrow windows):
         </p>
         <ul className="list-disc space-y-1 pl-5">
           <li><strong>Unit ID</strong> (0–255) — the device the master addresses.</li>
           <li><strong>Register type / bank</strong> — Coil (0x01), Discrete input (0x02), Holding (0x03), or Input (0x04). Coils/Discrete carry a single <code>bool</code>; Holding/Input carry words.</li>
           <li><strong>Address</strong> (0–65535) — what the master requests.</li>
           <li><strong>Alias</strong> — an optional friendly name.</li>
-          <li><strong>Value source</strong> — Hold, Device preset, Generator, or Route (see below).</li>
+          <li><strong>Value source</strong> — Hold, Device preset, Generator, or Route (see below), on the panel's Source tab.</li>
+          <li><strong>Interval (ms)</strong> — Source tab, for Device / Generator / Route: how often the value is recomputed or re-read. Empty or 0 uses the default of 1000 ms.</li>
         </ul>
         <p>
-          The table supports search, filters (unit / source / type), a <strong>Columns</strong> chooser, a <strong>Dec/Hex</strong> address toggle, and pagination. Click a row to open the inspector; use the row's delete action (with confirmation) to remove it.
+          The table supports search, filters (unit / source / type), a <strong>Columns</strong> chooser, a <strong>Dec/Hex</strong> address toggle, and pagination. Click a row to open it in the same side panel to edit, Save, Duplicate, or Delete; use the row's delete action (with confirmation) to remove it.
         </p>
         <p className="text-xs text-slate-500 dark:text-slate-400">
           Writable banks (Coils, Holding) accept master writes (0x05/0x06/0x0F/0x10); Discrete Inputs and Input registers are read-only, as in the Modbus spec.
