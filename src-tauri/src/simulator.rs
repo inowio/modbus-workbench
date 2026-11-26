@@ -32,7 +32,7 @@ use tokio_modbus::prelude::*;
 use tokio_modbus::server::tcp::{accept_tcp_connection, Server};
 use tokio_modbus::server::Service;
 
-use crate::sim_scaling::{build_reg_meta, eng_from_raw, round_to, RegMetaMap};
+use crate::sim_scaling::{build_reg_meta, eng_from_raw, raw_from_eng, round_to, RegMetaMap};
 
 /// Number of 16-bit words a data type occupies (1-, 2- and 4-word types).
 pub fn word_count(data_type: &str) -> usize {
@@ -1200,7 +1200,7 @@ impl SimEngine {
                             // that have come due, then evaluate rules for this tick.
                             pending_actions.retain(|p| {
                                 if p.due <= elapsed {
-                                    apply_timed_action(&mut guard, &p.action, p.seed);
+                                    apply_timed_action(&mut guard, &meta, &p.action, p.seed);
                                     false
                                 } else {
                                     true
@@ -1210,7 +1210,7 @@ impl SimEngine {
                             for (id, ta) in acts {
                                 let seed = elapsed as u64 ^ id as u64;
                                 if ta.delay_ms <= 0.0 {
-                                    apply_timed_action(&mut guard, &ta, seed);
+                                    apply_timed_action(&mut guard, &meta, &ta, seed);
                                 } else {
                                     pending_actions.push(PendingAction { due: elapsed + ta.delay_ms, rule_id: id, action: ta, seed });
                                 }
@@ -2658,9 +2658,11 @@ pub enum Join {
 /// A rule's action, parsed from an entry in the `SimRule.actions` JSON array.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
-    Set { unit: u8, bank: u8, address: u16, value: i64 },
-    Inc { unit: u8, bank: u8, address: u16, by: i64 },
-    Dec { unit: u8, bank: u8, address: u16, by: i64 },
+    /// `value`/`by` are engineering values (register raw × scale + offset); at
+    /// the default scale 1 / offset 0 they are the raw integers of old.
+    Set { unit: u8, bank: u8, address: u16, value: f64 },
+    Inc { unit: u8, bank: u8, address: u16, by: f64 },
+    Dec { unit: u8, bank: u8, address: u16, by: f64 },
     Toggle { unit: u8, bank: u8, address: u16 },
     Copy {
         src_unit: u8,
@@ -2731,9 +2733,9 @@ fn parse_action(v: &serde_json::Value) -> Option<TimedAction> {
     let bank = json_u8(v, "bank", 1)?;
     let address = json_u16(v, "address", 0)?;
     let action = match v.get("type").and_then(|x| x.as_str()).unwrap_or("") {
-        "set" => Action::Set { unit, bank, address, value: json_i64(v, "value", 0) },
-        "inc" => Action::Inc { unit, bank, address, by: json_i64(v, "by", 1) },
-        "dec" => Action::Dec { unit, bank, address, by: json_i64(v, "by", 1) },
+        "set" => Action::Set { unit, bank, address, value: json_finite_f64(v, "value", 0.0) },
+        "inc" => Action::Inc { unit, bank, address, by: json_finite_f64(v, "by", 1.0) },
+        "dec" => Action::Dec { unit, bank, address, by: json_finite_f64(v, "by", 1.0) },
         "toggle" => Action::Toggle { unit, bank, address },
         "copy" => Action::Copy {
             src_unit: json_u8(v, "srcUnit", unit)?,
@@ -2861,16 +2863,16 @@ pub fn read_word(banks: &HashMap<u8, SimBanks>, unit: u8, bank: u8, addr: u16) -
 pub fn apply_action(banks: &mut HashMap<u8, SimBanks>, action: &Action, rng_seed: u64) {
     match *action {
         Action::Set { unit, bank, address, value } => {
-            update_existing_words(banks, unit, bank, address, &[value as u16]);
+            update_existing_words(banks, unit, bank, address, &[value as i64 as u16]);
         }
         Action::Inc { unit, bank, address, by } => {
             let cur = read_word(banks, unit, bank, address).unwrap_or(0);
-            let next = cur.wrapping_add(by as u16);
+            let next = cur.wrapping_add(by as i64 as u16);
             update_existing_words(banks, unit, bank, address, &[next]);
         }
         Action::Dec { unit, bank, address, by } => {
             let cur = read_word(banks, unit, bank, address).unwrap_or(0);
-            let next = cur.wrapping_sub(by as u16);
+            let next = cur.wrapping_sub(by as i64 as u16);
             update_existing_words(banks, unit, bank, address, &[next]);
         }
         Action::Toggle { unit, bank, address } => {
@@ -2919,13 +2921,13 @@ fn read_typed(banks: &HashMap<u8, SimBanks>, unit: u8, bank: u8, addr: u16, data
     decode_value(data_type, byte_order, &words)
 }
 
-/// Apply a `TimedAction`'s effect. For single-word/bit targets (`data_type`
+/// Legacy path (target without register metadata). For single-word/bit targets (`data_type`
 /// resolving to 1 word — the default) this delegates to `apply_action`, keeping
 /// legacy behavior byte-for-byte. For multi-word targets it computes the numeric
 /// result, encodes it across the register's words with `data_type`/`byte_order`,
 /// and places them. `delay_ms` is handled by the caller (the tick scheduler),
 /// not here.
-pub fn apply_timed_action(banks: &mut HashMap<u8, SimBanks>, ta: &TimedAction, rng_seed: u64) {
+fn apply_timed_action_stored(banks: &mut HashMap<u8, SimBanks>, ta: &TimedAction, rng_seed: u64) {
     if word_count(&ta.data_type) <= 1 {
         apply_action(banks, &ta.action, rng_seed);
         return;
@@ -2935,9 +2937,9 @@ pub fn apply_timed_action(banks: &mut HashMap<u8, SimBanks>, ta: &TimedAction, r
     let (unit, bank, address) = action_target(&ta.action);
     // Multi-word only applies to word banks (holding/input); bit banks are 1-word.
     let result: f64 = match &ta.action {
-        Action::Set { value, .. } => *value as f64,
-        Action::Inc { by, .. } => read_typed(banks, unit, bank, address, dt, bo).unwrap_or(0.0) + *by as f64,
-        Action::Dec { by, .. } => read_typed(banks, unit, bank, address, dt, bo).unwrap_or(0.0) - *by as f64,
+        Action::Set { value, .. } => *value,
+        Action::Inc { by, .. } => read_typed(banks, unit, bank, address, dt, bo).unwrap_or(0.0) + *by,
+        Action::Dec { by, .. } => read_typed(banks, unit, bank, address, dt, bo).unwrap_or(0.0) - *by,
         Action::Randomize { min, max, .. } => {
             let span = (max - min + 1).max(1);
             (min + (unit_random(rng_seed) * span as f64) as i64) as f64
@@ -2954,6 +2956,57 @@ pub fn apply_timed_action(banks: &mut HashMap<u8, SimBanks>, ta: &TimedAction, r
     };
     if let Ok(words) = encode_value(dt, bo, result) {
         update_existing_words(banks, unit, bank, address, &words);
+    }
+}
+
+/// Apply a `TimedAction`'s effect. `Set`/`Inc`/`Dec` values and `Copy`'s
+/// source are engineering values: when the target register has metadata the
+/// result is converted back with `raw_from_eng` and encoded with the target's
+/// OWN type/byte order (multi-word aware), then written existing-only. A bit
+/// target turns on for any non-zero value. At scale 1 / offset 0 on a
+/// single-word target `Set`/`Inc`/`Dec` take the legacy raw path (same
+/// wrapping as before). A target with no metadata, and `Toggle`/`Randomize`,
+/// behave as before using the action's stored `data_type`/`byte_order`.
+/// `delay_ms` is handled by the caller (the tick scheduler), not here.
+pub fn apply_timed_action(banks: &mut HashMap<u8, SimBanks>, meta: &RegMetaMap, ta: &TimedAction, rng_seed: u64) {
+    let (unit, bank, address) = action_target(&ta.action);
+    let is_copy = matches!(ta.action, Action::Copy { .. });
+    let eng_action = matches!(ta.action, Action::Set { .. } | Action::Inc { .. } | Action::Dec { .. } | Action::Copy { .. });
+    if !eng_action {
+        return apply_timed_action_stored(banks, ta, rng_seed);
+    }
+    // The engineering result of the action, or None to do nothing.
+    let result = |banks: &HashMap<u8, SimBanks>| -> Option<f64> {
+        match &ta.action {
+            Action::Set { value, .. } => Some(*value),
+            Action::Inc { by, .. } => Some(read_eng(banks, meta, unit, bank, address).unwrap_or(0.0) + *by),
+            Action::Dec { by, .. } => Some(read_eng(banks, meta, unit, bank, address).unwrap_or(0.0) - *by),
+            Action::Copy { src_unit, src_bank, src_addr, scale, offset, .. } => {
+                read_eng(banks, meta, *src_unit, *src_bank, *src_addr).map(|v| v * scale + offset)
+            }
+            _ => None,
+        }
+    };
+    match bank {
+        1 | 2 => {
+            if let Some(v) = result(banks) {
+                update_existing_words(banks, unit, bank, address, &[u16::from(v.is_finite() && v != 0.0)]);
+            }
+        }
+        3 | 4 => match meta.get(&(unit, bank, address)) {
+            Some(m) => {
+                if !is_copy && m.scale == 1.0 && m.offset == 0.0 && word_count(&m.data_type) == 1 {
+                    return apply_action(banks, &ta.action, rng_seed);
+                }
+                let Some(eng) = result(banks) else { return };
+                let raw = raw_from_eng(eng, m.scale, m.offset, &m.data_type);
+                if let Ok(words) = encode_value(&m.data_type, &m.byte_order, raw) {
+                    update_existing_words(banks, unit, bank, address, &words);
+                }
+            }
+            None => apply_timed_action_stored(banks, ta, rng_seed),
+        },
+        _ => {}
     }
 }
 
@@ -4479,7 +4532,7 @@ mod tests {
     }
     #[test]
     fn condition_is_edge_fired() {
-        let rules = vec![rule(1, Trigger::Condition{join:Join::All,conds:vec![cnd(1,3,0,">=",100.0,0.0)]}, vec![Action::Set{unit:1,bank:1,address:0,value:1}])];
+        let rules = vec![rule(1, Trigger::Condition{join:Join::All,conds:vec![cnd(1,3,0,">=",100.0,0.0)]}, vec![Action::Set{unit:1,bank:1,address:0,value:1.0}])];
         let mut st = HashMap::new();
         let meta = cmeta(&[(1,3,0,"u16",1.0)]);
         let below = banks1(&[(1,3,0,50)]);
@@ -4490,7 +4543,7 @@ mod tests {
     }
     #[test]
     fn changed_fires_on_each_change() {
-        let rules = vec![rule(1, Trigger::Condition{join:Join::All,conds:vec![cnd(1,3,0,"changed",0.0,0.0)]}, vec![Action::Inc{unit:1,bank:3,address:1,by:1}])];
+        let rules = vec![rule(1, Trigger::Condition{join:Join::All,conds:vec![cnd(1,3,0,"changed",0.0,0.0)]}, vec![Action::Inc{unit:1,bank:3,address:1,by:1.0}])];
         let mut st = HashMap::new();
         let meta = cmeta(&[(1,3,0,"u16",1.0)]);
         let v10 = banks1(&[(1,3,0,10)]);
@@ -4503,7 +4556,7 @@ mod tests {
     }
     #[test]
     fn on_write_matches_drained_write() {
-        let rules = vec![rule(1, Trigger::OnWrite{unit:1,bank:3,address:Some(5)}, vec![Action::Inc{unit:1,bank:3,address:6,by:1}])];
+        let rules = vec![rule(1, Trigger::OnWrite{unit:1,bank:3,address:Some(5)}, vec![Action::Inc{unit:1,bank:3,address:6,by:1.0}])];
         let mut st = HashMap::new();
         let b = HashMap::new();
         assert_eq!(eval_rules(&rules, &mut st, &b, &RegMetaMap::new(), 0.0, &[(1,3,5)]).len(), 1);
@@ -4513,9 +4566,9 @@ mod tests {
     #[test]
     fn action_set_inc_toggle() {
         let mut b = banks1(&[(1, 3, 0, 10), (1, 1, 0, 0)]);
-        apply_action(&mut b, &Action::Set { unit: 1, bank: 3, address: 0, value: 42 }, 0);
+        apply_action(&mut b, &Action::Set { unit: 1, bank: 3, address: 0, value: 42.0 }, 0);
         assert_eq!(read_word(&b, 1, 3, 0), Some(42));
-        apply_action(&mut b, &Action::Inc { unit: 1, bank: 3, address: 0, by: 8 }, 0);
+        apply_action(&mut b, &Action::Inc { unit: 1, bank: 3, address: 0, by: 8.0 }, 0);
         assert_eq!(read_word(&b, 1, 3, 0), Some(50));
         apply_action(&mut b, &Action::Toggle { unit: 1, bank: 1, address: 0 }, 0);
         assert_eq!(read_word(&b, 1, 1, 0), Some(1));
@@ -4533,7 +4586,7 @@ mod tests {
     #[test]
     fn action_inc_wraps() {
         let mut b = banks1(&[(1, 3, 0, 0xFFFF)]);
-        apply_action(&mut b, &Action::Inc { unit: 1, bank: 3, address: 0, by: 2 }, 0);
+        apply_action(&mut b, &Action::Inc { unit: 1, bank: 3, address: 0, by: 2.0 }, 0);
         assert_eq!(read_word(&b, 1, 3, 0), Some(1)); // wraps
     }
 
@@ -4543,10 +4596,10 @@ mod tests {
         // The register must be configured (seeded) — actions never create.
         let mut b = banks1(&[(1, 3, 10, 0), (1, 3, 11, 0)]);
         let one = TimedAction {
-            action: Action::Set { unit: 1, bank: 3, address: 10, value: 1 },
+            action: Action::Set { unit: 1, bank: 3, address: 10, value: 1.0 },
             delay_ms: 0.0, data_type: "f32".into(), byte_order: "ABCD".into(),
         };
-        apply_timed_action(&mut b, &one, 0);
+        apply_timed_action(&mut b, &RegMetaMap::new(), &one, 0);
         // f32(1.0) = 0x3F80_0000 → words [0x3F80, 0x0000]
         assert_eq!(read_word(&b, 1, 3, 10), Some(0x3F80));
         assert_eq!(read_word(&b, 1, 3, 11), Some(0x0000));
@@ -4556,10 +4609,10 @@ mod tests {
     fn timed_action_inc_reads_and_writes_multi_word() {
         // Seed an f32 register = 10.0, inc by 5 → 15.0.
         let mut b = banks1(&[(1, 3, 0, 0), (1, 3, 1, 0)]);
-        let seed = TimedAction { action: Action::Set { unit: 1, bank: 3, address: 0, value: 10 }, delay_ms: 0.0, data_type: "f32".into(), byte_order: "ABCD".into() };
-        apply_timed_action(&mut b, &seed, 0);
-        let inc = TimedAction { action: Action::Inc { unit: 1, bank: 3, address: 0, by: 5 }, ..seed.clone() };
-        apply_timed_action(&mut b, &inc, 0);
+        let seed = TimedAction { action: Action::Set { unit: 1, bank: 3, address: 0, value: 10.0 }, delay_ms: 0.0, data_type: "f32".into(), byte_order: "ABCD".into() };
+        apply_timed_action(&mut b, &RegMetaMap::new(), &seed, 0);
+        let inc = TimedAction { action: Action::Inc { unit: 1, bank: 3, address: 0, by: 5.0 }, ..seed.clone() };
+        apply_timed_action(&mut b, &RegMetaMap::new(), &inc, 0);
         let got = read_typed(&b, 1, 3, 0, "f32", "ABCD").unwrap();
         assert!((got - 15.0).abs() < 1e-6, "got {got}");
     }
@@ -4569,8 +4622,8 @@ mod tests {
         // Default u16 timed action == apply_action (no multi-word path).
         let mut a = banks1(&[(1, 3, 0, 10)]);
         let mut b = banks1(&[(1, 3, 0, 10)]);
-        let ta = TimedAction { action: Action::Inc { unit: 1, bank: 3, address: 0, by: 8 }, delay_ms: 0.0, data_type: "u16".into(), byte_order: "ABCD".into() };
-        apply_timed_action(&mut a, &ta, 0);
+        let ta = TimedAction { action: Action::Inc { unit: 1, bank: 3, address: 0, by: 8.0 }, delay_ms: 0.0, data_type: "u16".into(), byte_order: "ABCD".into() };
+        apply_timed_action(&mut a, &RegMetaMap::new(), &ta, 0);
         apply_action(&mut b, &ta.action, 0);
         assert_eq!(read_word(&a, 1, 3, 0), read_word(&b, 1, 3, 0));
     }
@@ -5193,7 +5246,7 @@ mod tests {
         let rules = vec![RuleDef {
             id: 1, enabled: true, sort_order: 0,
             trigger: Trigger::Condition { join: Join::All, conds: vec![cnd(1, 3, 0, ">=", 100.0, 0.0)] },
-            actions: vec![timed(Action::Set { unit: 1, bank: 1, address: 0, value: 1 })],
+            actions: vec![timed(Action::Set { unit: 1, bank: 1, address: 0, value: 1.0 })],
         }];
         let mut engine = SimEngine::new();
         engine.set_register_meta(cmeta(&[(1, 3, 0, "u16", 1.0)]));
@@ -5442,24 +5495,24 @@ mod tests {
         // a missing unit, or a multi-word target with a missing tail must not
         // create anything.
         let mut b = banks1(&[(1, 3, 0, 5)]);
-        apply_action(&mut b, &Action::Set { unit: 1, bank: 3, address: 9, value: 1 }, 0);
+        apply_action(&mut b, &Action::Set { unit: 1, bank: 3, address: 9, value: 1.0 }, 0);
         apply_action(&mut b, &Action::Toggle { unit: 1, bank: 1, address: 2 }, 0);
-        apply_action(&mut b, &Action::Inc { unit: 1, bank: 3, address: 9, by: 1 }, 0);
+        apply_action(&mut b, &Action::Inc { unit: 1, bank: 3, address: 9, by: 1.0 }, 0);
         apply_action(&mut b, &Action::Randomize { unit: 1, bank: 4, address: 0, min: 0, max: 9 }, 0);
         apply_action(&mut b, &Action::Copy { src_unit: 1, src_bank: 3, src_addr: 0, unit: 1, bank: 3, address: 7, scale: 1.0, offset: 0.0 }, 0);
-        apply_action(&mut b, &Action::Set { unit: 9, bank: 3, address: 0, value: 1 }, 0);
+        apply_action(&mut b, &Action::Set { unit: 9, bank: 3, address: 0, value: 1.0 }, 0);
         let multi = TimedAction {
-            action: Action::Set { unit: 1, bank: 3, address: 20, value: 1 },
+            action: Action::Set { unit: 1, bank: 3, address: 20, value: 1.0 },
             delay_ms: 0.0, data_type: "f32".into(), byte_order: "ABCD".into(),
         };
-        apply_timed_action(&mut b, &multi, 0);
+        apply_timed_action(&mut b, &RegMetaMap::new(), &multi, 0);
         assert!(!b.contains_key(&9), "no new unit created");
         let u1 = b.get(&1).unwrap();
         assert_eq!(u1.holding.len(), 1, "no new holding address: {:?}", u1.holding);
         assert_eq!(u1.holding.get(&0), Some(&5), "configured register untouched");
         assert!(u1.coils.is_empty() && u1.input.is_empty());
         // The configured register itself is still writable.
-        apply_action(&mut b, &Action::Set { unit: 1, bank: 3, address: 0, value: 42 }, 0);
+        apply_action(&mut b, &Action::Set { unit: 1, bank: 3, address: 0, value: 42.0 }, 0);
         assert_eq!(read_word(&b, 1, 3, 0), Some(42));
     }
 
@@ -5467,7 +5520,7 @@ mod tests {
     fn condition_on_missing_register_is_not_met() {
         // `holding[5] == 0` on a register that doesn't exist must not read as
         // 0 and fire; it is simply "not met".
-        let rules = vec![rule(1, Trigger::Condition { join: Join::All, conds: vec![cnd(1, 3, 5, "==", 0.0, 0.0)] }, vec![Action::Set { unit: 1, bank: 3, address: 0, value: 1 }])];
+        let rules = vec![rule(1, Trigger::Condition { join: Join::All, conds: vec![cnd(1, 3, 5, "==", 0.0, 0.0)] }, vec![Action::Set { unit: 1, bank: 3, address: 0, value: 1.0 }])];
         let meta = cmeta(&[(1, 3, 5, "u16", 1.0)]);
         let mut st = HashMap::new();
         let b = banks1(&[(1, 3, 0, 0)]);
@@ -5577,7 +5630,7 @@ mod tests {
         // The rule is removed before the action is due: it must not fire.
         let mut banks = HashMap::new();
         place_words(&mut banks, 1, 3, 0, &[0]);
-        let ta = TimedAction { delay_ms: 300.0, ..timed(Action::Set { unit: 1, bank: 3, address: 0, value: 42 }) };
+        let ta = TimedAction { delay_ms: 300.0, ..timed(Action::Set { unit: 1, bank: 3, address: 0, value: 42.0 }) };
         let r = RuleDef { id: 7, enabled: true, sort_order: 0, trigger: Trigger::Interval { ms: 60000.0 }, actions: vec![ta] };
         let mut engine = SimEngine::new();
         engine.start(NoopSink, "ws".into(), "127.0.0.1", 0, 20, banks, Vec::new(), Default::default(), Default::default(), vec![r]).await.unwrap();
@@ -6027,10 +6080,10 @@ mod tests {
     fn multi_word_rule_action_onto_a_single_word_register_writes_nothing() {
         let mut b = banks1(&[(1, 3, 5, 7)]);
         let ta = TimedAction {
-            action: Action::Set { unit: 1, bank: 3, address: 5, value: 12 },
+            action: Action::Set { unit: 1, bank: 3, address: 5, value: 12.0 },
             delay_ms: 0.0, data_type: "f32".into(), byte_order: "ABCD".into(),
         };
-        apply_timed_action(&mut b, &ta, 0);
+        apply_timed_action(&mut b, &RegMetaMap::new(), &ta, 0);
         assert_eq!(b[&1].holding.get(&5), Some(&7), "partial f32 write landed on a u16 register");
     }
 
@@ -6317,7 +6370,7 @@ mod tests {
     }
 
     fn cond_rule(id: i64, join: Join, conds: Vec<Cond>) -> RuleDef {
-        rule(id, Trigger::Condition { join, conds }, vec![Action::Inc { unit: 1, bank: 3, address: 99, by: 1 }])
+        rule(id, Trigger::Condition { join, conds }, vec![Action::Inc { unit: 1, bank: 3, address: 99, by: 1.0 }])
     }
 
     fn sim_rule(trigger: &str) -> SimRule {
@@ -6502,6 +6555,96 @@ mod tests {
         assert_eq!(eval_rules(&rules, &mut st, &banks1(&[(1, 3, 0, 10)]), &meta, 0.0, &[]).len(), 0, "first observation");
         assert_eq!(eval_rules(&rules, &mut st, &banks1(&[(1, 3, 0, 11)]), &meta, 10.0, &[]).len(), 1);
         assert_eq!(eval_rules(&rules, &mut st, &banks1(&[(1, 3, 0, 11)]), &meta, 20.0, &[]).len(), 0);
+    }
+
+    fn tact(action: Action, dt: &str) -> TimedAction {
+        TimedAction { action, delay_ms: 0.0, data_type: dt.into(), byte_order: "ABCD".into() }
+    }
+
+    #[test]
+    fn set_action_writes_engineering_value() {
+        let mut b = banks1(&[(1, 3, 0, 0)]);
+        let meta = cmeta(&[(1, 3, 0, "u16", 0.1)]);
+        apply_timed_action(&mut b, &meta, &timed(Action::Set { unit: 1, bank: 3, address: 0, value: 25.57 }), 0);
+        assert_eq!(read_word(&b, 1, 3, 0), Some(256));
+    }
+
+    #[test]
+    fn inc_dec_in_engineering_units() {
+        let mut b = banks1(&[(1, 3, 0, 200)]);
+        let meta = cmeta(&[(1, 3, 0, "u16", 0.1)]);
+        apply_timed_action(&mut b, &meta, &timed(Action::Inc { unit: 1, bank: 3, address: 0, by: 0.5 }), 0);
+        assert_eq!(read_word(&b, 1, 3, 0), Some(205));
+        apply_timed_action(&mut b, &meta, &timed(Action::Dec { unit: 1, bank: 3, address: 0, by: 1.0 }), 0);
+        assert_eq!(read_word(&b, 1, 3, 0), Some(195));
+    }
+
+    #[test]
+    fn set_on_f32_target_writes_both_words() {
+        let mut b = banks1(&[(1, 3, 4, 0), (1, 3, 5, 0)]);
+        let meta = cmeta(&[(1, 3, 4, "f32", 1.0)]);
+        // The stored dataType (u16 default) is ignored when the meta is known.
+        apply_timed_action(&mut b, &meta, &timed(Action::Set { unit: 1, bank: 3, address: 4, value: 12.75 }), 0);
+        assert_eq!(read_typed(&b, 1, 3, 4, "f32", "ABCD"), Some(12.75));
+    }
+
+    #[test]
+    fn copy_copies_engineering_value() {
+        let mut b = banks1(&[(1, 3, 0, 235), (1, 3, 1, 0)]);
+        let meta = cmeta(&[(1, 3, 0, "u16", 0.1), (1, 3, 1, "i16", 0.01)]);
+        let copy = Action::Copy { src_unit: 1, src_bank: 3, src_addr: 0, unit: 1, bank: 3, address: 1, scale: 1.0, offset: 0.0 };
+        apply_timed_action(&mut b, &meta, &timed(copy), 0);
+        assert_eq!(read_word(&b, 1, 3, 1), Some(2350));
+        // Extra scale/offset apply to the engineering value: 23.5*2+1 = 48 → 4800.
+        let copy2 = Action::Copy { src_unit: 1, src_bank: 3, src_addr: 0, unit: 1, bank: 3, address: 1, scale: 2.0, offset: 1.0 };
+        apply_timed_action(&mut b, &meta, &timed(copy2), 0);
+        assert_eq!(read_word(&b, 1, 3, 1), Some(4800));
+    }
+
+    #[test]
+    fn bit_targets_non_zero_is_on() {
+        let mut b = banks1(&[(1, 1, 0, 0)]);
+        apply_timed_action(&mut b, &RegMetaMap::new(), &timed(Action::Set { unit: 1, bank: 1, address: 0, value: 0.5 }), 0);
+        assert_eq!(read_word(&b, 1, 1, 0), Some(1));
+        apply_timed_action(&mut b, &RegMetaMap::new(), &timed(Action::Set { unit: 1, bank: 1, address: 0, value: 0.0 }), 0);
+        assert_eq!(read_word(&b, 1, 1, 0), Some(0));
+    }
+
+    #[test]
+    fn legacy_integer_actions_unchanged() {
+        let meta = cmeta(&[(1, 3, 0, "u16", 1.0)]);
+        let mut with = banks1(&[(1, 3, 0, 10)]);
+        let mut without = banks1(&[(1, 3, 0, 10)]);
+        for a in [
+            Action::Set { unit: 1, bank: 3, address: 0, value: 42.0 },
+            Action::Inc { unit: 1, bank: 3, address: 0, by: 8.0 },
+            Action::Dec { unit: 1, bank: 3, address: 0, by: 60.0 },
+        ] {
+            apply_timed_action(&mut with, &meta, &timed(a.clone()), 0);
+            apply_timed_action(&mut without, &RegMetaMap::new(), &timed(a), 0);
+            assert_eq!(read_word(&with, 1, 3, 0), read_word(&without, 1, 3, 0));
+        }
+        assert_eq!(read_word(&with, 1, 3, 0), Some(65526), "u16 wraps exactly as before");
+    }
+
+    #[test]
+    fn action_without_target_meta_uses_stored_type() {
+        let mut b = banks1(&[(1, 3, 0, 0), (1, 3, 1, 0)]);
+        apply_timed_action(&mut b, &RegMetaMap::new(), &tact(Action::Set { unit: 1, bank: 3, address: 0, value: 1.0 }, "f32"), 0);
+        assert_eq!(read_typed(&b, 1, 3, 0, "f32", "ABCD"), Some(1.0));
+        // Existing-only: an absent target is never created.
+        apply_timed_action(&mut b, &RegMetaMap::new(), &timed(Action::Set { unit: 1, bank: 3, address: 9, value: 5.0 }), 0);
+        assert_eq!(read_word(&b, 1, 3, 9), None);
+    }
+
+    #[test]
+    fn parse_action_accepts_float_values() {
+        let v: serde_json::Value = serde_json::from_str(r#"{"type":"set","unit":1,"bank":3,"address":0,"value":25.57}"#).unwrap();
+        assert_eq!(parse_action(&v).unwrap().action, Action::Set { unit: 1, bank: 3, address: 0, value: 25.57 });
+        let v: serde_json::Value = serde_json::from_str(r#"{"type":"inc","unit":1,"bank":3,"address":0,"by":2}"#).unwrap();
+        assert_eq!(parse_action(&v).unwrap().action, Action::Inc { unit: 1, bank: 3, address: 0, by: 2.0 });
+        let v: serde_json::Value = serde_json::from_str(r#"{"type":"dec","unit":1,"bank":3,"address":0}"#).unwrap();
+        assert_eq!(parse_action(&v).unwrap().action, Action::Dec { unit: 1, bank: 3, address: 0, by: 1.0 });
     }
 
     #[test]
