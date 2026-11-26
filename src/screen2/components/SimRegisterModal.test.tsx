@@ -54,4 +54,31 @@ describe("SimRegisterModal", () => {
     expect(screen.getByRole("option", { name: /^generator$/i })).toBeDisabled();
     expect(screen.getByRole("option", { name: /^route$/i })).toBeDisabled();
   });
+
+  const presetReg = {
+    id: 5, unitId: 1, functionCode: 3, address: 10, alias: "Temp", dataType: "u16",
+    holdValue: 0, sortOrder: 0, valueSource: "device", byteOrder: "ABCD",
+    sourceParams: JSON.stringify({ preset: "temperature", min: 0, max: 100 }), intervalMs: 1000,
+  };
+
+  it("saving a preset register without a period does not stamp periodMs back in (I1)", () => {
+    const onSubmit = vi.fn();
+    render(<SimRegisterModal open initial={presetReg} onClose={() => {}} onSubmit={onSubmit} />);
+    const period = screen.getByLabelText(/period ms/i) as HTMLInputElement;
+    expect(period.value).toBe("");
+    expect(period.placeholder).toMatch(/default/i);
+    fireEvent.change(screen.getByDisplayValue("Temp"), { target: { value: "Temp 2" } });
+    fireEvent.click(screen.getByRole("button", { name: /save/i }));
+    const arg = onSubmit.mock.calls[0][0];
+    expect(arg.alias).toBe("Temp 2");
+    expect(JSON.parse(arg.sourceParams)).toEqual({ preset: "temperature", min: 0, max: 100 });
+  });
+
+  it("keeps an explicit period on a preset register (I1)", () => {
+    const onSubmit = vi.fn();
+    render(<SimRegisterModal open initial={presetReg} onClose={() => {}} onSubmit={onSubmit} />);
+    fireEvent.change(screen.getByLabelText(/period ms/i), { target: { value: "2500" } });
+    fireEvent.click(screen.getByRole("button", { name: /save/i }));
+    expect(JSON.parse(onSubmit.mock.calls[0][0].sourceParams).periodMs).toBe(2500);
+  });
 });

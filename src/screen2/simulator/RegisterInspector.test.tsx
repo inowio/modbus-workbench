@@ -122,4 +122,30 @@ describe("RegisterInspector", () => {
     render(<RegisterInspector {...base()} register={{ ...reg, id: 3, functionCode: 4 }} />);
     expect(screen.getByText("Read only")).toBeInTheDocument();
   });
+
+  it("saving only the alias of a preset register without a period leaves periodMs absent (I1)", () => {
+    const p = base();
+    render(<RegisterInspector {...p} />);
+    fireEvent.change(screen.getByDisplayValue("Temperature"), { target: { value: "Temp 2" } });
+    fireEvent.click(screen.getByRole("button", { name: /save/i }));
+    const saved = p.onSave.mock.calls[0][0] as PageRegister;
+    expect(saved.alias).toBe("Temp 2");
+    expect(JSON.parse(saved.sourceParams)).toEqual({ preset: "temperature", min: 0, max: 100 });
+  });
+
+  it("shows an empty period with a default placeholder for a preset register (I1)", () => {
+    render(<RegisterInspector {...base()} />);
+    fireEvent.click(screen.getByRole("tab", { name: /source/i }));
+    const period = screen.getByLabelText(/period ms/i) as HTMLInputElement;
+    expect(period.value).toBe("");
+    expect(period.placeholder).toMatch(/default/i);
+  });
+
+  it("a generator register still defaults its period to 1000 ms (I1)", () => {
+    const p = base();
+    const gen = { ...reg, id: 9, valueSource: "generator", sourceParams: JSON.stringify({ kind: "sine", min: 0, max: 10 }) };
+    render(<RegisterInspector {...p} register={gen} />);
+    fireEvent.click(screen.getByRole("button", { name: /save/i }));
+    expect(JSON.parse((p.onSave.mock.calls[0][0] as PageRegister).sourceParams).periodMs).toBe(1000);
+  });
 });

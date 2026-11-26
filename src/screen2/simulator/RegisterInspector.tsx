@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 
 import { rwLabel, type PageRegister } from "./simFilters";
+import { buildPeriodicParams, initialPeriodText, parseSourceParams, periodPlaceholder } from "./sourceParams";
 import type { SimDevice } from "./useSimulatorData";
 
 const DEVICE_PRESETS = ["temperature", "humidity", "pressure", "flow", "vibration", "analog", "discrete", "counter"];
@@ -10,31 +11,6 @@ const BYTE_ORDERS = ["ABCD", "BADC", "CDAB", "DCBA"];
 const DISPLAY_FORMATS = ["raw", "dec0", "dec1", "dec2", "hex"];
 
 const FC_LABEL: Record<number, string> = { 1: "Coil", 2: "Discrete", 3: "Holding", 4: "Input" };
-
-type SourceParams = {
-  kind?: string;
-  preset?: string;
-  min?: number;
-  max?: number;
-  periodMs?: number;
-  slaveUnitId?: number;
-  connectionKind?: string;
-  functionCode?: number;
-  address?: number;
-  scale?: number;
-  offset?: number;
-  srcByteOrder?: string;
-};
-
-function parseSourceParams(raw: string | undefined): SourceParams {
-  if (!raw) return {};
-  try {
-    const parsed = JSON.parse(raw);
-    return typeof parsed === "object" && parsed !== null ? parsed : {};
-  } catch {
-    return {};
-  }
-}
 
 function accessLabel(functionCode: number): string {
   return rwLabel(functionCode) === "R/W" ? "Read-Write" : "Read only";
@@ -91,7 +67,7 @@ export default function RegisterInspector(props: RegisterInspectorProps) {
   const [preset, setPreset] = useState(DEVICE_PRESETS[0]);
   const [min, setMin] = useState(0);
   const [max, setMax] = useState(100);
-  const [periodMs, setPeriodMs] = useState(1000);
+  const [periodText, setPeriodText] = useState(""); // "" ⇒ default period
   const [sourceUnitId, setSourceUnitId] = useState(1);
   const [sourceConnectionKind, setSourceConnectionKind] = useState("tcp");
   const [sourceFunctionCode, setSourceFunctionCode] = useState(3);
@@ -112,7 +88,7 @@ export default function RegisterInspector(props: RegisterInspectorProps) {
     setPreset(params.preset ?? DEVICE_PRESETS[0]);
     setMin(params.min ?? 0);
     setMax(params.max ?? 100);
-    setPeriodMs(params.periodMs ?? 1000);
+    setPeriodText(initialPeriodText(register.valueSource, params));
     setSourceUnitId(params.slaveUnitId ?? 1);
     setSourceConnectionKind(params.connectionKind ?? "tcp");
     setSourceFunctionCode(params.functionCode ?? 3);
@@ -158,10 +134,8 @@ export default function RegisterInspector(props: RegisterInspectorProps) {
 
   const handleSave = () => {
     const sourceParams = JSON.stringify(
-      reg.valueSource === "generator"
-        ? { kind, min, max, periodMs }
-        : reg.valueSource === "device"
-        ? { preset, min, max, periodMs }
+      reg.valueSource === "generator" || reg.valueSource === "device"
+        ? buildPeriodicParams(reg.valueSource, { kind, preset, min, max, periodText })
         : reg.valueSource === "route"
         ? {
             slaveUnitId: sourceUnitId,
@@ -418,7 +392,7 @@ export default function RegisterInspector(props: RegisterInspectorProps) {
                 </label>
                 <label className={LABEL_CLASS}>
                   Period (ms)
-                  <input aria-label="Period ms" type="number" value={periodMs} onChange={(e) => setPeriodMs(Number(e.target.value))} className={INPUT_CLASS} />
+                  <input aria-label="Period ms" type="number" value={periodText} placeholder={periodPlaceholder(reg.valueSource)} onChange={(e) => setPeriodText(e.target.value)} className={INPUT_CLASS} />
                 </label>
               </>
             )}

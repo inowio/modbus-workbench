@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
 import { RiCloseLine } from "react-icons/ri";
 
+import { buildPeriodicParams, initialPeriodText, parseSourceParams, periodPlaceholder } from "../simulator/sourceParams";
+
 export type SimRegister = {
   id: number;
   unitId: number;
@@ -40,31 +42,6 @@ const GENERATOR_KINDS = ["sine", "ramp", "decrement", "step", "random", "toggle"
 const MULTI_WORD_TYPES = ["u32", "i32", "f32", "u64", "i64", "f64"];
 const BYTE_ORDERS = ["ABCD", "BADC", "CDAB", "DCBA"];
 
-type SourceParams = {
-  kind?: string;
-  preset?: string;
-  min?: number;
-  max?: number;
-  periodMs?: number;
-  slaveUnitId?: number;
-  connectionKind?: string;
-  functionCode?: number;
-  address?: number;
-  scale?: number;
-  offset?: number;
-  srcByteOrder?: string;
-};
-
-function parseSourceParams(raw: string | undefined): SourceParams {
-  if (!raw) return {};
-  try {
-    const parsed = JSON.parse(raw);
-    return typeof parsed === "object" && parsed !== null ? parsed : {};
-  } catch {
-    return {};
-  }
-}
-
 export default function SimRegisterModal(props: {
   open: boolean;
   initial: SimRegister | null;
@@ -78,7 +55,7 @@ export default function SimRegisterModal(props: {
   const [preset, setPreset] = useState(DEVICE_PRESETS[0]);
   const [min, setMin] = useState(0);
   const [max, setMax] = useState(100);
-  const [periodMs, setPeriodMs] = useState(1000);
+  const [periodText, setPeriodText] = useState(""); // "" ⇒ default period
   const [sourceUnitId, setSourceUnitId] = useState(1);
   const [sourceConnectionKind, setSourceConnectionKind] = useState("tcp");
   const [sourceFunctionCode, setSourceFunctionCode] = useState(3);
@@ -96,7 +73,7 @@ export default function SimRegisterModal(props: {
     setPreset(params.preset ?? DEVICE_PRESETS[0]);
     setMin(params.min ?? 0);
     setMax(params.max ?? 100);
-    setPeriodMs(params.periodMs ?? 1000);
+    setPeriodText(initialPeriodText(next.valueSource, params));
     setSourceUnitId(params.slaveUnitId ?? 1);
     setSourceConnectionKind(params.connectionKind ?? "tcp");
     setSourceFunctionCode(params.functionCode ?? 3);
@@ -148,10 +125,8 @@ export default function SimRegisterModal(props: {
 
   const handleSubmit = () => {
     const sourceParams = JSON.stringify(
-      reg.valueSource === "generator"
-        ? { kind, min, max, periodMs }
-        : reg.valueSource === "device"
-        ? { preset, min, max, periodMs }
+      reg.valueSource === "generator" || reg.valueSource === "device"
+        ? buildPeriodicParams(reg.valueSource, { kind, preset, min, max, periodText })
         : reg.valueSource === "route"
         ? {
             slaveUnitId: sourceUnitId,
@@ -329,7 +304,7 @@ export default function SimRegisterModal(props: {
                   className="rounded-lg border border-slate-300 bg-white px-2 py-1 dark:border-slate-700 dark:bg-slate-900" />
               </label>
               <label className="flex flex-col gap-1 text-xs">Period (ms)
-                <input aria-label="Period ms" type="number" value={periodMs} onChange={(e) => setPeriodMs(Number(e.target.value))}
+                <input aria-label="Period ms" type="number" value={periodText} placeholder={periodPlaceholder(reg.valueSource)} onChange={(e) => setPeriodText(e.target.value)}
                   className="rounded-lg border border-slate-300 bg-white px-2 py-1 dark:border-slate-700 dark:bg-slate-900" />
               </label>
             </>
