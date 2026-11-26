@@ -203,7 +203,7 @@ async fn prepare<S: ScanSink>(
     // 4. From here on the shared session of this kind refuses to (re)open.
     let session_kind = match scan.kind {
         ScanKind::Serial => SessionKind::Rtu,
-        ScanKind::Tcp => SessionKind::Tcp,
+        ScanKind::Tcp | ScanKind::TcpRange => SessionKind::Tcp,
     };
     let flag = begin_scan(modbus, ws, session_kind)?;
     // Register the scan now so a cancel during the waits below is kept.
@@ -218,7 +218,7 @@ async fn prepare<S: ScanSink>(
     // 5. Close the shared session.
     match scan.kind {
         ScanKind::Serial => release_rtu_for_scan(modbus, ws, release_wait).await?,
-        ScanKind::Tcp => release_tcp_for_scan(modbus, ws, release_wait).await?,
+        ScanKind::Tcp | ScanKind::TcpRange => release_tcp_for_scan(modbus, ws, release_wait).await?,
     }
     if cancel.is_cancelled() {
         // Free the workspace before telling the UI, so it can start again.
@@ -251,7 +251,7 @@ pub async fn start_slave_scan(
     // 1. Validate.
     let scan = validate(&request)?;
     let connect_timeout = match scan.kind {
-        ScanKind::Tcp => connect_timeout_of(&app, &ws).await?,
+        ScanKind::Tcp | ScanKind::TcpRange => connect_timeout_of(&app, &ws).await?,
         ScanKind::Serial => Duration::ZERO, // only TCP scans connect
     };
     let sink = Arc::new(AppSink(app.clone()));
@@ -420,6 +420,9 @@ mod tests {
             }],
             tcp: None,
             concurrency: 1,
+            hosts: vec![],
+            host_concurrency: 0,
+            connect_wait: Duration::ZERO,
         }
     }
 

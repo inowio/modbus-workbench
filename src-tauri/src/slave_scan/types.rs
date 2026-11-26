@@ -1,5 +1,6 @@
 //! Pure, AppHandle-free types and logic for the slave scanner.
 
+use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -12,6 +13,12 @@ const MAX_RETRIES: u8 = 3;
 const DEFAULT_TCP_CONCURRENCY: u8 = 4;
 const MAX_TCP_CONCURRENCY: u8 = 32;
 const MAX_SCAN_ID_LEN: usize = 64;
+const DEFAULT_HOST_CONCURRENCY: u16 = 64;
+const MAX_HOST_CONCURRENCY: u16 = 256;
+const DEFAULT_CONNECT_WAIT_MS: u64 = 300;
+const MIN_CONNECT_WAIT_MS: u64 = 50;
+const MAX_CONNECT_WAIT_MS: u64 = 5000;
+const MAX_RANGE_ADDRS: u64 = 1024;
 const PARITIES: [&str; 3] = ["none", "even", "odd"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -19,6 +26,8 @@ const PARITIES: [&str; 3] = ["none", "even", "odd"];
 pub enum ScanKind {
     Serial,
     Tcp,
+    #[serde(rename = "tcpRange")]
+    TcpRange,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -70,6 +79,12 @@ pub struct ScanRequest {
     pub sweep: Option<Sweep>,
     pub tcp: Option<TcpTarget>,
     pub concurrency: Option<u8>,
+    #[serde(default)]
+    pub range: Option<String>,
+    #[serde(default)]
+    pub host_concurrency: Option<u16>,
+    #[serde(default)]
+    pub connect_wait_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -85,6 +100,79 @@ pub struct ValidScan {
     pub tcp: Option<TcpTarget>,
     /// 1 for serial scans; concurrency applies only to TCP.
     pub concurrency: usize,
+    /// TcpRange only: the addresses to scan, sorted and de-duplicated.
+    pub hosts: Vec<Ipv4Addr>,
+    /// TcpRange only: hosts probed in parallel during stage 1.
+    pub host_concurrency: usize,
+    /// TcpRange only: how long stage 1 waits for a connect.
+    pub connect_wait: Duration,
+}
+
+const NOT_AN_ADDRESS: &str = "Not an IPv4 address or range";
+const UNSCANNABLE: &str = "Multicast, broadcast and 0.x addresses can't be scanned";
+
+fn parse_ipv4(s: &str) -> Result<Ipv4Addr, String> {
+    s.trim().parse::<Ipv4Addr>().map_err(|_| NOT_AN_ADDRESS.to_string())
+}
+
+fn is_scannable(ip: u32) -> bool {
+    let first = ip >> 24;
+    first != 0 && first < 224 // 0/8, multicast 224/4, reserved 240/4 incl. broadcast
+}
+
+/// Parses `a.b.c.d`, `a.b.c.d-e`, `a.b.c.d-w.x.y.z` or `a.b.c.d/n` into a
+/// sorted, de-duplicated address list (at most 1024 addresses).
+pub fn parse_ip_range(s: &str) -> Result<Vec<Ipv4Addr>, String> {
+    let s = s.trim();
+    let (start, end): (u32, u32) = if let Some((a, n)) = s.split_once('/') {
+        let ip = u32::from(parse_ipv4(a)?);
+        let prefix: u32 = n.trim().parse().map_err(|_| NOT_AN_ADDRESS.to_string())?;
+        if prefix > 32 {
+            return Err(NOT_AN_ADDRESS.into());
+        }
+        let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
+        let (net, bcast) = (ip & mask, ip | !mask);
+        if prefix <= 30 {
+            (net + 1, bcast - 1)
+        } else {
+            (net, bcast)
+        }
+    } else if let Some((a, b)) = s.split_once('-') {
+        let start = u32::from(parse_ipv4(a)?);
+        let b = b.trim();
+        let end = if b.contains('.') {
+            u32::from(parse_ipv4(b)?)
+        } else {
+            let last: u32 = b.parse().map_err(|_| NOT_AN_ADDRESS.to_string())?;
+            if last > 255 {
+                return Err(NOT_AN_ADDRESS.into());
+            }
+            (start & !0xFF) | last
+        };
+        (start, end)
+    } else {
+        let ip = u32::from(parse_ipv4(s)?);
+        (ip, ip)
+    };
+    if end < start {
+        return Err("Range end is before its start".into());
+    }
+    if !is_scannable(start) || !is_scannable(end) {
+        return Err(UNSCANNABLE.into());
+    }
+    let n = u64::from(end) - u64::from(start) + 1;
+    if n > MAX_RANGE_ADDRS {
+        return Err(format!("Too many addresses ({n}) — the limit is {MAX_RANGE_ADDRS}"));
+    }
+    Ok((start..=end).map(Ipv4Addr::from).collect())
+}
+
+/// Suggests a range for a private address: its /24 minus network and broadcast.
+#[allow(dead_code)] // used by the range engine (Task 2)
+pub fn default_range_for(ip: Ipv4Addr) -> Option<String> {
+    let [a, b, c, _] = ip.octets();
+    let private = a == 10 || (a == 172 && (16..=31).contains(&b)) || (a == 192 && b == 168);
+    private.then(|| format!("{a}.{b}.{c}.1-254"))
 }
 
 fn check_parity(p: &str) -> Result<(), String> {
@@ -111,7 +199,9 @@ pub fn validate(req: &ScanRequest) -> Result<ValidScan, String> {
 
     let (min_unit, max_unit, range_msg) = match req.kind {
         ScanKind::Serial => (1, SERIAL_MAX_UNIT, "start/quantity must stay within 1–247 for serial"),
-        ScanKind::Tcp => (0, TCP_MAX_UNIT, "start/quantity must stay within 0–255 for TCP"),
+        ScanKind::Tcp | ScanKind::TcpRange => {
+            (0, TCP_MAX_UNIT, "start/quantity must stay within 0–255 for TCP")
+        }
     };
     let start = u32::from(req.start_unit_id);
     let last = start + u32::from(req.quantity) - 1; // quantity >= 1; u32 cannot overflow
@@ -125,6 +215,9 @@ pub fn validate(req: &ScanRequest) -> Result<ValidScan, String> {
     let mut combos = Vec::new();
     let mut tcp = None;
     let concurrency;
+    let mut hosts = Vec::new();
+    let mut host_concurrency = 0usize;
+    let mut connect_wait = Duration::ZERO;
 
     match req.kind {
         ScanKind::Serial => {
@@ -199,6 +292,38 @@ pub fn validate(req: &ScanRequest) -> Result<ValidScan, String> {
             }
             concurrency = usize::from(c);
         }
+        ScanKind::TcpRange => {
+            let range = req
+                .range
+                .as_deref()
+                .ok_or_else(|| "range is required for an IP range scan".to_string())?;
+            hosts = parse_ip_range(range)?;
+            let t = req
+                .tcp
+                .as_ref()
+                .ok_or_else(|| "tcp target is required for a TCP scan".to_string())?;
+            if t.port == 0 {
+                return Err("tcp.port must be within 1–65535".into());
+            }
+            tcp = Some(TcpTarget { host: String::new(), port: t.port });
+            let c = req.concurrency.unwrap_or(DEFAULT_TCP_CONCURRENCY);
+            if !(1..=MAX_TCP_CONCURRENCY).contains(&c) {
+                return Err(format!("concurrency must be within 1–{MAX_TCP_CONCURRENCY}"));
+            }
+            concurrency = usize::from(c);
+            let hc = req.host_concurrency.unwrap_or(DEFAULT_HOST_CONCURRENCY);
+            if !(1..=MAX_HOST_CONCURRENCY).contains(&hc) {
+                return Err(format!("hostConcurrency must be within 1–{MAX_HOST_CONCURRENCY}"));
+            }
+            host_concurrency = usize::from(hc);
+            let cw = req.connect_wait_ms.unwrap_or(DEFAULT_CONNECT_WAIT_MS);
+            if !(MIN_CONNECT_WAIT_MS..=MAX_CONNECT_WAIT_MS).contains(&cw) {
+                return Err(format!(
+                    "connectWaitMs must be within {MIN_CONNECT_WAIT_MS}–{MAX_CONNECT_WAIT_MS}"
+                ));
+            }
+            connect_wait = Duration::from_millis(cw);
+        }
     }
 
     Ok(ValidScan {
@@ -212,6 +337,9 @@ pub fn validate(req: &ScanRequest) -> Result<ValidScan, String> {
         combos,
         tcp,
         concurrency,
+        hosts,
+        host_concurrency,
+        connect_wait,
     })
 }
 
@@ -375,6 +503,9 @@ mod tests {
             sweep: None,
             tcp: None,
             concurrency: None,
+            range: None,
+            host_concurrency: None,
+            connect_wait_ms: None,
         }
     }
 
@@ -508,6 +639,98 @@ mod tests {
         let mut t = tcp_req();
         t.tcp = Some(TcpTarget { host: "h".into(), port: 0 });
         assert!(validate(&t).is_err());
+    }
+
+    fn n(s: &str) -> usize {
+        parse_ip_range(s).unwrap().len()
+    }
+
+    #[test]
+    fn parse_ip_range_forms() {
+        let v = parse_ip_range("192.168.68.1-254").unwrap();
+        assert_eq!(v.len(), 254);
+        assert_eq!(v[0], Ipv4Addr::new(192, 168, 68, 1));
+        assert_eq!(*v.last().unwrap(), Ipv4Addr::new(192, 168, 68, 254));
+        assert_eq!(n("192.168.68.10-192.168.69.20"), 267);
+        let v = parse_ip_range("192.168.68.0/24").unwrap();
+        assert_eq!(v.len(), 254);
+        assert_eq!(v[0], Ipv4Addr::new(192, 168, 68, 1));
+        assert_eq!(*v.last().unwrap(), Ipv4Addr::new(192, 168, 68, 254));
+        assert_eq!(n("10.0.0.0/22"), 1022);
+        assert_eq!(n("192.168.1.5"), 1);
+        assert_eq!(n("192.168.1.0/31"), 2);
+        assert_eq!(n("192.168.1.7/32"), 1);
+        assert_eq!(n(" 192.168.68.1 - 20 "), 20);
+    }
+
+    #[test]
+    fn parse_ip_range_refusals() {
+        let e = |s: &str| parse_ip_range(s).unwrap_err();
+        assert_eq!(e("192.168.68.20-10"), "Range end is before its start");
+        for s in ["224.0.0.1", "255.255.255.255", "0.1.2.3"] {
+            assert_eq!(e(s), "Multicast, broadcast and 0.x addresses can't be scanned", "{s}");
+        }
+        for s in ["192.168.68.300", "abc", ""] {
+            assert_eq!(e(s), "Not an IPv4 address or range", "{s}");
+        }
+        assert_eq!(e("10.0.0.0/21"), "Too many addresses (2046) — the limit is 1024");
+        assert_eq!(e("10.0.0.0-10.0.4.0"), "Too many addresses (1025) — the limit is 1024");
+    }
+
+    #[test]
+    fn default_range_private_only() {
+        assert_eq!(default_range_for(Ipv4Addr::new(192, 168, 68, 128)), Some("192.168.68.1-254".into()));
+        assert_eq!(default_range_for(Ipv4Addr::new(10, 2, 3, 4)), Some("10.2.3.1-254".into()));
+        assert!(default_range_for(Ipv4Addr::new(172, 20, 1, 9)).is_some());
+        assert_eq!(default_range_for(Ipv4Addr::new(8, 8, 8, 8)), None);
+        assert_eq!(default_range_for(Ipv4Addr::new(172, 32, 0, 1)), None);
+    }
+
+    fn range_req() -> ScanRequest {
+        ScanRequest {
+            kind: ScanKind::TcpRange,
+            range: Some("192.168.68.1-254".into()),
+            tcp: Some(TcpTarget { host: String::new(), port: 502 }),
+            ..tcp_req()
+        }
+    }
+
+    #[test]
+    fn validate_tcp_range() {
+        let v = validate(&range_req()).unwrap();
+        assert_eq!(v.host_concurrency, 64);
+        assert_eq!(v.connect_wait, Duration::from_millis(300));
+        assert_eq!(v.hosts.len(), 254);
+        assert_eq!(v.concurrency, 4);
+        assert!(v.ports.is_empty() && v.combos.is_empty());
+        assert_eq!(v.tcp, Some(TcpTarget { host: String::new(), port: 502 }));
+        let mut r = range_req();
+        r.range = None;
+        assert!(validate(&r).is_err());
+        for (hc, ok) in [(0, false), (1, true), (256, true), (257, false)] {
+            let mut r = range_req();
+            r.host_concurrency = Some(hc);
+            assert_eq!(validate(&r).is_ok(), ok, "hc {hc}");
+        }
+        for (cw, ok) in [(49, false), (50, true), (5000, true), (5001, false)] {
+            let mut r = range_req();
+            r.connect_wait_ms = Some(cw);
+            assert_eq!(validate(&r).is_ok(), ok, "cw {cw}");
+        }
+        let mut r = range_req();
+        r.tcp = Some(TcpTarget { host: String::new(), port: 0 });
+        assert!(validate(&r).is_err());
+    }
+
+    #[test]
+    fn tcp_range_kind_deserializes() {
+        let j = r#"{"scanId":"s","kind":"tcpRange","startUnitId":1,"quantity":2,"probe":"holding",
+            "waitMs":200,"retries":0,"ports":[],"serial":null,"sweep":null,
+            "tcp":{"host":"","port":502},"concurrency":null,"range":"10.0.0.1-5"}"#;
+        let r: ScanRequest = serde_json::from_str(j).unwrap();
+        assert_eq!(r.kind, ScanKind::TcpRange);
+        assert_eq!(r.range.as_deref(), Some("10.0.0.1-5"));
+        assert!(r.host_concurrency.is_none());
     }
 
     #[test]

@@ -334,7 +334,7 @@ pub async fn run_scan<O: Opener, C: Connector, S: ScanSink>(
     let units = scan.units.len() as u64;
     let total = match scan.kind {
         ScanKind::Serial => units * scan.combos.len() as u64 * scan.ports.len() as u64,
-        ScanKind::Tcp => units,
+        ScanKind::Tcp | ScanKind::TcpRange => units,
     };
     let ctx = Arc::new(Ctx {
         workspace,
@@ -359,6 +359,8 @@ pub async fn run_scan<O: Opener, C: Connector, S: ScanSink>(
             Some(c) => scan_tcp_pool(scan, ctx.clone(), c, cancel).await,
             None => Err("internal error: no TCP connector for a TCP scan".to_string()),
         },
+        // The range engine arrives in a later task (Task 2).
+        ScanKind::TcpRange => Err("IP range scans are not available yet".to_string()),
     };
 
     // A serial scan that could not open any port at any setting failed.
@@ -1252,6 +1254,9 @@ mod tests {
             combos: vec![combo(9600, "none")],
             tcp: None,
             concurrency: 1,
+            hosts: vec![],
+            host_concurrency: 0,
+            connect_wait: Duration::ZERO,
         }
     }
 

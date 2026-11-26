@@ -1145,6 +1145,9 @@ mod tests {
             combos: vec![],
             tcp: Some(TcpTarget { host: "127.0.0.1".into(), port: addr.port() }),
             concurrency: 4,
+            hosts: vec![],
+            host_concurrency: 0,
+            connect_wait: Duration::ZERO,
         };
         let sink = Arc::new(Recorder::default());
         let (_tx, cancel) = cancel_pair();
