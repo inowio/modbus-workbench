@@ -505,6 +505,7 @@ export default function TcpSimulatorPage() {
         initial={saveTemplateDraft}
         forceNew
         takenKeys={sim.deviceTemplates.map((t) => t.templateKey)}
+        categories={sim.deviceTemplates.map((t) => t.category)}
         onClose={() => setSaveTemplateDraft(null)}
         onSave={async (t) => {
           const ok = await sim.saveCustomTemplate(t);

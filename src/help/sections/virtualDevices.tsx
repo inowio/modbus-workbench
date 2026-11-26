@@ -133,7 +133,7 @@ const virtualDevicesSection: HelpSectionDefinition = {
         <div className="rounded-xl border border-slate-200 bg-slate-50 p-4 dark:border-slate-800/60 dark:bg-slate-900/30">
           <p className="text-sm font-semibold uppercase tracking-wide text-emerald-700 dark:text-emerald-300">Example — build a power meter</p>
           <ol className="mt-2 list-decimal space-y-1 pl-5">
-            <li>New Device → name "Acme Power Meter", key <code>acme_power_meter</code>, pick the ⚡ icon.</li>
+            <li>New Device → name "Power Meter", category Power, pick the ⚡ icon (the key <code>custom_power_meter</code> is filled in for you under Advanced).</li>
             <li>Add a register: alias <code>voltage</code>, offset <code>0</code>, Input bank, <code>f32</code>, source Generator → sine 220–240.</li>
             <li>Add a register: alias <code>energy</code>, offset <code>2</code>, Holding bank, <code>u32</code>, source Generator → ramp.</li>
             <li>Save. The meter now appears under Custom Devices and in every workspace's Add Device gallery.</li>

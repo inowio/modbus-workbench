@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  categoryOptions,
   findOverlaps,
+  normalizeCategory,
   formatOffset,
   nextFreeOffset,
   parseOffset,
@@ -44,9 +46,9 @@ describe("templateEditorUtils", () => {
   });
 
   it("slugs keys from names with uniqueness", () => {
-    expect(slugKey("Acme Power Meter!", [])).toBe("custom_acme_power_meter");
-    expect(slugKey("Acme Power Meter", ["custom_acme_power_meter"])).toBe("custom_acme_power_meter_2");
-    expect(slugKey("Acme Power Meter", ["custom_acme_power_meter", "custom_acme_power_meter_2"])).toBe("custom_acme_power_meter_3");
+    expect(slugKey("Power Meter!", [])).toBe("custom_power_meter");
+    expect(slugKey("Power Meter", ["custom_power_meter"])).toBe("custom_power_meter_2");
+    expect(slugKey("Power Meter", ["custom_power_meter", "custom_power_meter_2"])).toBe("custom_power_meter_3");
     expect(slugKey("   ", [])).toBe("");
     expect(slugKey("***", [])).toBe("");
   });
@@ -72,5 +74,21 @@ describe("templateEditorUtils", () => {
     expect(sourceSummary(reg(0, "u16", 3, { valueSource: "generator", sourceParams: '{"kind":"ramp","min":0,"max":5,"periodMs":1500}' }))).toBe("ramp 0–5 · 1500 ms");
     expect(sourceSummary(reg(0, "u16", 3, { valueSource: "device", sourceParams: '{"preset":"temperature","min":0,"max":100}' }))).toBe("preset temperature");
     expect(sourceSummary(reg(0, "u16", 3, { valueSource: "route", sourceParams: '{"slaveUnitId":3,"functionCode":3,"address":257}' }))).toBe("route → unit 3 · FC3 @257");
+  });
+});
+
+describe("device categories", () => {
+  it("offers the standard categories plus ones already in use, without duplicates or Workspace", () => {
+    expect(categoryOptions(["Sensors", "sensors", "HVAC", " Lab ", "Workspace", ""])).toEqual([
+      "Sensors", "Power", "I/O", "Drives", "Learning", "Custom", "HVAC", "Lab",
+    ]);
+  });
+
+  it("snaps a typed category to an existing one ignoring case and spaces", () => {
+    const opts = categoryOptions(["HVAC"]);
+    expect(normalizeCategory("  sensors ", opts)).toBe("Sensors");
+    expect(normalizeCategory("hvac", opts)).toBe("HVAC");
+    expect(normalizeCategory("  Lab   rig ", opts)).toBe("Lab rig");
+    expect(normalizeCategory("   ", opts)).toBe("Custom");
   });
 });

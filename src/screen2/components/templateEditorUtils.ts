@@ -90,3 +90,35 @@ export function sourceSummary(r: TemplateRegister): string {
       return "hold";
   }
 }
+
+/** The standard device categories, in the order the editor lists them. */
+export const STANDARD_CATEGORIES = ["Sensors", "Power", "I/O", "Drives", "Learning", "Custom"];
+
+/**
+ * Categories the editor offers: the standard ones, then any other category
+ * already used by a device (first spelling wins, compared ignoring case).
+ * "Workspace" is reserved for devices built from a workspace's slaves.
+ */
+export function categoryOptions(inUse: string[]): string[] {
+  const out = [...STANDARD_CATEGORIES];
+  const seen = new Set(out.map((c) => c.toLowerCase()));
+  for (const raw of inUse) {
+    const c = raw.trim().replace(/\s+/g, " ");
+    const k = c.toLowerCase();
+    if (!c || k === "workspace" || seen.has(k)) continue;
+    seen.add(k);
+    out.push(c);
+  }
+  return out;
+}
+
+/**
+ * The category to save: trimmed, single-spaced, and snapped to an existing
+ * option when it differs only in case — so "sensors" joins "Sensors" in the
+ * Add Device gallery instead of starting a new group. Empty → "Custom".
+ */
+export function normalizeCategory(value: string, options: string[]): string {
+  const c = value.trim().replace(/\s+/g, " ");
+  if (!c) return "Custom";
+  return options.find((o) => o.toLowerCase() === c.toLowerCase()) ?? c;
+}

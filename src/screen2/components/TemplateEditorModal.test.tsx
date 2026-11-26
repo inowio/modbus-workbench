@@ -38,6 +38,36 @@ describe("TemplateEditorModal", () => {
     expect(onSave).toHaveBeenCalledWith(expect.objectContaining({ templateKey: "custom_x", name: "My Device" }));
   });
 
+  it("picks the category from a list, and a typed category snaps to an existing one", () => {
+    const onSave = vi.fn();
+    render(<TemplateEditorModal open initial={null} takenKeys={[]} categories={["HVAC", "Workspace"]} onClose={vi.fn()} onSave={onSave} />);
+    const category = screen.getByRole("combobox", { name: "Category" });
+    expect(category).toHaveValue("Custom");
+    expect(Array.from(category.querySelectorAll("option")).map((o) => o.textContent)).toEqual([
+      "Sensors", "Power", "I/O", "Drives", "Learning", "Custom", "HVAC", "New category…",
+    ]);
+    expect(screen.queryByLabelText("New category name")).not.toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText(/template name/i), { target: { value: "Power Meter" } });
+    fireEvent.change(category, { target: { value: "Power" } });
+    fireEvent.click(screen.getByRole("button", { name: /save device/i }));
+    expect(onSave).toHaveBeenLastCalledWith(expect.objectContaining({ category: "Power" }));
+
+    fireEvent.change(category, { target: { value: " new " } });
+    fireEvent.change(screen.getByLabelText("New category name"), { target: { value: "  hvac " } });
+    fireEvent.click(screen.getByRole("button", { name: /save device/i }));
+    expect(onSave).toHaveBeenLastCalledWith(expect.objectContaining({ category: "HVAC" }));
+
+    fireEvent.change(screen.getByLabelText("New category name"), { target: { value: "Lab rig" } });
+    fireEvent.click(screen.getByRole("button", { name: /save device/i }));
+    expect(onSave).toHaveBeenLastCalledWith(expect.objectContaining({ category: "Lab rig" }));
+  });
+
+  it("keeps an edited device's own category in the list", () => {
+    render(<TemplateEditorModal open initial={{ ...custom, category: "Bench" }} takenKeys={[]} onClose={vi.fn()} onSave={vi.fn()} />);
+    expect(screen.getByRole("combobox", { name: "Category" })).toHaveValue("Bench");
+  });
+
   it("adds and removes register rows", () => {
     render(<TemplateEditorModal open initial={custom} takenKeys={[]} onClose={vi.fn()} onSave={vi.fn()} />);
     expect(screen.getByLabelText("Alias 0")).toBeInTheDocument();
@@ -140,11 +170,11 @@ describe("TemplateEditorModal", () => {
 
   it("derives the key from the name until it is edited by hand", () => {
     const onSave = vi.fn();
-    render(<TemplateEditorModal open initial={null} takenKeys={["custom_acme"]} onClose={vi.fn()} onSave={onSave} />);
-    fireEvent.change(screen.getByLabelText(/template name/i), { target: { value: "Acme" } });
-    expect(screen.getByLabelText(/template key/i)).toHaveValue("custom_acme_2");
-    fireEvent.change(screen.getByLabelText(/template name/i), { target: { value: "Acme Meter" } });
-    expect(screen.getByLabelText(/template key/i)).toHaveValue("custom_acme_meter");
+    render(<TemplateEditorModal open initial={null} takenKeys={["custom_meter"]} onClose={vi.fn()} onSave={onSave} />);
+    fireEvent.change(screen.getByLabelText(/template name/i), { target: { value: "Meter" } });
+    expect(screen.getByLabelText(/template key/i)).toHaveValue("custom_meter_2");
+    fireEvent.change(screen.getByLabelText(/template name/i), { target: { value: "Power Meter" } });
+    expect(screen.getByLabelText(/template key/i)).toHaveValue("custom_power_meter");
     fireEvent.change(screen.getByLabelText(/template key/i), { target: { value: "mine" } });
     fireEvent.change(screen.getByLabelText(/template name/i), { target: { value: "Other" } });
     expect(screen.getByLabelText(/template key/i)).toHaveValue("mine");

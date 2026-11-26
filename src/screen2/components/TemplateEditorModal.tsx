@@ -6,8 +6,12 @@ import { useAppAddressFormat } from "../utils/addressFormatPref";
 import { GENERATOR_DEFAULT_PERIOD_MS, initialPeriodText, periodPlaceholder } from "../simulator/sourceParams";
 import type { DeviceTemplate, TemplateRegister } from "./AddDeviceModal";
 import {
-  findOverlaps, formatOffset, nextFreeOffset, parseOffset, regLabel, slugKey, sourceSummary,
+  categoryOptions, findOverlaps, formatOffset, nextFreeOffset, normalizeCategory, parseOffset, regLabel,
+  slugKey, sourceSummary,
 } from "./templateEditorUtils";
+
+/** Select value for the "type a new category" choice (can't clash with a real one: it has spaces trimmed out). */
+const NEW_CATEGORY = " new ";
 
 const BANKS = [
   { value: 1, label: "Coil (1)" },
@@ -133,6 +137,8 @@ export default function TemplateEditorModal(props: {
   initial: DeviceTemplate | null;
   /** Keys already used by other templates (for a uniqueness hint). */
   takenKeys: string[];
+  /** Categories already used by devices, offered alongside the standard ones. */
+  categories?: string[];
   /**
    * Treat `initial` as a *pre-filled draft for a brand-new* device rather than
    * an existing one to edit: the key stays editable and clash-guarded. Used by
@@ -149,6 +155,8 @@ export default function TemplateEditorModal(props: {
   // Once the user types a key by hand it stops following the name.
   const [keyTouched, setKeyTouched] = useState(false);
   const [iconModalOpen, setIconModalOpen] = useState(false);
+  // True while the user is typing a category that isn't in the list yet.
+  const [typingCategory, setTypingCategory] = useState(false);
   const [sel, setSel] = useState(0);
   const [focusTick, setFocusTick] = useState(0);
   const aliasRef = useRef<HTMLInputElement>(null);
@@ -159,6 +167,7 @@ export default function TemplateEditorModal(props: {
     setT(props.initial ?? emptyTemplate());
     setIsEdit(!!props.initial && !props.forceNew);
     setKeyTouched(false);
+    setTypingCategory(false);
     setSel(0);
   }, [props.open, props.initial, props.forceNew]);
 
@@ -219,6 +228,17 @@ export default function TemplateEditorModal(props: {
     setSel((s) => (s > i || s >= t.registers.length - 1 ? Math.max(0, s - 1) : s));
   };
 
+  const categories = categoryOptions([...(props.categories ?? []), props.initial?.category ?? ""]);
+  const pickCategory = (value: string) => {
+    if (value === NEW_CATEGORY) {
+      setTypingCategory(true);
+      set({ category: "" });
+    } else {
+      setTypingCategory(false);
+      set({ category: value });
+    }
+  };
+
   const keyTrim = t.templateKey.trim();
   const keyClashes = !isEdit && props.takenKeys.includes(keyTrim);
   const overlaps = findOverlaps(t.registers);
@@ -236,6 +256,8 @@ export default function TemplateEditorModal(props: {
     void props.onSave({
       ...t,
       templateKey: keyTrim,
+      // "sensors" joins "Sensors" rather than starting a new gallery group.
+      category: normalizeCategory(t.category, categories),
       // Never persist an empty alias: fall back to the placeholder shown in the list.
       registers: t.registers.map((r) => ({ ...r, alias: regLabel(r) })),
     });
@@ -270,13 +292,22 @@ export default function TemplateEditorModal(props: {
             <div className="space-y-2">
               <div className="grid grid-cols-1 gap-3 @2xl:grid-cols-[minmax(0,1.2fr)_minmax(0,0.8fr)_minmax(0,2fr)]">
                 <label className={labelCls}>Name
-                  <input aria-label="Template name" placeholder="e.g. Acme Power Meter" value={t.name}
+                  <input aria-label="Template name" placeholder="e.g. Power Meter" value={t.name}
                     onChange={(e) => setName(e.target.value)} className={inputCls} />
                 </label>
-                <label className={labelCls}>Category
-                  <input aria-label="Category" placeholder="Custom" value={t.category}
-                    onChange={(e) => set({ category: e.target.value })} className={inputCls} />
-                </label>
+                <div className={labelCls}>
+                  <label htmlFor="tpl-category">Category</label>
+                  <select id="tpl-category" aria-label="Category"
+                    value={typingCategory ? NEW_CATEGORY : normalizeCategory(t.category, categories)}
+                    onChange={(e) => pickCategory(e.target.value)} className={inputCls}>
+                    {categories.map((c) => <option key={c} value={c}>{c}</option>)}
+                    <option value={NEW_CATEGORY}>New category…</option>
+                  </select>
+                  {typingCategory ? (
+                    <input aria-label="New category name" placeholder="e.g. HVAC" value={t.category} autoFocus
+                      onChange={(e) => set({ category: e.target.value })} className={inputCls} />
+                  ) : null}
+                </div>
                 <label className={labelCls}>Description
                   <input aria-label="Description" placeholder="What this device represents" value={t.description}
                     onChange={(e) => set({ description: e.target.value })} className={inputCls} />
@@ -285,7 +316,7 @@ export default function TemplateEditorModal(props: {
               <details className="text-xs text-slate-600 dark:text-slate-300">
                 <summary className="cursor-pointer select-none font-medium">Advanced</summary>
                 <label className={`${labelCls} mt-2 max-w-sm`}>Key
-                  <input aria-label="Template key" placeholder="custom_acme_power_meter" value={t.templateKey} disabled={isEdit}
+                  <input aria-label="Template key" placeholder="custom_power_meter" value={t.templateKey} disabled={isEdit}
                     onChange={(e) => { setKeyTouched(true); set({ templateKey: e.target.value.replace(/\s+/g, "_").toLowerCase() }); }}
                     className={`${inputCls} font-mono ${isEdit ? "cursor-not-allowed opacity-60" : ""}`} />
                 </label>

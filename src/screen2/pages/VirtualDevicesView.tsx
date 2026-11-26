@@ -185,6 +185,7 @@ const VirtualDevicesView = forwardRef<VirtualDevicesHandle, { search?: string }>
         initial={editing}
         forceNew={editingIsNew}
         takenKeys={takenKeys}
+        categories={templates.map((t) => t.category)}
         onClose={() => { setEditorOpen(false); setEditing(null); setEditingIsNew(false); }}
         onSave={handleSave}
       />
