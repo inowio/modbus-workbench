@@ -30,17 +30,15 @@ const VirtualDevicesView = forwardRef<VirtualDevicesHandle, { search?: string }>
   const [confirmDelete, setConfirmDelete] = useState<DeviceTemplate | null>(null);
 
   const reload = useCallback(async () => {
-    try {
-      const [all, custom] = await Promise.all([
-        invoke<DeviceTemplate[]>("simulator_list_device_templates"),
-        invoke<DeviceTemplate[]>("simulator_list_custom_templates"),
-      ]);
-      setTemplates(all ?? []);
-      setCustomKeys(new Set((custom ?? []).map((c) => c.templateKey)));
-      setLoadError(null);
-    } catch (e) {
-      setLoadError(String(e));
-    }
+    // Settle both: a damaged custom-template file must not hide the built-ins.
+    const [all, custom] = await Promise.allSettled([
+      invoke<DeviceTemplate[]>("simulator_list_device_templates"),
+      invoke<DeviceTemplate[]>("simulator_list_custom_templates"),
+    ]);
+    if (all.status === "fulfilled") setTemplates(all.value ?? []);
+    setCustomKeys(new Set(custom.status === "fulfilled" ? (custom.value ?? []).map((c) => c.templateKey) : []));
+    const failed = [all, custom].find((r): r is PromiseRejectedResult => r.status === "rejected");
+    setLoadError(failed ? String(failed.reason) : null);
   }, []);
 
   useEffect(() => { void reload(); }, [reload]);

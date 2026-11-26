@@ -69,6 +69,18 @@ describe("VirtualDevicesView", () => {
     expect(screen.queryByText(/no custom devices yet/i)).toBeNull();
   });
 
+  it("still lists built-ins (with the error banner) when only the custom list fails (M3)", async () => {
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "simulator_list_device_templates") return Promise.resolve([tmpl("temp_humidity", "Temp Humidity", "Sensor")]);
+      if (cmd === "simulator_list_custom_templates") return Promise.reject("custom templates file is corrupt; backed up");
+      return Promise.resolve(null);
+    });
+    render(<VirtualDevicesView search="" />);
+    expect(await screen.findByText(/custom templates file is corrupt/i)).toBeInTheDocument();
+    expect(await screen.findByText("Temp Humidity")).toBeInTheDocument();
+    expect(screen.queryByText(/no built-in devices match/i)).toBeNull();
+  });
+
   it("preserves unit/displayFormat/intervalMs/holdValue on a template register when saving from the editor", async () => {
     const rich = { ...tmpl("custom_rich", "Rich"), registers: [{ offset: 0, bank: 3, dataType: "u16", byteOrder: "ABCD", valueSource: "hold", sourceParams: "{}", alias: "T", unit: "°C", displayFormat: "dec2", intervalMs: 250, holdValue: 7 }] };
     invokeMock.mockImplementation((cmd: string) => {
