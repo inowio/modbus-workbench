@@ -1,5 +1,5 @@
 import { fireEvent, render, screen } from "@testing-library/react";
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 
 import LiveValuesTab from "./LiveValuesTab";
 
@@ -30,6 +30,20 @@ describe("LiveValuesTab", () => {
       />
     );
     expect(screen.getByText(/start the server/i)).toBeInTheDocument();
+  });
+
+  it("offers a Start button when stopped (S8)", () => {
+    const onStart = vi.fn();
+    render(
+      <LiveValuesTab
+        registers={[]}
+        snapshotFor={() => undefined}
+        status={{ running: false, listen: null, clientCount: 0 }}
+        onStart={onStart}
+      />
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Start" }));
+    expect(onStart).toHaveBeenCalled();
   });
 
   it("renders a row per register with live word value when running", () => {

@@ -37,6 +37,33 @@ const base = () => ({
 beforeEach(() => localStorage.clear());
 
 describe("RegistersTab", () => {
+  it("shows a muted source summary in the Value column while stopped (S7)", () => {
+    const regs = [
+      reg({ id: 1, holdValue: 7 }),
+      reg({ id: 2, alias: "G", valueSource: "generator", sourceParams: JSON.stringify({ kind: "sine", min: 0, max: 100 }) }),
+      reg({ id: 3, alias: "D", valueSource: "device", sourceParams: JSON.stringify({ preset: "temperature" }) }),
+      reg({ id: 4, alias: "R", valueSource: "route", sourceParams: JSON.stringify({ slaveUnitId: 3, functionCode: 3, address: 257 }) }),
+    ];
+    render(<RegistersTab {...base()} registers={regs} addrFmt="hex" />);
+    expect(screen.getByText("hold 7")).toBeInTheDocument();
+    expect(screen.getByText("sine 0–100")).toBeInTheDocument();
+    expect(screen.getByText("preset temperature")).toBeInTheDocument();
+    expect(screen.getByText("route → unit 3 holding 0x0101")).toBeInTheDocument();
+  });
+
+  it("replaces the summary with the live value while running (S7)", () => {
+    render(
+      <RegistersTab
+        {...base()}
+        registers={[reg({ holdValue: 7 })]}
+        status={{ running: true, listen: null, clientCount: 0 }}
+        snapshotFor={() => ({ unitId: 1, functionCode: 3, address: 5, valueWord: 42, valueBit: null })}
+      />,
+    );
+    expect(screen.getByText("42")).toBeInTheDocument();
+    expect(screen.queryByText("hold 7")).toBeNull();
+  });
+
   it("renders all rows then filters by search", () => {
     render(<RegistersTab {...base()} />);
     expect(screen.getAllByRole("row").length).toBeGreaterThan(2);

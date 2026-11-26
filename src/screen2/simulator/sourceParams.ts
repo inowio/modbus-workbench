@@ -1,3 +1,5 @@
+import { bankName, fmtAddr, type AddrFmt } from "./ruleTargets";
+
 // Shared source-param helpers for the register editors (RegisterInspector and
 // SimRegisterModal), so both serialise device/generator params the same way.
 
@@ -64,4 +66,27 @@ export function buildPeriodicParams(
     return { kind: fields.kind, min: fields.min, max: fields.max, periodMs: period ?? GENERATOR_DEFAULT_PERIOD_MS };
   }
   return { preset: fields.preset, min: fields.min, max: fields.max, ...(period !== null ? { periodMs: period } : {}) };
+}
+
+/**
+ * Short, muted description of where a register's value comes from, shown in
+ * place of a live value while the simulator is stopped.
+ */
+export function sourceSummary(
+  r: { valueSource: string; holdValue: number; sourceParams: string },
+  addrFmt: AddrFmt = "dec",
+): string {
+  const p = parseSourceParams(r.sourceParams);
+  switch (r.valueSource) {
+    case "hold":
+      return `hold ${r.holdValue}`;
+    case "generator":
+      return `${p.kind ?? "generator"} ${p.min ?? 0}–${p.max ?? 100}`;
+    case "device":
+      return `preset ${p.preset ?? "device"}`;
+    case "route":
+      return `route → unit ${p.slaveUnitId ?? 1} ${bankName(p.functionCode ?? 3)} ${fmtAddr(p.address ?? 0, addrFmt)}`;
+    default:
+      return r.valueSource;
+  }
 }

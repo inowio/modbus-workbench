@@ -232,7 +232,7 @@ export default function TcpSimulatorPage() {
           ) : null}
 
           {activeTab === "live" ? (
-            <LiveValuesTab registers={sim.registers} snapshotFor={sim.snapshotFor} status={sim.status} addrFmt={addrFmt} />
+            <LiveValuesTab registers={sim.registers} snapshotFor={sim.snapshotFor} status={sim.status} addrFmt={addrFmt} onStart={() => void sim.start()} busy={sim.busy} />
           ) : null}
 
           {activeTab === "activity" ? (

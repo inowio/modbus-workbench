@@ -199,7 +199,8 @@ export default function RulesTab(props: {
       {rules.length === 0 ? (
         <p className="text-sm text-slate-600 dark:text-slate-300">No rules yet. Click "Add Rule".</p>
       ) : (
-        <table className="w-full table-fixed border-collapse text-left text-sm">
+        <div className="overflow-x-auto" data-testid="rules-scroll">
+        <table className="w-full min-w-[640px] table-fixed border-collapse text-left text-sm">
           <thead>
             <tr className="text-xs text-slate-500">
               <th className="py-1">Name</th>
@@ -259,6 +260,7 @@ export default function RulesTab(props: {
             ))}
           </tbody>
         </table>
+        </div>
       )}
     </div>
   );

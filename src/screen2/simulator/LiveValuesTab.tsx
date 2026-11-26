@@ -23,6 +23,9 @@ type Props = {
   snapshotFor: (unitId: number, functionCode: number, address: number) => SnapshotRow | undefined;
   status: SimStatus;
   addrFmt?: "dec" | "hex";
+  /** Same action as the main Start button; omit to hide the button. */
+  onStart?: () => void;
+  busy?: boolean;
 };
 
 const FC_LABEL: Record<number, string> = { 1: "Coil", 2: "Discrete", 3: "Holding", 4: "Input" };
@@ -39,7 +42,7 @@ function liveValueText(row: SnapshotRow | undefined): string {
   return row.valueWord === null ? "—" : String(row.valueWord);
 }
 
-export default function LiveValuesTab({ registers, snapshotFor, status, addrFmt = "dec" }: Props) {
+export default function LiveValuesTab({ registers, snapshotFor, status, addrFmt = "dec", onStart, busy = false }: Props) {
   const [search, setSearch] = useState("");
 
   const filtered = useMemo(() => {
@@ -54,6 +57,16 @@ export default function LiveValuesTab({ registers, snapshotFor, status, addrFmt 
     return (
       <div className="rounded-2xl border border-slate-200 bg-white p-8 text-center dark:border-slate-800 dark:bg-white/5">
         <p className="text-sm text-slate-600 dark:text-slate-300">Start the server to see live values.</p>
+        {onStart ? (
+          <button
+            type="button"
+            disabled={busy}
+            onClick={onStart}
+            className="mt-3 rounded-full border border-emerald-600/60 bg-emerald-500/10 px-4 py-1.5 text-sm font-semibold text-emerald-800 disabled:opacity-60 dark:text-emerald-200"
+          >
+            Start
+          </button>
+        ) : null}
       </div>
     );
   }

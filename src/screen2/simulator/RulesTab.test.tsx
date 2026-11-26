@@ -70,6 +70,12 @@ describe("ruleSummary", () => {
 });
 
 describe("RulesTab", () => {
+  it("wraps the rules table in a horizontally scrolling container (S9)", () => {
+    render(<RulesTab rules={[rule as any]} devices={[]} onAdd={vi.fn()} onEdit={vi.fn()} onToggle={vi.fn()} onDelete={vi.fn()} />);
+    const table = screen.getByRole("table");
+    expect(table.parentElement!.className).toMatch(/overflow-x-auto/);
+  });
+
   it("renders rule name and toggles", () => {
     const onToggle = vi.fn();
     render(

@@ -15,6 +15,7 @@ import {
   type PageRegister,
   type RegisterFilter,
 } from "./simFilters";
+import { sourceSummary } from "./sourceParams";
 
 const FC_LABEL: Record<number, string> = { 1: "Coil", 2: "Discrete", 3: "Holding", 4: "Input" };
 const SOURCE_OPTIONS = ["hold", "device", "generator", "route"];
@@ -135,7 +136,9 @@ export default function RegistersTab(props: RegistersTabProps) {
   };
 
   const liveValueCell = (r: PageRegister) => {
-    if (!status.running) return <span>&mdash;</span>;
+    if (!status.running) {
+      return <span className="text-xs text-slate-500 dark:text-slate-400">{sourceSummary(r, addrFmt)}</span>;
+    }
     const row = snapshotFor(r.unitId, r.functionCode, r.address);
     if (!row) return <span>&mdash;</span>;
     const text = row.valueBit !== null ? (row.valueBit ? "ON" : "OFF") : row.valueWord === null ? "—" : String(row.valueWord);
