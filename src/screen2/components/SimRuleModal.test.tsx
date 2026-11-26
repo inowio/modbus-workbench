@@ -239,6 +239,31 @@ describe("SimRuleModal — engineering units", () => {
     }
   });
 
+  it("hides Deadband for a condition on a bit (coil/discrete) register and doesn't save one", () => {
+    const onSubmit = openNew();
+    fireEvent.change(screen.getByLabelText("Condition register 0"), { target: { value: "1:4:1" } });
+    fireEvent.change(screen.getByLabelText("Condition op 0"), { target: { value: ">" } });
+    fireEvent.change(screen.getByLabelText("Condition deadband 0"), { target: { value: "2" } });
+    fireEvent.change(screen.getByLabelText("Condition register 0"), { target: { value: "1:1:2" } });
+    for (const op of [">", ">=", "<", "<="]) {
+      fireEvent.change(screen.getByLabelText("Condition op 0"), { target: { value: op } });
+      expect(screen.queryByLabelText("Condition deadband 0")).toBeNull();
+    }
+    fireEvent.click(screen.getByRole("button", { name: /add action/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+    expect(JSON.parse(onSubmit.mock.calls[0][0].trigger).conditions[0]).not.toHaveProperty("deadband");
+  });
+
+  it("does not block Save on a hidden negative deadband of a bit condition", () => {
+    openNew();
+    fireEvent.change(screen.getByLabelText("Condition register 0"), { target: { value: "1:4:1" } });
+    fireEvent.change(screen.getByLabelText("Condition op 0"), { target: { value: ">=" } });
+    fireEvent.change(screen.getByLabelText("Condition deadband 0"), { target: { value: "-1" } });
+    fireEvent.change(screen.getByLabelText("Condition register 0"), { target: { value: "1:1:2" } });
+    fireEvent.click(screen.getByRole("button", { name: /add action/i }));
+    expect(screen.getByRole("button", { name: /^save$/i })).toBeEnabled();
+  });
+
   it("does not save a deadband of a hidden operator", () => {
     const onSubmit = openNew();
     fireEvent.change(screen.getByLabelText("Condition register 0"), { target: { value: "1:4:1" } });

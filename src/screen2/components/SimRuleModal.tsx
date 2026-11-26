@@ -236,7 +236,8 @@ const storedNum = (text: string): number => {
   return Number.isFinite(n) ? n : 0;
 };
 
-function buildTriggerJson(t: TriggerForm): string {
+/** `bandApplies(c)`: whether condition `c` carries a deadband (level op on a non-bit register). */
+function buildTriggerJson(t: TriggerForm, bandApplies: (c: CondRow) => boolean): string {
   if (t.type === "interval") {
     return JSON.stringify({ type: "interval", ms: t.ms });
   }
@@ -245,7 +246,7 @@ function buildTriggerJson(t: TriggerForm): string {
     const conditions = t.conds.map((c) => {
       const out: Record<string, unknown> = { unit: c.unit, bank: c.bank, address: c.address, op: c.op, value: storedNum(c.value) };
       const band = storedNum(c.deadband);
-      if (DEADBAND_OPS.has(c.op) && band > 0) out.deadband = band;
+      if (bandApplies(c) && band > 0) out.deadband = band;
       return out;
     });
     return JSON.stringify({ type: "condition", join: t.conds.length > 1 ? t.join : "all", conditions });
@@ -459,13 +460,15 @@ export default function SimRuleModal(props: {
 
   const nameMissing = rule.name.trim() === "";
   const noActions = actions.length === 0;
-  const negativeBand = isCondition && trigger.conds.some((c) => DEADBAND_OPS.has(c.op) && parseNum(c.deadband) < 0);
+  // Deadband applies to level comparisons on word registers; a bit is only 0/1.
+  const bandApplies = (c: CondRow) => DEADBAND_OPS.has(c.op) && !isBitTarget(c.bank, regAt(c.unit, c.bank, c.address));
+  const negativeBand = isCondition && trigger.conds.some((c) => bandApplies(c) && parseNum(c.deadband) < 0);
   const badCondNumber =
     isCondition &&
     trigger.conds.some(
       (c) =>
         (c.op !== "changed" && !Number.isFinite(parseNum(c.value))) ||
-        (DEADBAND_OPS.has(c.op) && c.deadband.trim() !== "" && !Number.isFinite(parseNum(c.deadband))),
+        (bandApplies(c) && c.deadband.trim() !== "" && !Number.isFinite(parseNum(c.deadband))),
     );
   const badActionNumber = actions.some(
     (a) =>
@@ -487,7 +490,7 @@ export default function SimRuleModal(props: {
 
   const handleSubmit = () => {
     if (saveBlock) return;
-    const triggerJson = buildTriggerJson(trigger);
+    const triggerJson = buildTriggerJson(trigger, bandApplies);
     const actionsJson = JSON.stringify(actions.map(buildActionJson));
     void props.onSubmit({ ...rule, trigger: triggerJson, actions: actionsJson });
   };
@@ -667,7 +670,7 @@ export default function SimRuleModal(props: {
                         />
                       </label>
                     ) : null}
-                    {DEADBAND_OPS.has(c.op) ? (
+                    {bandApplies(c) ? (
                       <label className="flex flex-col gap-1" title="Re-arms only after the value moves back past the threshold by this much">
                         Deadband
                         <NumberWithUnit
