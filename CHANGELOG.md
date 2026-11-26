@@ -43,6 +43,17 @@ All notable changes to this project are tracked here following [Keep a Changelog
 - **One control bar** — the Analyzer controls are now a single, tidier bar:
   Trends ▾ (trend history window), Signals, Connection, + Tile, Edit layout
   (acts on the current tab), a Refresh icon and a Focus view button.
+- **Engineering units in the TCP Simulator and Virtual Devices** — each
+  register can have a unit, scale, offset and decimals (e.g. °C, ×0.1).
+  Generators, presets and initial values are then entered in real-world
+  values, live values show "23.5 °C", and Virtual Devices carry the scaling
+  when shared. What clients read on the wire is unchanged; with the default
+  scale 1 and offset 0 everything behaves as before.
+- **Rules in real-world values** — pick registers by name, compare in their
+  units ("Temperature ≥ 35.0 °C"), add a deadband so a rule doesn't flicker at
+  the limit, and combine conditions with All of / Any of. Set, Increment,
+  Decrement and Copy take real-world values, and the dialog says when a value
+  will be rounded to the register's step.
 
 ### Fixed
 - **Trend chart time labels** — on narrow trend tiles the time labels no longer
@@ -90,6 +101,14 @@ All notable changes to this project are tracked here following [Keep a Changelog
   bar to Settings → Display. It is app-wide, remembered, and used by the
   Analyzer and TCP Simulator. It only changes how addresses are written, never
   values.
+- **Simulator rules read the register's real value** — conditions now decode
+  the register by its type: signed (i16) negatives, 32/64-bit and float
+  registers compare correctly. Existing rules on such registers, and rules
+  that pointed at the second word of a 32-bit register, may need their
+  threshold or target re-checked. On scaled registers, Set/Increment/Decrement
+  and Copy clamp at the register's limits instead of wrapping around (plain
+  16-bit registers at the default scale still wrap as before); Copy between
+  registers of different types now clamps too.
 - **Virtual Device editor** — a larger two-pane editor: the register list on
   the left, the selected register's settings on the right. New registers go to
   the next free offset, overlaps are flagged as you type, fields that don't
