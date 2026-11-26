@@ -99,6 +99,7 @@ pub struct RegMeta {
     pub byte_order: String,
     pub scale: f64,
     pub offset: f64,
+    /// Decimals rule comparisons round to (not the display decimals).
     pub decimals: u32,
 }
 
@@ -123,7 +124,11 @@ pub fn build_reg_meta(regs: &[SimRegister]) -> RegMetaMap {
                 byte_order: r.byte_order.clone(),
                 scale,
                 offset,
-                decimals: effective_decimals(r.decimals, scale, offset, &r.data_type),
+                // Comparison precision: never coarser than one raw step, so
+                // explicit display decimals 0 on a ×0.1 register don't turn
+                // "> 35.5" into "> 36". Display keeps the explicit decimals.
+                decimals: effective_decimals(r.decimals, scale, offset, &r.data_type)
+                    .max(effective_decimals(None, scale, offset, &r.data_type)),
             },
         );
     }
@@ -213,6 +218,24 @@ mod tests {
         let m = build_reg_meta(&[mk(Some(0.1), Some(-40.0), None)]);
         let v = m.get(&(3, 3, 10)).unwrap();
         assert_eq!((v.scale, v.offset, v.decimals), (0.1, -40.0, 1));
+    }
+
+    #[test]
+    fn build_reg_meta_compares_at_least_one_raw_step() {
+        let mk = |scale, decimals, data_type: &str| SimRegister {
+            id: 1, unit_id: 1, function_code: 3, address: 0, alias: String::new(),
+            data_type: data_type.into(), hold_value: 0, sort_order: 0, device_instance_id: None,
+            value_source: "hold".into(), byte_order: "ABCD".into(), source_params: "{}".into(),
+            interval_ms: 1000, unit: None, display_format: None, scale, scale_offset: None, decimals,
+        };
+        let dec = |scale, decimals, dt| build_reg_meta(&[mk(scale, decimals, dt)])[&(1, 3, 0)].decimals;
+        // Explicit 0 decimals on a ×0.1 register still compares at 0.1 (so "> 35.5" stays 35.5).
+        assert_eq!(dec(Some(0.1), Some(0), "u16"), 1);
+        // Finer explicit decimals are kept.
+        assert_eq!(dec(Some(0.1), Some(3), "u16"), 3);
+        assert_eq!(dec(None, Some(2), "u16"), 2);
+        // Floats compare at their automatic precision.
+        assert_eq!(dec(None, Some(1), "f32"), 6);
     }
 
     #[test]

@@ -3050,7 +3050,8 @@ pub fn read_eng(banks: &HashMap<u8, SimBanks>, meta: &RegMetaMap, unit: u8, bank
     }
 }
 
-/// Decimals a condition compares at: the register's effective decimals for
+/// Decimals a condition compares at: the register's comparison decimals (see
+/// `build_reg_meta`: never coarser than one raw step) for
 /// word banks, 0 for bits (and for a register without metadata, which reads
 /// as not met anyway).
 fn cond_decimals(meta: &RegMetaMap, c: &Cond) -> u32 {
@@ -6457,6 +6458,21 @@ mod tests {
         assert_eq!(fired, vec![1, 2]);
         assert_eq!(read_eng(&b, &meta, 1, 4, 0), Some(35.5));
         assert_eq!(read_eng(&b, &meta, 1, 4, 10), Some(70000.0));
+    }
+
+    #[test]
+    fn coarse_explicit_decimals_do_not_round_thresholds() {
+        let regs = [SimRegister {
+            id: 1, unit_id: 1, function_code: 3, address: 0, alias: String::new(), data_type: "u16".into(),
+            hold_value: 0, sort_order: 0, device_instance_id: None, value_source: "hold".into(),
+            byte_order: "ABCD".into(), source_params: "{}".into(), interval_ms: 1000, unit: None,
+            display_format: None, scale: Some(0.1), scale_offset: None, decimals: Some(0),
+        }];
+        let meta = build_reg_meta(&regs);
+        let rules = vec![cond_rule(1, Join::All, vec![cnd(1, 3, 0, ">", 35.5, 0.0)])];
+        let mut st = HashMap::new();
+        assert_eq!(eval_rules(&rules, &mut st, &banks1(&[(1, 3, 0, 355)]), &meta, 0.0, &[]).len(), 0, "35.5 is not > 35.5");
+        assert_eq!(eval_rules(&rules, &mut st, &banks1(&[(1, 3, 0, 356)]), &meta, 10.0, &[]).len(), 1, "35.6 > 35.5");
     }
 
     #[test]
