@@ -208,6 +208,8 @@ export default function TcpSimulatorPage() {
             <DevicesTab
               devices={sim.devices}
               registers={sim.registers}
+              templates={sim.deviceTemplates}
+              addrFmt={addrFmt}
               onAddDevice={() => openDialog(() => setDeviceModalOpen(true))}
               onRename={handleRename}
               onRebase={handleRebase}
