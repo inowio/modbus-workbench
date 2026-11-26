@@ -118,6 +118,7 @@ export default function SlavesPage() {
   const [formKind, setFormKind] = useState<"serial" | "tcp">("serial");
   const [scanPick, setScanPick] = useState<ScanPick | null>(null);
   const [saveSerial, setSaveSerial] = useState(false);
+  const [saveTcpHost, setSaveTcpHost] = useState(false);
   const [scanOpen, setScanOpen] = useState(false);
 
   const [confirmDelete, setConfirmDelete] = useState<SlaveItem | null>(null);
@@ -200,6 +201,7 @@ export default function SlavesPage() {
     setFormKind("serial");
     setScanPick(null);
     setSaveSerial(false);
+    setSaveTcpHost(false);
   }
 
   function addFromScan(pick: ScanPick) {
@@ -212,6 +214,7 @@ export default function SlavesPage() {
     setFormKind(pick.connectionKind);
     setScanPick(pick);
     setSaveSerial(false);
+    setSaveTcpHost(pick.tcpToSave != null);
   }
 
   function openEdit(s: SlaveItem) {
@@ -245,6 +248,7 @@ export default function SlavesPage() {
     setModalSlaveId(null);
     setScanPick(null);
     setSaveSerial(false);
+    setSaveTcpHost(false);
     setFormKind("serial");
   }
 
@@ -336,6 +340,38 @@ export default function SlavesPage() {
               workspaceName: workspace.name,
               source: "slaves",
               message: "Failed to save serial settings from slave scan",
+              detailsJson: { error: message },
+            });
+          }
+        }
+        const tcpToSave = saveTcpHost ? scanPick?.tcpToSave : null;
+        if (tcpToSave) {
+          try {
+            const current = await invoke<Record<string, unknown>>("get_connection_settings", {
+              name: workspace.name,
+            });
+            await invoke<void>("set_connection_settings", {
+              name: workspace.name,
+              settings: { ...current, tcpHost: tcpToSave.host, tcpPort: tcpToSave.port },
+              nowIso,
+            });
+            void logEvent({
+              scope: "workspace",
+              level: "info",
+              workspaceName: workspace.name,
+              source: "slaves",
+              message: "TCP host saved from slave scan",
+              detailsJson: { host: tcpToSave.host, port: tcpToSave.port },
+            });
+          } catch (e) {
+            const message = String(e);
+            pushToast(`Slave added, but saving TCP host failed: ${message}`, "error");
+            void logEvent({
+              scope: "workspace",
+              level: "error",
+              workspaceName: workspace.name,
+              source: "slaves",
+              message: "Failed to save TCP host from slave scan",
               detailsJson: { error: message },
             });
           }
@@ -801,6 +837,23 @@ export default function SlavesPage() {
                       Changes the port and settings for all serial slaves in this workspace
                     </div>
                   ) : null}
+                </div>
+              ) : null}
+
+              {modalMode === "add" && scanPick?.tcpToSave ? (
+                <div className="flex flex-col gap-1">
+                  <label className="flex items-center gap-2 text-sm text-slate-700 dark:text-slate-200">
+                    <input
+                      type="checkbox"
+                      checked={saveTcpHost}
+                      onChange={(e) => setSaveTcpHost(e.currentTarget.checked)}
+                      disabled={saving}
+                    />
+                    {`Also set the workspace TCP host to ${scanPick.tcpToSave.host}:${scanPick.tcpToSave.port}`}
+                  </label>
+                  <div className="text-xs text-amber-700 dark:text-amber-300">
+                    Changes the host for all TCP slaves in this workspace
+                  </div>
                 </div>
               ) : null}
             </div>

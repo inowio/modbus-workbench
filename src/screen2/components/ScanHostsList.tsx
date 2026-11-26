@@ -11,10 +11,10 @@ export type ScanHostsListProps = {
   scanning: boolean;
   /** The scan ended by cancel: hosts still "open" were never scanned. */
   cancelled: boolean;
+  isExisting(ev: ScanFoundEvent): boolean;
+  onAdd(ev: ScanFoundEvent): void;
 };
 
-const noop = () => {};
-const never = () => false;
 const NONE: ScanFoundEvent[] = [];
 
 /** Orders "a.b.c.d:port" by address, then port. */
@@ -61,12 +61,16 @@ function HostRow({
   own,
   scanning,
   cancelled,
+  isExisting,
+  onAdd,
 }: {
   host: ScanHostEvent;
   /** This host's own found events. */
   own: ScanFoundEvent[];
   scanning: boolean;
   cancelled: boolean;
+  isExisting(ev: ScanFoundEvent): boolean;
+  onAdd(ev: ScanFoundEvent): void;
 }) {
   const collapsible = own.length > 0;
   const replies = Math.max(host.found, own.length);
@@ -101,14 +105,14 @@ function HostRow({
         ) : null}
       </div>
       {collapsible && expanded ? (
-        <ScanResultsList results={own} scanning={scanning} isExisting={never} onAdd={noop} allowAdd={false} />
+        <ScanResultsList results={own} scanning={scanning} isExisting={isExisting} onAdd={onAdd} />
       ) : null}
     </section>
   );
 }
 
 /** Range scan results: one block per host that answered the connect, with its unit rows underneath. */
-export default function ScanHostsList({ hosts, results, scanning, cancelled }: ScanHostsListProps) {
+export default function ScanHostsList({ hosts, results, scanning, cancelled, isExisting, onAdd }: ScanHostsListProps) {
   const sorted = useMemo(() => [...hosts].sort((a, b) => hostOrder(a.host, b.host)), [hosts]);
   const byHost = useMemo(() => {
     const m = new Map<string, ScanFoundEvent[]>();
@@ -130,7 +134,15 @@ export default function ScanHostsList({ hosts, results, scanning, cancelled }: S
   return (
     <div className="flex flex-col gap-3">
       {sorted.map((h) => (
-        <HostRow key={h.host} host={h} own={byHost.get(h.host) ?? NONE} scanning={scanning} cancelled={cancelled} />
+        <HostRow
+          key={h.host}
+          host={h}
+          own={byHost.get(h.host) ?? NONE}
+          scanning={scanning}
+          cancelled={cancelled}
+          isExisting={isExisting}
+          onAdd={onAdd}
+        />
       ))}
     </div>
   );

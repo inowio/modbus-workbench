@@ -419,6 +419,66 @@ describe("SlavesPage", () => {
       });
     });
 
+    describe("TCP host save", () => {
+      const tcpPick = {
+        unitId: 21,
+        connectionKind: "tcp",
+        suggestedName: "Slave 21",
+        serialToSave: null,
+        tcpToSave: { host: "192.168.68.128", port: 502 },
+      };
+      async function openTcpPick() {
+        render(<SlavesPage />);
+        fireEvent.click(await screen.findByRole("button", { name: /^scan$/i }));
+        await screen.findByTestId("scanner-modal");
+        act(() => scannerProps!.onAdd(tcpPick));
+        return await screen.findByRole("dialog");
+      }
+      const label = "Also set the workspace TCP host to 192.168.68.128:502";
+
+      it("shows a ticked checkbox with the warning", async () => {
+        setupScan();
+        const dialog = await openTcpPick();
+        expect(within(dialog).getByRole("checkbox", { name: label })).toBeChecked();
+        expect(within(dialog).getByText("Changes the host for all TCP slaves in this workspace")).toBeInTheDocument();
+      });
+
+      it("saves the host after creating the slave, leaving the rest unchanged", async () => {
+        setupScan();
+        const dialog = await openTcpPick();
+        fireEvent.click(within(dialog).getByRole("button", { name: /^add$/i }));
+        await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("set_connection_settings", expect.anything()));
+        const cmds = invokeMock.mock.calls.map((c) => c[0]);
+        expect(cmds.indexOf("create_slave")).toBeLessThan(cmds.indexOf("set_connection_settings"));
+        const call = invokeMock.mock.calls.find((c) => c[0] === "set_connection_settings")!;
+        expect(call[1].name).toBe("TestWS");
+        expect(typeof call[1].nowIso).toBe("string");
+        expect(call[1].settings).toEqual({ ...wsSettings, tcpHost: "192.168.68.128", tcpPort: 502 });
+      });
+
+      it("unticked does not touch workspace settings", async () => {
+        setupScan();
+        const dialog = await openTcpPick();
+        fireEvent.click(within(dialog).getByRole("checkbox", { name: label }));
+        fireEvent.click(within(dialog).getByRole("button", { name: /^add$/i }));
+        await waitFor(() => expect(pushToastMock).toHaveBeenCalledWith('Slave "Slave 21" added', "info"));
+        expect(invokeMock.mock.calls.some((c) => c[0] === "set_connection_settings")).toBe(false);
+      });
+
+      it("a failed save keeps the slave and toasts", async () => {
+        setupScan({ setFails: true });
+        const dialog = await openTcpPick();
+        fireEvent.click(within(dialog).getByRole("button", { name: /^add$/i }));
+        await waitFor(() =>
+          expect(pushToastMock).toHaveBeenCalledWith(
+            expect.stringMatching(/^Slave added, but saving TCP host failed: .*disk full/),
+            "error",
+          ),
+        );
+        expect(pushToastMock).toHaveBeenCalledWith('Slave "Slave 21" added', "info");
+      });
+    });
+
     it("unticked checkbox does not touch workspace settings", async () => {
       setupScan();
       const dialog = await openFromPick();

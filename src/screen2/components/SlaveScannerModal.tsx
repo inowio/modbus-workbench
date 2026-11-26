@@ -47,6 +47,8 @@ export type ScanPick = {
   suggestedName: string;
   /** Non-null only when the result's port or settings differ from the workspace's. */
   serialToSave: { port: string; params: SerialParams; portDiffers: boolean } | null;
+  /** Non-null only for a TCP result whose host:port differs from the workspace's. */
+  tcpToSave: { host: string; port: number } | null;
 };
 
 export type SlaveScannerModalProps = {
@@ -58,6 +60,15 @@ export type SlaveScannerModalProps = {
 };
 
 type Phase = "idle" | "scanning" | "cancelling";
+
+/** Splits "host:port" at the last colon; null when there is no valid port. */
+function parseTcpTarget(target: string): { host: string; port: number } | null {
+  const i = target.lastIndexOf(":");
+  if (i <= 0) return null;
+  const port = Number(target.slice(i + 1));
+  if (!Number.isInteger(port) || port < 0) return null;
+  return { host: target.slice(0, i), port };
+}
 
 function sameSerial(a: SerialParams, b: SerialParams): boolean {
   return (
@@ -91,7 +102,7 @@ export default function SlaveScannerModal({ open, workspaceName, existingSlaves,
   const [phase, setPhaseState] = useState<Phase>("idle");
   const [resultKind, setResultKind] = useState<"serial" | "tcp">("serial");
   const [results, setResults] = useState<ScanFoundEvent[]>([]);
-  /** Whether the running or last scan was an IP-range scan (results grouped by host, no Add). */
+  /** Whether the running or last scan was an IP-range scan (results grouped by host). */
   const [rangeScan, setRangeScan] = useState(false);
   /** Detected local range and address, for the range hints. */
   const [defaultRange, setDefaultRange] = useState<string | null>(null);
@@ -358,6 +369,8 @@ export default function SlaveScannerModal({ open, workspaceName, existingSlaves,
     cancelSlaveScan(scanWorkspaceRef.current, scanId).catch((e) => setError(String(e)));
   }
 
+  const wsTcpTarget = `${ws.tcpHost}:${ws.tcpPort}`;
+
   function handleAdd(ev: ScanFoundEvent) {
     const wsSerial = workspaceSerial(ws);
     const differs =
@@ -373,6 +386,7 @@ export default function SlaveScannerModal({ open, workspaceName, existingSlaves,
         differs && ev.settings
           ? { port: ev.target, params: ev.settings, portDiffers: ev.target !== ws.serialPort }
           : null,
+      tcpToSave: resultKind === "tcp" && ev.target !== wsTcpTarget ? parseTcpTarget(ev.target) : null,
     };
     requestCancel();
     onAdd(pick);
@@ -582,12 +596,19 @@ export default function SlaveScannerModal({ open, workspaceName, existingSlaves,
             ) : null}
 
             {showStatus && rangeScan ? (
-              <ScanHostsList hosts={hostList} results={results} scanning={busy} cancelled={cancelledDone} />
+              <ScanHostsList
+                hosts={hostList}
+                results={results}
+                scanning={busy}
+                cancelled={cancelledDone}
+                isExisting={(ev) => isAlreadyInWorkspace(ev, existingSlaves, resultKind, wsTcpTarget)}
+                onAdd={handleAdd}
+              />
             ) : showStatus ? (
               <ScanResultsList
                 results={results}
                 scanning={busy}
-                isExisting={(ev) => isAlreadyInWorkspace(ev, existingSlaves, resultKind)}
+                isExisting={(ev) => isAlreadyInWorkspace(ev, existingSlaves, resultKind, wsTcpTarget)}
                 onAdd={handleAdd}
               />
             ) : (

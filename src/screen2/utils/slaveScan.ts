@@ -92,12 +92,18 @@ export function groupScanResults(events: ScanFoundEvent[]): {
   return { found, garbled, gateway };
 }
 
-/** A result is already configured when a slave has the same unit ID and connection kind. */
+/**
+ * A result is already configured when a slave has the same unit ID and connection kind. TCP slaves
+ * share the workspace's single host, so a TCP result also has to be on that host (`wsTcpTarget`,
+ * "host:port").
+ */
 export function isAlreadyInWorkspace(
   ev: ScanFoundEvent,
   slaves: { unitId: number; connectionKind: string }[],
   kind: ScanKind,
+  wsTcpTarget: string | null,
 ): boolean {
+  if (kind === "tcp" && ev.target !== wsTcpTarget) return false;
   return slaves.some((s) => s.unitId === ev.unitId && s.connectionKind === kind);
 }
 

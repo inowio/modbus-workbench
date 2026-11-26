@@ -148,10 +148,19 @@ describe("isAlreadyInWorkspace", () => {
   const slaves = [{ unitId: 3, connectionKind: "serial" }];
 
   it("matches on unit ID plus connection kind only", () => {
-    expect(isAlreadyInWorkspace(found({ unitId: 3 }), slaves, "serial")).toBe(true);
-    expect(isAlreadyInWorkspace(found({ unitId: 3, target: "COM9", settings: P8E1 }), slaves, "serial")).toBe(true);
-    expect(isAlreadyInWorkspace(found({ unitId: 3, settings: null }), slaves, "tcp")).toBe(false);
-    expect(isAlreadyInWorkspace(found({ unitId: 4 }), slaves, "serial")).toBe(false);
+    expect(isAlreadyInWorkspace(found({ unitId: 3 }), slaves, "serial", null)).toBe(true);
+    expect(isAlreadyInWorkspace(found({ unitId: 3, target: "COM9", settings: P8E1 }), slaves, "serial", null)).toBe(true);
+    expect(isAlreadyInWorkspace(found({ unitId: 3, settings: null }), slaves, "tcp", null)).toBe(false);
+    expect(isAlreadyInWorkspace(found({ unitId: 4 }), slaves, "serial", null)).toBe(false);
+  });
+
+  it("counts a TCP result only on the workspace host with a matching tcp slave", () => {
+    const tcpSlaves = [{ unitId: 5, connectionKind: "tcp" }];
+    const onWs = found({ unitId: 5, target: "10.0.0.5:1502", settings: null });
+    const other = found({ unitId: 5, target: "192.168.68.128:502", settings: null });
+    expect(isAlreadyInWorkspace(onWs, tcpSlaves, "tcp", "10.0.0.5:1502")).toBe(true);
+    expect(isAlreadyInWorkspace(other, tcpSlaves, "tcp", "10.0.0.5:1502")).toBe(false);
+    expect(isAlreadyInWorkspace(onWs, [{ unitId: 5, connectionKind: "serial" }], "tcp", "10.0.0.5:1502")).toBe(false);
   });
 });
 

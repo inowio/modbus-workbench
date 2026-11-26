@@ -9,7 +9,7 @@ export type ScanResultsListProps = {
   scanning: boolean;
   isExisting(ev: ScanFoundEvent): boolean;
   onAdd(ev: ScanFoundEvent): void;
-  /** False hides the Add button and "already in workspace" badge (range scans list devices only). */
+  /** False hides the Add button and "already in workspace" badge. */
   allowAdd?: boolean;
 };
 

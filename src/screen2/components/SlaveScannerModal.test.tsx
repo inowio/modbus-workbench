@@ -565,6 +565,7 @@ describe("SlaveScannerModal", () => {
         params: { baud: 19200, parity: "even", dataBits: 8, stopBits: 1, flowControl: "none" },
         portDiffers: true,
       },
+      tcpToSave: null,
     });
     // Adding while a scan runs stops the scan.
     expect(cancelCalls()).toEqual([["cancel_slave_scan", { name: WS, scanId }]]);
@@ -575,6 +576,7 @@ describe("SlaveScannerModal", () => {
       connectionKind: "serial",
       suggestedName: "Slave 18",
       serialToSave: null,
+      tcpToSave: null,
     });
   });
 
@@ -836,7 +838,7 @@ describe("SlaveScannerModal", () => {
         return startScan();
       }
 
-      it("groups results by host with status badges and no Add", async () => {
+      it("groups results by host with status badges and an Add per unit", async () => {
         const scanId = await startRangeScan();
         fire("slave_scan_host", hostEvent(scanId, T3, "open"));
         fire("slave_scan_host", hostEvent(scanId, T7, "open"));
@@ -847,7 +849,7 @@ describe("SlaveScannerModal", () => {
         expect(screen.getByText("port open, no Modbus reply")).toBeInTheDocument();
         expect(screen.getByRole("region", { name: `Host ${T3}` })).toBeInTheDocument();
         expect(screen.getByLabelText("Unit 1 on " + T3)).toBeInTheDocument();
-        expect(screen.queryByRole("button", { name: "Add" })).toBeNull();
+        expect(within(screen.getByLabelText("Unit 1 on " + T3)).getByRole("button", { name: "Add" })).toBeInTheDocument();
         expect(screen.getByText("Hosts")).toBeInTheDocument();
         expect(screen.getByText("2 / 254")).toBeInTheDocument();
       });
@@ -949,6 +951,65 @@ describe("SlaveScannerModal", () => {
         fire("slave_scan_done", { workspace: WS, scanId, reason: "completed", checked: 3, found: 1, error: null });
         expect(screen.queryByRole("progressbar")).toBeNull();
         expect(screen.getByText("Scan complete — checked 3, found 1")).toBeInTheDocument();
+      });
+
+      it("Add on a range unit row passes a TCP pick that saves the new host", async () => {
+        const onAdd = vi.fn();
+        setupRange();
+        renderModal({ onAdd });
+        await loaded();
+        fireEvent.click(screen.getByRole("radio", { name: "TCP" }));
+        fireEvent.click(screen.getByRole("radio", { name: "IP range" }));
+        await waitFor(() => expect(screen.getByLabelText("Network")).toHaveValue("192.168.68"));
+        const scanId = await startScan();
+        const T128 = "192.168.68.128:502";
+        fire("slave_scan_found", tcpFound(scanId, T128, 7));
+        fire("slave_scan_host", hostEvent(scanId, T128, "devices", { found: 1 }));
+        fireEvent.click(within(screen.getByLabelText("Unit 7 on " + T128)).getByRole("button", { name: "Add" }));
+        expect(onAdd).toHaveBeenLastCalledWith({
+          unitId: 7,
+          connectionKind: "tcp",
+          suggestedName: "Slave 7",
+          serialToSave: null,
+          tcpToSave: { host: "192.168.68.128", port: 502 },
+        });
+      });
+
+      it("single-host TCP Add: no TCP save on the workspace host, a save on another host", async () => {
+        const onAdd = vi.fn();
+        setupRange();
+        renderModal({ onAdd });
+        await loaded();
+        fireEvent.click(screen.getByRole("radio", { name: "TCP" }));
+        const scanId = await startScan();
+        fire("slave_scan_found", tcpFound(scanId, "192.168.1.10:502", 8));
+        fire("slave_scan_found", tcpFound(scanId, "192.168.1.99:1502", 9));
+        fireEvent.click(within(screen.getByLabelText("Unit 8 on 192.168.1.10:502")).getByRole("button", { name: "Add" }));
+        expect(onAdd).toHaveBeenLastCalledWith(expect.objectContaining({ unitId: 8, tcpToSave: null }));
+        fireEvent.click(within(screen.getByLabelText("Unit 9 on 192.168.1.99:1502")).getByRole("button", { name: "Add" }));
+        expect(onAdd).toHaveBeenLastCalledWith(
+          expect.objectContaining({ unitId: 9, tcpToSave: { host: "192.168.1.99", port: 1502 } }),
+        );
+      });
+
+      it("same unit ID on another host is not 'already in workspace'", async () => {
+        setupRange();
+        render(
+          <SlaveScannerModal
+            open
+            workspaceName={WS}
+            existingSlaves={[{ unitId: 8, connectionKind: "tcp", name: "Slave 8" }]}
+            onClose={vi.fn()}
+            onAdd={vi.fn()}
+          />,
+        );
+        await loaded();
+        fireEvent.click(screen.getByRole("radio", { name: "TCP" }));
+        const scanId = await startScan();
+        fire("slave_scan_found", tcpFound(scanId, "192.168.1.10:502", 8));
+        fire("slave_scan_found", tcpFound(scanId, "192.168.1.99:502", 8));
+        expect(within(screen.getByLabelText("Unit 8 on 192.168.1.10:502")).getByText("already in workspace")).toBeInTheDocument();
+        expect(within(screen.getByLabelText("Unit 8 on 192.168.1.99:502")).getByRole("button", { name: "Add" })).toBeInTheDocument();
       });
 
       it("single-host mode keeps ScanResultsList with Add", async () => {
