@@ -40,15 +40,17 @@ fn swap_bytes_word(w: u16) -> u16 {
     (w << 8) | (w >> 8)
 }
 
-/// Big-endian bytes of the value for the given type. Integer casts saturate
-/// (Rust float→int semantics); precision beyond 2^53 is lossy for u64/i64 —
-/// acceptable for simulated values.
+/// Big-endian bytes of the value for the given type. Every integer type
+/// saturates at its own range (Rust float→int `as` semantics: out-of-range
+/// clamps to MIN/MAX, NaN → 0) — e.g. 70000 as u16 is 65535, never a wrapped
+/// 4464. Precision beyond 2^53 is lossy for u64/i64 — acceptable for
+/// simulated values.
 fn value_to_be_bytes(data_type: &str, value: f64) -> Result<Vec<u8>, String> {
     match data_type {
-        "u16" => Ok(((value as i64) as u16).to_be_bytes().to_vec()),
-        "i16" => Ok(((value as i64) as i16).to_be_bytes().to_vec()),
-        "u32" => Ok(((value as i64) as u32).to_be_bytes().to_vec()),
-        "i32" => Ok(((value as i64) as i32).to_be_bytes().to_vec()),
+        "u16" => Ok((value as u16).to_be_bytes().to_vec()),
+        "i16" => Ok((value as i16).to_be_bytes().to_vec()),
+        "u32" => Ok((value as u32).to_be_bytes().to_vec()),
+        "i32" => Ok((value as i32).to_be_bytes().to_vec()),
         "f32" => Ok((value as f32).to_be_bytes().to_vec()),
         "u64" => Ok((value as u64).to_be_bytes().to_vec()),
         "i64" => Ok((value as i64).to_be_bytes().to_vec()),
@@ -313,16 +315,18 @@ pub fn parse_dynamic(reg: &SimRegister) -> Option<DynReg> {
     let v: serde_json::Value = serde_json::from_str(&reg.source_params).ok()?;
     let interval_ms = if reg.interval_ms > 0 { reg.interval_ms as f64 } else { 1000.0 };
     let seed = ((reg.unit_id as u64) << 32) ^ (reg.function_code as u64) << 16 ^ (reg.address as u64);
-    let common = (json_f64(&v, "min", 0.0), json_f64(&v, "max", 100.0), json_f64(&v, "periodMs", 1000.0));
+    let (min, max) = (json_f64(&v, "min", 0.0), json_f64(&v, "max", 100.0));
     let kind = match reg.value_source.as_str() {
         "generator" => DynKind::Generator {
             kind: v.get("kind").and_then(|x| x.as_str()).unwrap_or("sine").to_string(),
-            params: GenParams { min: common.0, max: common.1, period_ms: common.2 },
+            params: GenParams { min, max, period_ms: json_f64(&v, "periodMs", 1000.0) },
             seed,
         },
+        // No `periodMs` → 0, so `preset_value` applies its own slow default
+        // (60 s): presets model physical signals that drift, not 1 s waves.
         "device" => DynKind::Preset {
             preset: v.get("preset").and_then(|x| x.as_str()).unwrap_or("analog").to_string(),
-            params: PresetParams { min: common.0, max: common.1, period_ms: common.2 },
+            params: PresetParams { min, max, period_ms: json_f64(&v, "periodMs", 0.0) },
             seed,
         },
         "route" => DynKind::Route {
@@ -2451,35 +2455,47 @@ pub struct RuleDef {
     pub sort_order: i64,
 }
 
-fn json_u8(v: &serde_json::Value, key: &str, default: u8) -> u8 {
-    v.get(key).and_then(|x| x.as_u64()).map(|x| x as u8).unwrap_or(default)
+/// Read an optional `u8` field: absent/null → `Some(default)`; present and a
+/// whole number in 0..=255 → `Some(n)`; anything else (out of range,
+/// negative, non-integer) → `None` so the caller rejects it instead of
+/// truncating (unit 300 must not silently become unit 44).
+fn json_u8(v: &serde_json::Value, key: &str, default: u8) -> Option<u8> {
+    match v.get(key) {
+        None | Some(serde_json::Value::Null) => Some(default),
+        Some(x) => x.as_u64().and_then(|n| u8::try_from(n).ok()),
+    }
 }
 
-fn json_u16(v: &serde_json::Value, key: &str, default: u16) -> u16 {
-    v.get(key).and_then(|x| x.as_u64()).map(|x| x as u16).unwrap_or(default)
+/// `u16` counterpart of `json_u8` (address 70000 is rejected, not wrapped).
+fn json_u16(v: &serde_json::Value, key: &str, default: u16) -> Option<u16> {
+    match v.get(key) {
+        None | Some(serde_json::Value::Null) => Some(default),
+        Some(x) => x.as_u64().and_then(|n| u16::try_from(n).ok()),
+    }
 }
 
 fn json_i64(v: &serde_json::Value, key: &str, default: i64) -> i64 {
     v.get(key).and_then(|x| x.as_i64()).unwrap_or(default)
 }
 
-/// Parse a single action from its JSON object; unknown `type` → `None` (the
-/// caller skips it, so one bad action doesn't invalidate the whole rule).
+/// Parse a single action from its JSON object; unknown `type` or an
+/// out-of-range unit/bank/address → `None` (the caller skips it, so one bad
+/// action doesn't invalidate the whole rule).
 /// Reads optional `delayMs` (per-action delay) and `dataType`/`byteOrder`
 /// (multi-word target width), both defaulting to legacy single-word/immediate.
 fn parse_action(v: &serde_json::Value) -> Option<TimedAction> {
-    let unit = json_u8(v, "unit", 1);
-    let bank = json_u8(v, "bank", 1);
-    let address = json_u16(v, "address", 0);
+    let unit = json_u8(v, "unit", 1)?;
+    let bank = json_u8(v, "bank", 1)?;
+    let address = json_u16(v, "address", 0)?;
     let action = match v.get("type").and_then(|x| x.as_str()).unwrap_or("") {
         "set" => Action::Set { unit, bank, address, value: json_i64(v, "value", 0) },
         "inc" => Action::Inc { unit, bank, address, by: json_i64(v, "by", 1) },
         "dec" => Action::Dec { unit, bank, address, by: json_i64(v, "by", 1) },
         "toggle" => Action::Toggle { unit, bank, address },
         "copy" => Action::Copy {
-            src_unit: json_u8(v, "srcUnit", unit),
-            src_bank: json_u8(v, "srcBank", bank),
-            src_addr: json_u16(v, "srcAddr", 0),
+            src_unit: json_u8(v, "srcUnit", unit)?,
+            src_bank: json_u8(v, "srcBank", bank)?,
+            src_addr: json_u16(v, "srcAddr", 0)?,
             unit,
             bank,
             address,
@@ -2505,8 +2521,9 @@ fn parse_action(v: &serde_json::Value) -> Option<TimedAction> {
 
 /// Parse a `SimRule`'s `trigger`/`actions` JSON into a `RuleDef`. Returns
 /// `None` if the rule is disabled, or its `trigger`/`actions` JSON is
-/// malformed or has an unrecognized trigger `type`. Unrecognized action
-/// types are skipped (not fatal to the rule).
+/// malformed, has an unrecognized trigger `type`, or an out-of-range trigger
+/// unit/bank/address. Unrecognized or out-of-range actions are skipped (not
+/// fatal to the rule).
 pub fn parse_rule(rule: &SimRule) -> Option<RuleDef> {
     if !rule.enabled {
         return None;
@@ -2515,18 +2532,20 @@ pub fn parse_rule(rule: &SimRule) -> Option<RuleDef> {
     let trigger = match tv.get("type").and_then(|x| x.as_str()).unwrap_or("") {
         "interval" => Trigger::Interval { ms: tv.get("ms").and_then(|x| x.as_f64()).unwrap_or(1000.0) },
         "condition" => Trigger::Condition {
-            unit: json_u8(&tv, "unit", 1),
-            bank: json_u8(&tv, "bank", 1),
-            address: json_u16(&tv, "address", 0),
+            unit: json_u8(&tv, "unit", 1)?,
+            bank: json_u8(&tv, "bank", 1)?,
+            address: json_u16(&tv, "address", 0)?,
             op: tv.get("op").and_then(|x| x.as_str()).unwrap_or("==").to_string(),
             value: json_i64(&tv, "value", 0),
         },
         "onWrite" => {
+            // A negative/absent address means "any address"; one past 65535
+            // is invalid (not wrapped).
             let address = match tv.get("address").and_then(|x| x.as_i64()) {
-                Some(a) if a >= 0 => Some(a as u16),
+                Some(a) if a >= 0 => Some(u16::try_from(a).ok()?),
                 _ => None,
             };
-            Trigger::OnWrite { unit: json_u8(&tv, "unit", 1), bank: json_u8(&tv, "bank", 1), address }
+            Trigger::OnWrite { unit: json_u8(&tv, "unit", 1)?, bank: json_u8(&tv, "bank", 1)?, address }
         }
         _ => return None,
     };
@@ -5383,5 +5402,55 @@ mod tests {
         assert!(validate_config(&cfg(0)).is_err());
         assert!(validate_config(&cfg(10)).is_ok());
         assert!(validate_config(&cfg(60000)).is_ok());
+    }
+
+    #[test]
+    fn preset_without_period_uses_slow_default() {
+        let reg = SimRegister {
+            id: 1, unit_id: 1, function_code: 4, address: 0, alias: "".into(), data_type: "u16".into(),
+            hold_value: 0, value_source: "device".into(), byte_order: "ABCD".into(),
+            source_params: "{\"preset\":\"temperature\",\"min\":20,\"max\":30}".into(),
+            interval_ms: 1000, sort_order: 0, device_instance_id: None, unit: None, display_format: None,
+        };
+        let d = parse_dynamic(&reg).unwrap();
+        let DynKind::Preset { params, seed, .. } = &d.kind else { panic!("expected Preset") };
+        let slow = PresetParams { period_ms: 60000.0, ..*params };
+        for t in [0.0, 1234.0, 5000.0, 30000.0] {
+            assert_eq!(dyn_value(&d, t), preset_value("temperature", &slow, t, *seed), "at t={t}");
+        }
+        // A generator without periodMs keeps its 1000 ms default.
+        let gen = SimRegister { value_source: "generator".into(), source_params: "{\"kind\":\"ramp\"}".into(), ..reg };
+        let DynKind::Generator { params, .. } = parse_dynamic(&gen).unwrap().kind else { panic!("expected Generator") };
+        assert_eq!(params.period_ms, 1000.0);
+    }
+
+    #[test]
+    fn out_of_range_unit_or_address_is_rejected_not_truncated() {
+        // unit 300 must not become 44; address 70000 must not wrap.
+        let v: serde_json::Value = serde_json::from_str(r#"{"type":"set","unit":300,"bank":3,"address":0,"value":1}"#).unwrap();
+        assert!(parse_action(&v).is_none());
+        let v: serde_json::Value = serde_json::from_str(r#"{"type":"set","unit":1,"bank":3,"address":70000,"value":1}"#).unwrap();
+        assert!(parse_action(&v).is_none());
+        let v: serde_json::Value = serde_json::from_str(r#"{"type":"copy","unit":1,"bank":3,"address":0,"srcUnit":256}"#).unwrap();
+        assert!(parse_action(&v).is_none());
+        let trig = |t: &str| SimRule { id: 1, name: "".into(), enabled: true, trigger: t.into(), actions: "[]".into(), sort_order: 0 };
+        assert!(parse_rule(&trig(r#"{"type":"condition","unit":300,"bank":3,"address":0,"op":"==","value":1}"#)).is_none());
+        assert!(parse_rule(&trig(r#"{"type":"onWrite","unit":999,"bank":3}"#)).is_none());
+        // In-range values and omitted keys still parse.
+        assert!(parse_rule(&trig(r#"{"type":"condition","unit":255,"bank":3,"address":65535,"op":"==","value":1}"#)).is_some());
+        let v: serde_json::Value = serde_json::from_str(r#"{"type":"toggle"}"#).unwrap();
+        assert_eq!(parse_action(&v).unwrap().action, Action::Toggle { unit: 1, bank: 1, address: 0 });
+    }
+
+    #[test]
+    fn integer_encoding_saturates() {
+        assert_eq!(encode_value("u16", "ABCD", 70000.0).unwrap(), vec![0xFFFF]);
+        assert_eq!(encode_value("u16", "ABCD", -5.0).unwrap(), vec![0x0000]);
+        assert_eq!(encode_value("i16", "ABCD", 40000.0).unwrap(), vec![0x7FFF]);
+        assert_eq!(encode_value("i16", "ABCD", -40000.0).unwrap(), vec![0x8000]);
+        assert_eq!(encode_value("u32", "ABCD", -1.0).unwrap(), vec![0x0000, 0x0000]);
+        assert_eq!(encode_value("u32", "ABCD", 5e9).unwrap(), vec![0xFFFF, 0xFFFF]);
+        assert_eq!(encode_value("i32", "ABCD", 3e9).unwrap(), vec![0x7FFF, 0xFFFF]);
+        assert_eq!(encode_value("i32", "ABCD", -3e9).unwrap(), vec![0x8000, 0x0000]);
     }
 }
