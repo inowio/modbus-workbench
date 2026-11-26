@@ -307,18 +307,22 @@ describe("SimRuleModal — engineering units", () => {
     expect(JSON.parse(onSubmit.mock.calls[0][0].actions)[0]).toMatchObject({ type: "set", address: 10, value: 25.57 });
   });
 
-  it("hints when an Inc/Dec amount is smaller than one step (scale 0.1)", () => {
+  it("hints what an Inc/Dec amount really moves on a scale-0.1 target", () => {
     const onSubmit = openNew();
     fireEvent.click(screen.getByRole("button", { name: /add action/i }));
     fireEvent.change(screen.getByLabelText("Action target 0"), { target: { value: "1:3:10" } });
     fireEvent.change(screen.getByLabelText("Action type 0"), { target: { value: "inc" } });
-    fireEvent.change(screen.getByLabelText("Action by 0"), { target: { value: "0.05" } });
-    expect(screen.getByText("Smaller than one step (0.1 °C) — does nothing")).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Action by 0"), { target: { value: "0.04" } });
+    expect(screen.getByText("Smaller than half a step (0.1 °C) — does nothing")).toBeInTheDocument();
     expect(screen.getByTestId("action-by-unit-0")).toHaveTextContent("°C");
+    fireEvent.change(screen.getByLabelText("Action by 0"), { target: { value: "0.05" } });
+    expect(screen.getByText("Moves by 0.1 °C each time")).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Action by 0"), { target: { value: "0.15" } });
+    expect(screen.getByText("Moves by 0.2 °C each time")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
-    expect(JSON.parse(onSubmit.mock.calls[0][0].actions)[0]).toMatchObject({ type: "inc", address: 10, by: 0.05 });
+    expect(JSON.parse(onSubmit.mock.calls[0][0].actions)[0]).toMatchObject({ type: "inc", address: 10, by: 0.15 });
     fireEvent.change(screen.getByLabelText("Action by 0"), { target: { value: "0.5" } });
-    expect(screen.queryByText(/smaller than one step/i)).toBeNull();
+    expect(screen.queryByText(/does nothing|moves by/i)).toBeNull();
   });
 
   it("no representability hint for an f32 target", () => {

@@ -11,12 +11,14 @@ import {
   readConditions,
   refKey,
   registerOptionLabel,
+  setHint,
+  stepHint,
   targetLabel,
   type AddrFmt,
   type RuleJoin,
 } from "../simulator/ruleTargets";
-import { decimalPlaces, effectiveDecimals, engFromRaw, formatEng, rawFromEng, registerScaling } from "../simulator/scaling";
-import { wordSpan, type PageRegister } from "../simulator/useSimulatorData";
+import { registerScaling } from "../simulator/scaling";
+import type { PageRegister } from "../simulator/useSimulatorData";
 
 export type SimRule = {
   id: number;
@@ -280,47 +282,6 @@ function buildActionJson(a: ActionRow): Record<string, unknown> {
     default:
       return base;
   }
-}
-
-const INTEGER_TYPES = new Set(["u16", "i16", "u32", "i32", "u64", "i64", "bool"]);
-
-/**
- * The engineering value a Set of `value` actually stores on `reg`, mirroring
- * the engine: a single-word register at scale 1 / offset 0 takes the legacy
- * truncate-and-wrap path; otherwise `rawFromEng` (round to nearest step,
- * clamp), with integer encodes truncating and f32 losing precision.
- */
-function storedEngValue(value: number, reg: PageRegister): number {
-  const sc = registerScaling(reg);
-  const dt = reg.dataType;
-  if (sc.scale === 1 && sc.offset === 0 && wordSpan(dt) === 1 && INTEGER_TYPES.has(dt)) {
-    const w = ((Math.trunc(value) % 65536) + 65536) % 65536;
-    return dt === "i16" && w > 32767 ? w - 65536 : w;
-  }
-  let raw = rawFromEng(value, sc.scale, sc.offset, dt);
-  if (INTEGER_TYPES.has(dt)) raw = Math.trunc(raw);
-  else if (dt === "f32") raw = Math.fround(raw);
-  return engFromRaw(raw, sc.scale, sc.offset);
-}
-
-/** "Will be stored as 25.6 °C" when a Set value isn't exactly representable. */
-function setHint(value: number, reg: PageRegister | undefined, bank: number): string | null {
-  if (!reg || isBitTarget(bank, reg) || !Number.isFinite(value) || reg.dataType === "f64") return null;
-  const stored = storedEngValue(value, reg);
-  const tol = (reg.dataType === "f32" ? 1e-6 : 1e-9) * Math.max(1, Math.abs(value));
-  if (Math.abs(stored - value) <= tol) return null;
-  const sc = registerScaling(reg);
-  const decimals = Math.max(sc.decimals, effectiveDecimals(null, sc.scale, sc.offset, reg.dataType));
-  return `Will be stored as ${formatEng(stored, decimals, sc.unit, sc.trim)}`;
-}
-
-/** "Smaller than one step (0.1 °C) — does nothing" for an integer target's Inc/Dec. */
-function stepHint(by: number, reg: PageRegister | undefined, bank: number): string | null {
-  if (!reg || isBitTarget(bank, reg) || !Number.isFinite(by) || by === 0 || !INTEGER_TYPES.has(reg.dataType)) return null;
-  const sc = registerScaling(reg);
-  const step = Math.abs(sc.scale);
-  if (Math.abs(by) >= step - 1e-12) return null;
-  return `Smaller than one step (${formatEng(step, Math.min(6, decimalPlaces(step)), sc.unit)}) — does nothing`;
 }
 
 function Warn({ text }: { text: string }) {

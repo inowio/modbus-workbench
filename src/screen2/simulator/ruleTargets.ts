@@ -1,6 +1,15 @@
 import type { PageRegister } from "./useSimulatorData";
 import { wordSpan } from "./useSimulatorData";
-import { decimalPlaces, formatEng, registerScaling } from "./scaling";
+import {
+  INTEGER_TYPES,
+  decimalPlaces,
+  effectiveDecimals,
+  engFromRaw,
+  formatEng,
+  rawFromEng,
+  registerScaling,
+  roundHalfAway,
+} from "./scaling";
 
 export type AddrFmt = "dec" | "hex";
 
@@ -142,3 +151,61 @@ export function readConditions(t: Record<string, unknown>): { join: RuleJoin; co
 
 /** Operators that take a deadband. */
 export const DEADBAND_OPS = new Set([">", ">=", "<", "<="]);
+
+/**
+ * The engineering value a Set of `value` actually stores on `reg`, mirroring
+ * the engine: a single-word integer register at scale 1 / offset 0 takes the
+ * legacy truncate-and-wrap path (`value as i64 as u16`); otherwise
+ * `rawFromEng` (round to nearest step, clamp), with integer encodes truncating
+ * and f32 losing precision.
+ */
+export function storedEngValue(value: number, reg: PageRegister): number {
+  const sc = registerScaling(reg);
+  const dt = reg.dataType;
+  if (sc.scale === 1 && sc.offset === 0 && wordSpan(dt) === 1 && INTEGER_TYPES.has(dt)) {
+    const w = ((Math.trunc(value) % 65536) + 65536) % 65536;
+    return dt === "i16" && w > 32767 ? w - 65536 : w;
+  }
+  let raw = rawFromEng(value, sc.scale, sc.offset, dt);
+  if (INTEGER_TYPES.has(dt)) raw = Math.trunc(raw);
+  else if (dt === "f32") raw = Math.fround(raw);
+  return engFromRaw(raw, sc.scale, sc.offset);
+}
+
+/** Decimals that show one raw step of `reg` (at least the register's own). */
+function stepDecimals(reg: PageRegister): number {
+  const sc = registerScaling(reg);
+  return Math.max(sc.decimals, effectiveDecimals(null, sc.scale, sc.offset, reg.dataType));
+}
+
+/** "Will be stored as 25.6 °C" when a Set value isn't exactly representable on `reg`. */
+export function setHint(value: number, reg: PageRegister | undefined, bank: number): string | null {
+  if (!reg || isBitTarget(bank, reg) || !Number.isFinite(value) || reg.dataType === "f64") return null;
+  const stored = storedEngValue(value, reg);
+  const tol = (reg.dataType === "f32" ? 1e-6 : 1e-9) * Math.max(1, Math.abs(value));
+  if (Math.abs(stored - value) <= tol) return null;
+  const sc = registerScaling(reg);
+  return `Will be stored as ${formatEng(stored, stepDecimals(reg), sc.unit, sc.trim)}`;
+}
+
+/**
+ * Inc/Dec hint for an integer target. At scale 1 / offset 0 the engine
+ * truncates the amount (legacy path), so |by| < 1 does nothing. Otherwise each
+ * firing moves round(by / scale) whole steps (half away from zero, after the
+ * same 1e-9 pre-rounding as `rawFromEng`): 0 steps → does nothing; a different
+ * amount than typed → "Moves by 0.2 °C each time".
+ */
+export function stepHint(by: number, reg: PageRegister | undefined, bank: number): string | null {
+  if (!reg || isBitTarget(bank, reg) || !Number.isFinite(by) || by === 0 || !INTEGER_TYPES.has(reg.dataType)) return null;
+  const sc = registerScaling(reg);
+  const step = Math.abs(sc.scale);
+  const stepText = formatEng(step, Math.min(6, decimalPlaces(step)), sc.unit);
+  if (sc.scale === 1 && sc.offset === 0) {
+    return Math.abs(by) < 1 ? `Smaller than one step (${stepText}) — does nothing` : null;
+  }
+  const steps = roundHalfAway(roundHalfAway((by / sc.scale) * 1e9) / 1e9);
+  const moved = steps * sc.scale;
+  if (steps === 0) return `Smaller than half a step (${stepText}) — does nothing`;
+  if (Math.abs(moved - by) <= 1e-9 * Math.max(1, Math.abs(by))) return null;
+  return `Moves by ${formatEng(moved, stepDecimals(reg), sc.unit)} each time`;
+}

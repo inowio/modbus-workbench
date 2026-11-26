@@ -279,7 +279,7 @@ const simulatorSection: HelpSectionDefinition = {
         <p>Actions run in order, each with an optional per-action <strong>delay</strong> (fire now, or N ms later). Set, Increment and Decrement values are in the target register's units:</p>
         <ul className="list-disc space-y-1 pl-5">
           <li><strong>set</strong> — write a constant (On/Off for bits). A value the register can't hold exactly is rounded to its nearest step; the dialog says so (<em>Will be stored as 25.6 °C</em>) but still saves.</li>
-          <li><strong>inc</strong> / <strong>dec</strong> — add/subtract an amount, e.g. 0.5 °C. An amount smaller than one step of a scaled register (0.1 °C for scale 0.1) does nothing, and the dialog warns you.</li>
+          <li><strong>inc</strong> / <strong>dec</strong> — add/subtract an amount, e.g. 0.5 °C. On a scaled register each firing moves a whole number of steps (the amount rounded to the nearest step), so with scale 0.1 an amount of 0.15 °C moves 0.2 °C and anything under half a step (0.05 °C) does nothing; the dialog tells you when the real move differs from what you typed.</li>
           <li><strong>toggle</strong> — flip a bit, or a word between 0 and non-zero.</li>
           <li><strong>copy</strong> — copy another register's value, with optional scale and offset.</li>
           <li><strong>randomize</strong> — write a random value in a min/max range.</li>

@@ -8,7 +8,8 @@ import { decodeWordsInAddressOrder } from "../utils/modbusValueCodec";
 
 const MAX_SAFE = 9_007_199_254_740_992; // 2^53
 
-const INTEGER_TYPES = new Set(["u16", "i16", "u32", "i32", "u64", "i64", "bool"]);
+/** Data types encoded as integers (raw values round to a whole step when scaled). */
+export const INTEGER_TYPES: ReadonlySet<string> = new Set(["u16", "i16", "u32", "i32", "u64", "i64", "bool"]);
 
 const TYPE_RANGE: Record<string, [number, number]> = {
   u16: [0, 65535],
@@ -21,7 +22,7 @@ const TYPE_RANGE: Record<string, [number, number]> = {
 };
 
 /** Round half away from zero (JS Math.round rounds halves toward +Infinity). */
-function roundHalfAway(x: number): number {
+export function roundHalfAway(x: number): number {
   return x < 0 ? -Math.round(-x) : Math.round(x);
 }
 
