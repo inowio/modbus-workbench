@@ -263,8 +263,13 @@ export default function SlavesPage() {
         setFormError("Unit ID is required");
         return;
       }
-      if (unitId <= 0) {
-        setFormError("Slave Address (Unit ID) must be a positive number");
+      const tcpAdd = modalMode === "add" && formKind === "tcp";
+      if (tcpAdd ? unitId < 0 : unitId <= 0) {
+        setFormError(
+          tcpAdd
+            ? "Slave Address (Unit ID) must be 0 or greater"
+            : "Slave Address (Unit ID) must be a positive number",
+        );
         return;
       }
 

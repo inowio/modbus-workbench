@@ -377,6 +377,26 @@ describe("SlavesPage", () => {
       );
     });
 
+    it("Add with TCP and unit ID 0 is allowed; Serial with 0 is rejected", async () => {
+      setupScan();
+      render(<SlavesPage />);
+      fireEvent.click(await screen.findByRole("button", { name: /^add$/i }));
+      const dialog = await screen.findByRole("dialog");
+      fireEvent.change(within(dialog).getByLabelText("Name"), { target: { value: "Gw0" } });
+      fireEvent.change(within(dialog).getByLabelText(/unit id/i), { target: { value: "0" } });
+      fireEvent.click(within(dialog).getByRole("button", { name: /^add$/i }));
+      await screen.findByText(/must be a positive number/i);
+      expect(invokeMock.mock.calls.some((c) => c[0] === "create_slave")).toBe(false);
+      fireEvent.change(within(dialog).getByLabelText("Connection"), { target: { value: "tcp" } });
+      fireEvent.click(within(dialog).getByRole("button", { name: /^add$/i }));
+      await waitFor(() =>
+        expect(invokeMock).toHaveBeenCalledWith(
+          "create_slave",
+          expect.objectContaining({ slave: expect.objectContaining({ connectionKind: "tcp", unitId: 0 }) }),
+        ),
+      );
+    });
+
     it("ticked checkbox saves serial settings after creating the slave", async () => {
       setupScan();
       const dialog = await openFromPick();
