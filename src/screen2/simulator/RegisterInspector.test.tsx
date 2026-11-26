@@ -100,4 +100,26 @@ describe("RegisterInspector", () => {
     expect(screen.getByText("Pressure")).toBeInTheDocument();
     expect((screen.getByLabelText(/^unit$/i) as HTMLInputElement).value).toBe("kPa");
   });
+
+  it("keeps the action row pinned outside a height-limited scrolling body (F2)", () => {
+    render(<RegisterInspector {...base()} />);
+    const save = screen.getByRole("button", { name: /^save$/i });
+    const actionRow = save.parentElement as HTMLElement;
+    const root = actionRow.parentElement as HTMLElement;
+    expect(root.className).toMatch(/max-h-\[calc\(100vh-/);
+    expect(root.className).not.toMatch(/h-full/);
+    expect(actionRow.className).toMatch(/shrink-0/);
+    const body = root.querySelector(".overflow-y-auto") as HTMLElement;
+    expect(body).not.toBeNull();
+    expect(body.className).toMatch(/min-h-0/);
+    expect(body.contains(save)).toBe(false);
+  });
+
+  it("shows Access as plain text, not an input-styled box (F9)", () => {
+    render(<RegisterInspector {...base()} />);
+    const access = screen.getByText("Read-Write");
+    expect(access.className).not.toMatch(/border|bg-/);
+    render(<RegisterInspector {...base()} register={{ ...reg, id: 3, functionCode: 4 }} />);
+    expect(screen.getByText("Read only")).toBeInTheDocument();
+  });
 });

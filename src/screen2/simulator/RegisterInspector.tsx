@@ -37,7 +37,7 @@ function parseSourceParams(raw: string | undefined): SourceParams {
 }
 
 function accessLabel(functionCode: number): string {
-  return rwLabel(functionCode) === "R/W" ? "Read-Write" : "Read Only";
+  return rwLabel(functionCode) === "R/W" ? "Read-Write" : "Read only";
 }
 
 type SubTab = "general" | "source" | "advanced";
@@ -180,7 +180,7 @@ export default function RegisterInspector(props: RegisterInspectorProps) {
   };
 
   return (
-    <div className="flex h-full flex-col rounded-2xl border border-slate-200 bg-white dark:border-slate-800 dark:bg-white/5">
+    <div className="flex max-h-[calc(100vh-11rem)] min-h-0 flex-col rounded-2xl border border-slate-200 bg-white dark:border-slate-800 dark:bg-white/5">
       {/* Header */}
       <div className="border-b border-slate-100 p-4 dark:border-slate-800">
         <div className="flex items-start justify-between gap-2">
@@ -225,7 +225,7 @@ export default function RegisterInspector(props: RegisterInspectorProps) {
         })}
       </div>
 
-      <div className="flex-1 space-y-4 overflow-y-auto p-4">
+      <div className="min-h-0 flex-1 space-y-4 overflow-y-auto p-4">
         {tab === "general" && (
           <div className="grid grid-cols-2 gap-3">
             <label className={`col-span-2 ${LABEL_CLASS}`}>
@@ -265,12 +265,10 @@ export default function RegisterInspector(props: RegisterInspectorProps) {
               Unit
               <input aria-label="Unit" value={reg.unit ?? ""} onChange={(e) => set({ unit: e.target.value })} className={INPUT_CLASS} />
             </label>
-            <label className={LABEL_CLASS}>
+            <div className={LABEL_CLASS}>
               Access
-              <span className="rounded-lg border border-slate-200 bg-slate-50 px-2 py-1 text-slate-700 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200">
-                {accessLabel(reg.functionCode)}
-              </span>
-            </label>
+              <span className="py-1 text-sm text-slate-700 dark:text-slate-200">{accessLabel(reg.functionCode)}</span>
+            </div>
           </div>
         )}
 
@@ -491,7 +489,7 @@ export default function RegisterInspector(props: RegisterInspectorProps) {
         <div>Interval: {reg.intervalMs} ms</div>
       </div>
 
-      <div className="flex justify-end gap-2 border-t border-slate-100 p-4 dark:border-slate-800">
+      <div className="flex shrink-0 justify-end gap-2 border-t border-slate-100 p-4 dark:border-slate-800">
         <button
           type="button"
           onClick={() => onDuplicate(reg)}

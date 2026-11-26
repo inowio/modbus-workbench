@@ -239,7 +239,7 @@ export default function TcpSimulatorPage() {
         </div>
 
         {activeTab === "registers" && selectedRegister ? (
-          <div className="w-full lg:w-96 lg:shrink-0">
+          <div className="w-full pb-2 lg:sticky lg:top-0 lg:w-96 lg:shrink-0 lg:self-start">
             <RegisterInspector
               register={selectedRegister}
               devices={sim.devices}

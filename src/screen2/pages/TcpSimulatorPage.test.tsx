@@ -74,6 +74,15 @@ describe("TcpSimulatorPage (tabbed shell)", () => {
     // Inspector shows the alias as a heading and a Save button
     expect(await screen.findByRole("button", { name: /save/i })).toBeTruthy();
   });
+
+  it("makes the inspector panel sticky on wide layouts so its actions stay on screen", async () => {
+    renderPage();
+    fireEvent.click(await screen.findByText("temp"));
+    const save = await screen.findByRole("button", { name: /^save$/i });
+    const wrapper = save.parentElement!.parentElement!.parentElement as HTMLElement;
+    expect(wrapper.className).toMatch(/lg:sticky/);
+    expect(wrapper.className).toMatch(/lg:top-0/);
+  });
 });
 
 describe("TcpSimulatorPage dialogs keep open on failed saves", () => {
