@@ -11,6 +11,7 @@ const slavesSection: HelpSectionDefinition = {
     "slaves",
     "registers",
     "unit id",
+    "scanner",
     "clone",
     "duplicate",
     "polling",
@@ -26,7 +27,8 @@ const slavesSection: HelpSectionDefinition = {
   ],
   searchText:
     "Learn how to maintain the slaves list, open slave detail, configure connections, poll intervals, register selector, Edit and Monitor views, live monitor dashboard with density, search, filters and pinning, status bar, toolbar actions, register rows, mask write, row actions, read-after-write, attachments, switching behavior, address format, and safety rules." +
-    " Clone a slave to duplicate its register map and settings under a new name and Unit ID.",
+    " Clone a slave to duplicate its register map and settings under a new name and Unit ID." +
+    " Scan for slaves: find an unknown Unit ID (slave address) over serial or TCP, baud and parity sweep, several COM ports, gateway, garbled, add from result.",
   anchors: [
     { id: "list-overview", label: "Slaves list overview" },
     { id: "list-layout", label: "List layout" },
@@ -35,6 +37,7 @@ const slavesSection: HelpSectionDefinition = {
     { id: "list-rows", label: "Row metadata" },
     { id: "list-actions", label: "Per-slave actions" },
     { id: "list-dialogs", label: "Add / clone / edit / delete" },
+    { id: "list-scan", label: "Scan for slaves" },
     { id: "list-best", label: "List best practices" },
     { id: "list-scope", label: "List scope" },
     { id: "detail-purpose", label: "Slave detail purpose" },
@@ -80,6 +83,7 @@ const slavesSection: HelpSectionDefinition = {
       </SectionBlock>
       <SectionBlock section="slaves" anchor="list-header" title="Header actions">
         <ul className="list-disc space-y-1 pl-5">
+          <li><strong>Scan</strong> — find the Unit ID of a device you do not know the address of (see <em>Scan for slaves</em> below).</li>
           <li><strong>+ Add</strong> — register a new Unit ID with a descriptive name.</li>
           <li><strong>Refresh</strong> — reload after teammates change the list or after imports.</li>
         </ul>
@@ -110,6 +114,34 @@ const slavesSection: HelpSectionDefinition = {
         </p>
         <p>
           The <strong>Clone</strong> dialog uses those same two fields, pre-filled with a free name (<code>SHT20 (copy)</code>) and the lowest unused Unit ID, and tells you how many register rows it will copy. Cloning copies the register map for every function code plus the poll interval, connection kind and address offset — it does not copy attachments or Analyzer signals.
+        </p>
+      </SectionBlock>
+      <SectionBlock section="slaves" anchor="list-scan" title="Scan for slaves">
+        <p>
+          Do not know a device's Unit ID? Click <strong>Scan</strong> in the Slaves header. The scanner reads a couple of registers from each address in a range and lists every address that answers, live, as it goes. Cancel as soon as the device you want appears.
+        </p>
+        <ul className="list-disc space-y-1 pl-5">
+          <li><strong>What counts as found</strong> — each address is read with function 03, then 04 (change this under <em>Check with</em>). A real value <em>or</em> a Modbus exception reply means a device is there, so it is listed. An address that stays silent is not shown. Serial scans cover 1–247; TCP scans cover 0–255.</li>
+          <li><strong>Defaults</strong> — the scan uses your workspace connection settings, which you can edit for this scan only. <strong>Start</strong> is 1 and <strong>Quantity</strong> covers the rest of the range. <strong>Wait (ms)</strong> is how long each check waits for a reply: 200 ms for serial, 1000 ms for TCP (20–5000 allowed). <strong>Retries</strong> repeats a silent address 0–3 more times. The estimated time is shown before you press Scan.</li>
+          <li><strong>Several ports</strong> — tick more than one serial port to scan them at the same time. On a single port the addresses are checked one at a time, because an RS-485 bus carries one conversation at a time.</li>
+          <li><strong>Also try other baud rates &amp; parity</strong> — optional (off by default). Tick the bauds and parities to repeat the address range for each combination. It multiplies the scan time, so use it only when the line settings are unknown.</li>
+          <li><strong>Parallel checks (TCP)</strong> — TCP scans check several addresses at once over separate connections (default 4, up to 32). If the device refuses the extra connections, the scanner drops to fewer on its own and tells you.</li>
+        </ul>
+        <p>Results are grouped:</p>
+        <ul className="list-disc space-y-1 pl-5">
+          <li><strong>Found</strong> — the addresses that answered, each with an <strong>Add</strong> button.</li>
+          <li><strong>Answered but garbled — maybe wrong baud rate</strong> — bytes came back but not a valid reply. This usually means the baud rate or parity is wrong; try the sweep. At low baud rates a slow device's late reply can also make the next address look garbled, so raise <strong>Wait</strong> if that happens.</li>
+          <li><strong>Gateway reported no device</strong> — a Modbus TCP-to-RTU gateway answered with exception 0x0A or 0x0B because nothing is behind that address. These are collapsed and are not devices. Gateways answer absent addresses only after their own serial timeout and handle one request at a time, which is why TCP waits 1000 ms by default; lower <strong>Wait</strong> for devices that answer directly. After a check times out, the scanner reconnects before the next one so a gateway's late reply is never credited to the wrong address.</li>
+          <li><strong>A device that answers every address</strong> — some TCP devices ignore the Unit ID. If the first 16 addresses all answer, the scan stops with a warning; use Unit ID 1 (or 255) for that device. On serial, an address that answers at every setting usually means an echo/loopback adapter or wrong settings, and the rest of that setting is skipped.</li>
+        </ul>
+        <p>
+          <strong>Adding a result.</strong> <strong>Add</strong> closes the scanner and opens the Add Slave form with the address, a suggested name (such as <code>Slave 17</code>) and the connection type filled in. The form has a <strong>Connection</strong> choice (Serial or TCP); TCP allows address 0. If the serial settings that found the device differ from the workspace's, an optional checkbox saves them to the workspace. When the port itself differs it warns: <em>Changes the port and settings for all serial slaves in this workspace</em>. Leave it unticked to add the slave without touching the workspace settings.
+        </p>
+        <p>
+          <strong>While a scan runs.</strong> A serial scan takes over the serial connection, so other screens report <em>Serial port is in use by the slave scanner</em>; a TCP scan does the same for the TCP connection (<em>Connection is in use by the slave scanner</em>). Closing the scanner, pressing Esc, or leaving the page cancels the scan and releases the connection. The scanner will not start while Analyzer polling is using the connection: <em>Stop Analyzer polling before scanning — it is using the connection.</em> Only one scan runs per workspace at a time.
+        </p>
+        <p className="text-xs text-slate-500 dark:text-slate-400">
+          Scanning only reads. It never writes to a device. To discover a device's register map once you have its Unit ID, use Scan &amp; Add on the slave detail page. The built-in TCP simulator answers addresses without a device with exception 0x0B, like a gateway, so scanning it lists only the configured devices.
         </p>
       </SectionBlock>
       <SectionBlock section="slaves" anchor="list-best" title="List best practices">
