@@ -18,6 +18,40 @@ describe("SimStatusDashboard", () => {
     expect(onRefresh).toHaveBeenCalled();
   });
 
+  it("Refresh is an icon-only button with a title and aria-label (S2)", () => {
+    render(<SimStatusDashboard {...base} />);
+    const btn = screen.getByRole("button", { name: "Refresh" });
+    expect(btn).toHaveAttribute("title", "Refresh");
+    expect(btn.textContent?.trim()).toBe("");
+  });
+
+  it("puts Tick interval next to Port in the server controls and disables both while running (S1)", () => {
+    const { rerender } = render(<SimStatusDashboard {...base} />);
+    const tick = screen.getByLabelText("Tick interval (ms)");
+    const port = screen.getByLabelText("Port");
+    expect(tick.closest(".flex-wrap")).toBe(port.closest(".flex-wrap"));
+    expect(tick).not.toBeDisabled();
+    rerender(<SimStatusDashboard {...base} status={{ running: true, listen: null, clientCount: 0, startedAtMs: Date.now() }} />);
+    expect(screen.getByLabelText("Tick interval (ms)")).toBeDisabled();
+    expect(screen.getByLabelText("Port")).toBeDisabled();
+  });
+
+  it("shows an Uptime card: dash when stopped, m:ss while running (S1)", () => {
+    const { rerender } = render(<SimStatusDashboard {...base} />);
+    expect(screen.getByText("Uptime")).toBeInTheDocument();
+    expect(screen.queryByText("Tick Interval")).toBeNull();
+    expect(screen.getByTestId("uptime-value").textContent).toBe("—");
+    rerender(<SimStatusDashboard {...base} status={{ running: true, listen: null, clientCount: 0, startedAtMs: Date.now() - 65_000 }} />);
+    expect(screen.getByTestId("uptime-value").textContent).toMatch(/^1:0[5-9]$/);
+  });
+
+  it("explains that nothing is listening when stopped, using the Expose choice (S1)", () => {
+    const { rerender } = render(<SimStatusDashboard {...base} />);
+    expect(screen.getByText(/Not listening — Start to expose on LAN \/ Intranet:502/)).toBeInTheDocument();
+    rerender(<SimStatusDashboard {...base} config={{ ...base.config, host: "127.0.0.1" }} />);
+    expect(screen.getByText(/Start to expose on Local only:502/)).toBeInTheDocument();
+  });
+
   it("shows client count and resolved address when running", () => {
     render(<SimStatusDashboard {...base} status={{ running: true, listen: { bound: "0.0.0.0", port: 502, addresses: ["192.168.1.10:502", "10.0.0.5:502"] }, clientCount: 2 }} listen={{ bound: "0.0.0.0", port: 502, addresses: ["192.168.1.10:502", "10.0.0.5:502"] }} />);
     expect(screen.getByText("2")).toBeInTheDocument();
