@@ -17,7 +17,8 @@ export type SimStatus = {
   startedAtMs?: number | null;
   clients?: ClientInfo[];
 };
-export type SnapshotRow = { unitId: number; functionCode: number; address: number; valueWord: number | null; valueBit: boolean | null; sourceStatus?: string | null };
+export type { SnapshotRow } from "./liveValues";
+import type { SnapshotRow } from "./liveValues";
 export type SimDevice = { id: number; templateKey: string; name: string; unitId: number; baseAddress: number; sortOrder: number };
 export type PageRegister = SimRegister & { deviceInstanceId?: number | null };
 
