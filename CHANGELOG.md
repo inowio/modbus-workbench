@@ -11,6 +11,10 @@ All notable changes to this project are tracked here following [Keep a Changelog
   ("Stop Analyzer polling before scanning"). The Analyzer now shows polling as
   running with a Stop button, and the scanner's warning has a **Stop Analyzer
   polling** button.
+- **Scanning right after polling stops** — some USB serial adapters keep a port
+  locked for a few seconds after it closes, so a scan started straight after
+  stopping Analyzer polling failed with "Access is denied". The scanner now
+  keeps trying for up to about 8 seconds before giving up.
 - **Refresh buttons** — the Analyzer's Refresh also re-reads whether polling is
   running; a slave's "Reload from saved configuration" asks before discarding
   unsaved changes; the TCP Simulator's Refresh clears an error left from an

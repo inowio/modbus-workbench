@@ -250,13 +250,19 @@ fn serial_builder(port: &str, params: &SerialParams) -> Result<tokio_serial::Ser
 /// Pauses before each new try when Windows says a port is still in use.
 /// Closing a COM port finishes asynchronously, so reopening it straight away
 /// (next sweep setting, or right after the shared session let it go) can be
-/// refused for a moment with "Access is denied".
-const BUSY_PORT_RETRY: [Duration; 5] = [
+/// refused for a moment with "Access is denied". Some USB adapters (seen with
+/// a CH343 right after Analyzer polling stopped) take about 5 s, so the pauses
+/// add up to about 8 s before giving up on a port another program holds.
+const BUSY_PORT_RETRY: [Duration; 9] = [
     Duration::from_millis(50),
     Duration::from_millis(100),
     Duration::from_millis(200),
     Duration::from_millis(400),
     Duration::from_millis(800),
+    Duration::from_millis(1500),
+    Duration::from_millis(1500),
+    Duration::from_millis(1500),
+    Duration::from_millis(2000),
 ];
 
 /// "Access is denied" — the port is still held, by us (closing) or by someone else.
@@ -738,6 +744,29 @@ mod tests {
         .await;
         assert_eq!(opened.ok(), Some("port"));
         assert_eq!(tries.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_usb_adapter_that_takes_seconds_to_release_still_opens() {
+        // Seen with a CH343 USB adapter: right after Analyzer polling was stopped,
+        // COM14 kept answering "Access is denied" for about 5 s.
+        let start = tokio::time::Instant::now();
+        let opened = retry_while_busy(
+            move || async move {
+                Ok(if start.elapsed() < Duration::from_secs(5) { Err(busy()) } else { Ok("port") })
+            },
+            &BUSY_PORT_RETRY,
+        )
+        .await;
+        assert_eq!(opened.ok(), Some("port"));
+    }
+
+    #[test]
+    fn busy_retries_give_up_within_about_ten_seconds() {
+        // A port held by another program still fails in reasonable time.
+        let total: Duration = BUSY_PORT_RETRY.iter().sum();
+        assert!(total >= Duration::from_secs(7), "{total:?}");
+        assert!(total <= Duration::from_secs(10), "{total:?}");
     }
 
     #[tokio::test(start_paused = true)]
