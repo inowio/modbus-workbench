@@ -5,10 +5,15 @@ import { engFromRaw, liveRaw, registerScaling } from "./scaling";
 
 type LiveRegister = Parameters<typeof liveRaw>[0];
 
+const SAMPLE_MS = 100;
+
 /**
  * Rolling history of a register's live engineering value (or 0/1 for bits),
- * one point per store change while the register's row exists. Resets when the
- * register or anything that changes how its value is decoded changes.
+ * sampled every 100 ms while the register's row exists in the store. Reading
+ * the store on a timer (not per store change) keeps the chart's time base
+ * steady for idle registers and independent of unrelated registers' traffic.
+ * Resets when the register or anything that changes how its value is decoded
+ * changes, and when the row disappears (e.g. the store is cleared on Stop).
  */
 export function useValueHistory(store: LiveStore, reg: LiveRegister | null, cap = 60): number[] {
   const [history, setHistory] = useState<number[]>([]);
@@ -23,11 +28,17 @@ export function useValueHistory(store: LiveStore, reg: LiveRegister | null, cap 
     setHistory((h) => (h.length ? [] : h));
     if (resetKey === null) return;
     let buffer: number[] = [];
-    const record = () => {
+    const sample = () => {
       const r = regRef.current;
       if (!r) return;
       const row = store.get(r.unitId, r.functionCode, r.address);
-      if (!row) return;
+      if (!row) {
+        if (buffer.length) {
+          buffer = [];
+          setHistory([]);
+        }
+        return;
+      }
       let value: number | null = null;
       if (row.valueBit !== null && row.valueBit !== undefined) {
         value = row.valueBit ? 1 : 0;
@@ -43,8 +54,8 @@ export function useValueHistory(store: LiveStore, reg: LiveRegister | null, cap 
       if (buffer.length > cap) buffer.splice(0, buffer.length - cap);
       setHistory(buffer);
     };
-    record();
-    return store.subscribe(record);
+    const id = setInterval(sample, SAMPLE_MS);
+    return () => clearInterval(id);
   }, [store, resetKey, cap]);
 
   return history;

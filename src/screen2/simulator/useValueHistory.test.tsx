@@ -1,5 +1,5 @@
 import { act, renderHook } from "@testing-library/react";
-import { describe, it, expect } from "vitest";
+import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { createLiveStore, type SnapshotRow } from "./liveValues";
 import { useValueHistory } from "./useValueHistory";
 
@@ -9,42 +9,67 @@ const reg = (o: Record<string, unknown> = {}) => ({
 const row = (valueWord: number | null, o: Partial<SnapshotRow> = {}): SnapshotRow => ({
   unitId: 1, functionCode: 3, address: 5, valueWord, valueBit: null, ...o,
 });
+const tick = (ms: number) => act(() => { vi.advanceTimersByTime(ms); });
 
 describe("useValueHistory", () => {
-  it("records engineering values, one point per store change", () => {
+  beforeEach(() => { vi.useFakeTimers(); });
+  afterEach(() => { vi.useRealTimers(); });
+
+  it("samples an idle register every 100 ms so a flat line still draws", () => {
     const store = createLiveStore();
+    store.apply({ full: true, rows: [row(7)] });
+    const r = reg();
+    const { result } = renderHook(() => useValueHistory(store, r));
+    tick(300);
+    expect(result.current.length).toBeGreaterThanOrEqual(2);
+    expect(new Set(result.current)).toEqual(new Set([7]));
+  });
+
+  it("records engineering values", () => {
+    const store = createLiveStore();
+    store.apply({ full: true, rows: [row(235)] });
     const r = reg({ scale: 0.1 });
     const { result } = renderHook(() => useValueHistory(store, r));
-    expect(result.current).toEqual([]);
-    act(() => store.apply({ full: false, rows: [row(235)] }));
-    expect(result.current).toEqual([23.5]);
+    tick(100);
+    expect(result.current[result.current.length - 1]).toBeCloseTo(23.5);
     act(() => store.apply({ full: false, rows: [row(240)] }));
-    expect(result.current).toEqual([23.5, 24]);
+    tick(100);
+    expect(result.current[result.current.length - 1]).toBeCloseTo(24);
   });
 
   it("records 0/1 for bit registers", () => {
     const store = createLiveStore();
+    const bit = (valueBit: boolean): SnapshotRow => ({ unitId: 2, functionCode: 1, address: 0, valueWord: null, valueBit });
+    store.apply({ full: true, rows: [bit(true)] });
     const r = reg({ unitId: 2, functionCode: 1, address: 0 });
     const { result } = renderHook(() => useValueHistory(store, r));
-    act(() => store.apply({ full: false, rows: [{ unitId: 2, functionCode: 1, address: 0, valueWord: null, valueBit: true }] }));
-    act(() => store.apply({ full: false, rows: [{ unitId: 2, functionCode: 1, address: 0, valueWord: null, valueBit: false }] }));
-    expect(result.current).toEqual([1, 0]);
+    tick(100);
+    act(() => store.apply({ full: false, rows: [bit(false)] }));
+    tick(100);
+    expect(result.current[result.current.length - 1]).toBe(0);
+    expect(new Set(result.current)).toEqual(new Set([1, 0]));
   });
 
-  it("skips changes while the register has no row or no value", () => {
+  it("does not record while the register has no row or no value", () => {
     const store = createLiveStore();
     const r = reg();
     const { result } = renderHook(() => useValueHistory(store, r));
-    act(() => store.apply({ full: false, rows: [row(null)] }));
+    tick(300);
     act(() => store.apply({ full: false, rows: [{ ...row(1), address: 9 }] }));
+    tick(300);
+    act(() => store.apply({ full: false, rows: [row(null)] }));
+    tick(300);
     expect(result.current).toEqual([]);
   });
 
   it("caps the history at cap", () => {
     const store = createLiveStore();
-    const r = reg();
-    const { result } = renderHook(() => useValueHistory(store, r, 3));
-    for (const v of [1, 2, 3, 4, 5]) act(() => store.apply({ full: false, rows: [row(v)] }));
+    store.apply({ full: true, rows: [row(1)] });
+    const { result } = renderHook(() => useValueHistory(store, reg(), 3));
+    for (const v of [2, 3, 4, 5]) {
+      act(() => store.apply({ full: false, rows: [row(v)] }));
+      tick(100);
+    }
     expect(result.current).toEqual([3, 4, 5]);
   });
 
@@ -54,31 +79,65 @@ describe("useValueHistory", () => {
     const a = reg();
     const b = reg({ address: 6 });
     const { result, rerender } = renderHook(({ r }) => useValueHistory(store, r), { initialProps: { r: a } });
-    act(() => store.apply({ full: false, rows: [row(2)] }));
-    expect(result.current).toEqual([1, 2]);
+    tick(200);
+    expect(new Set(result.current)).toEqual(new Set([1]));
     rerender({ r: b });
-    expect(result.current).toEqual([100]);
+    tick(100);
+    expect(result.current.length).toBeGreaterThanOrEqual(1);
+    expect(new Set(result.current)).toEqual(new Set([100]));
   });
 
   it("resets when scale, offset, data type or byte order change", () => {
     const store = createLiveStore();
     store.apply({ full: true, rows: [row(10)] });
     const { result, rerender } = renderHook(({ r }) => useValueHistory(store, r), { initialProps: { r: reg() } });
+    tick(100);
     expect(result.current).toEqual([10]);
     rerender({ r: reg({ scale: 0.5 }) });
-    expect(result.current).toEqual([5]);
+    tick(100);
+    expect(new Set(result.current)).toEqual(new Set([5]));
     rerender({ r: reg({ scale: 0.5, scaleOffset: 1 }) });
-    expect(result.current).toEqual([6]);
+    tick(100);
+    expect(new Set(result.current)).toEqual(new Set([6]));
+    const n = result.current.length;
     rerender({ r: reg({ scale: 0.5, scaleOffset: 1, byteOrder: "BADC" }) });
-    expect(result.current).toHaveLength(1);
+    tick(100);
+    expect(result.current.length).toBeLessThanOrEqual(n);
     rerender({ r: reg({ scale: 0.5, scaleOffset: 1, byteOrder: "BADC", dataType: "i16" }) });
+    tick(100);
     expect(result.current).toHaveLength(1);
+  });
+
+  it("empties when the store is cleared and grows again after a new full event", () => {
+    const store = createLiveStore();
+    store.apply({ full: true, rows: [row(7)] });
+    const r = reg();
+    const { result } = renderHook(() => useValueHistory(store, r));
+    tick(300);
+    expect(result.current.length).toBeGreaterThanOrEqual(2);
+    act(() => store.clear());
+    tick(100);
+    expect(result.current).toEqual([]);
+    act(() => store.apply({ full: true, rows: [row(8)] }));
+    tick(100);
+    expect(result.current).toEqual([8]);
+    tick(100);
+    expect(result.current).toEqual([8, 8]);
+  });
+
+  it("stops sampling on unmount", () => {
+    const store = createLiveStore();
+    store.apply({ full: true, rows: [row(7)] });
+    const { unmount } = renderHook(() => useValueHistory(store, reg()));
+    unmount();
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it("returns an empty history when reg is null", () => {
     const store = createLiveStore();
+    store.apply({ full: true, rows: [row(1)] });
     const { result } = renderHook(() => useValueHistory(store, null));
-    act(() => store.apply({ full: false, rows: [row(1)] }));
+    tick(300);
     expect(result.current).toEqual([]);
   });
 });
