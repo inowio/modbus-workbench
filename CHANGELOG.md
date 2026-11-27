@@ -4,6 +4,9 @@ All notable changes to this project are tracked here following [Keep a Changelog
 
 ## [Unreleased]
 
+_No changes yet._
+
+## [0.6.0] - 2026-11-27
 ### Added
 - **Slave scanner** — a **Scan** button on the Slaves page finds a device's
   Unit ID over serial (one or several ports, optional baud/parity sweep) or TCP
