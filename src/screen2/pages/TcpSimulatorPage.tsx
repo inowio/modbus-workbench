@@ -250,7 +250,7 @@ export default function TcpSimulatorPage() {
         onSaveConfig={(patch) => sim.saveConfig(patch)}
         onChangeExpose={(host) => void sim.saveConfig({ host })}
         onChangePort={(port) => sim.saveConfig({ port })}
-        onRefresh={() => void sim.reload()}
+        onRefresh={() => void sim.refresh()}
         registerCount={sim.registers.length}
         unitCount={new Set(sim.registers.map((r) => r.unitId)).size}
         deviceCount={sim.devices.length}

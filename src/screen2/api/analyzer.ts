@@ -90,6 +90,11 @@ export async function stopAnalyzerPolling(workspaceName: string): Promise<void> 
   await invoke<void>("stop_analyzer_polling", { name: workspaceName });
 }
 
+/** Whether Analyzer polling is running in the backend (it keeps running after the page is left). */
+export async function isAnalyzerPollingRunning(workspaceName: string): Promise<boolean> {
+  return await invoke<boolean>("analyzer_polling_running", { name: workspaceName });
+}
+
 export async function listAnalyzerTiles(workspaceName: string): Promise<AnalyzerTile[]> {
   return await invoke<AnalyzerTile[]>("list_analyzer_tiles", { name: workspaceName });
 }

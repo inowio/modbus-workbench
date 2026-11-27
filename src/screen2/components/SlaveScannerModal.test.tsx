@@ -484,6 +484,42 @@ describe("SlaveScannerModal", () => {
     fireEvent.click(screen.getByRole("button", { name: "Scan" }));
     expect(await screen.findByText("A scan is already running in this workspace")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Scan" })).toBeEnabled();
+    expect(screen.queryByRole("button", { name: "Stop Analyzer polling" })).not.toBeInTheDocument();
+  });
+
+  describe("refused because Analyzer polling is running", () => {
+    const POLLING = "Stop Analyzer polling before scanning — it is using the connection.";
+
+    it("offers to stop Analyzer polling, then clears the warning so Scan can run", async () => {
+      setup({ start: () => Promise.reject(POLLING) });
+      renderModal();
+      await loaded();
+      fireEvent.click(screen.getByRole("button", { name: "Scan" }));
+      expect(await screen.findByText(POLLING)).toBeInTheDocument();
+
+      fireEvent.click(screen.getByRole("button", { name: "Stop Analyzer polling" }));
+
+      await waitFor(() => expect(screen.queryByText(POLLING)).not.toBeInTheDocument());
+      expect(invokeMock).toHaveBeenCalledWith("stop_analyzer_polling", { name: WS });
+      expect(screen.queryByRole("button", { name: "Stop Analyzer polling" })).not.toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Scan" })).toBeEnabled();
+    });
+
+    it("shows the error if stopping Analyzer polling fails", async () => {
+      setup({ start: () => Promise.reject(POLLING) });
+      const base = invokeMock.getMockImplementation()!;
+      invokeMock.mockImplementation((command: string, args?: unknown) =>
+        command === "stop_analyzer_polling" ? Promise.reject("lock poisoned") : base(command, args),
+      );
+      renderModal();
+      await loaded();
+      fireEvent.click(screen.getByRole("button", { name: "Scan" }));
+      await screen.findByText(POLLING);
+
+      fireEvent.click(screen.getByRole("button", { name: "Stop Analyzer polling" }));
+
+      expect(await screen.findByText(/Could not stop Analyzer polling: lock poisoned/)).toBeInTheDocument();
+    });
   });
 
   it("disables Scan with a reason when no serial port is selected", async () => {

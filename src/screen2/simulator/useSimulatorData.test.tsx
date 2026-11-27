@@ -147,6 +147,29 @@ describe("useSimulatorData", () => {
     expect(invokeMock).not.toHaveBeenCalledWith("simulator_snapshot", expect.anything());
   });
 
+  it("refresh clears an earlier error when the reload works", async () => {
+    const { result } = renderHook(() => useSimulatorData("ws"));
+    await waitFor(() => expect(result.current.lastUpdated).not.toBeNull());
+    act(() => result.current.setError("Port 502 is in use"));
+
+    await act(async () => { await result.current.refresh(); });
+
+    expect(result.current.error).toBeNull();
+  });
+
+  it("refresh shows the new error when the reload fails", async () => {
+    const { result } = renderHook(() => useSimulatorData("ws"));
+    await waitFor(() => expect(result.current.lastUpdated).not.toBeNull());
+    act(() => result.current.setError("old error"));
+    const base = invokeMock.getMockImplementation()!;
+    invokeMock.mockImplementation((cmd: string, args?: unknown) =>
+      cmd === "simulator_list_rules" ? Promise.reject("db locked") : base(cmd, args));
+
+    await act(async () => { await result.current.refresh(); });
+
+    expect(result.current.error).toBe("db locked");
+  });
+
   it("setError sets the error message", async () => {
     const { result } = renderHook(() => useSimulatorData("ws"));
     await waitFor(() => expect(result.current.lastUpdated).not.toBeNull());

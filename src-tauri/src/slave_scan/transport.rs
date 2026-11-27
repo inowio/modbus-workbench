@@ -250,18 +250,44 @@ fn serial_builder(port: &str, params: &SerialParams) -> Result<tokio_serial::Ser
 /// Pauses before each new try when Windows says a port is still in use.
 /// Closing a COM port finishes asynchronously, so reopening it straight away
 /// (next sweep setting, or right after the shared session let it go) can be
-/// refused for a moment with "Access is denied".
-const BUSY_PORT_RETRY: [Duration; 5] = [
+/// refused for a moment with "Access is denied". Some USB adapters (seen with
+/// a CH343 right after Analyzer polling stopped) take about 5 s, so the pauses
+/// add up to about 8 s before giving up on a port another program holds.
+const BUSY_PORT_RETRY: [Duration; 9] = [
     Duration::from_millis(50),
     Duration::from_millis(100),
     Duration::from_millis(200),
     Duration::from_millis(400),
     Duration::from_millis(800),
+    Duration::from_millis(1500),
+    Duration::from_millis(1500),
+    Duration::from_millis(1500),
+    Duration::from_millis(2000),
 ];
 
 /// "Access is denied" — the port is still held, by us (closing) or by someone else.
 fn port_busy(e: &tokio_serial::Error) -> bool {
     e.kind() == tokio_serial::ErrorKind::Io(io::ErrorKind::PermissionDenied)
+}
+
+/// On Windows, serialport 4.x reports "Access is denied" as `NoDevice` — the
+/// same kind as a port that does not exist — so `port_busy` would never see
+/// it. A port that is still listed exists, so the error means it is busy:
+/// re-label it so it is retried. A port that is not listed stays `NoDevice`
+/// and fails at once. Decided by the port list, not by the (translated) text.
+fn busy_if_listed(e: tokio_serial::Error, listed: bool) -> tokio_serial::Error {
+    if listed && e.kind() == tokio_serial::ErrorKind::NoDevice {
+        tokio_serial::Error::new(tokio_serial::ErrorKind::Io(io::ErrorKind::PermissionDenied), e.description)
+    } else {
+        e
+    }
+}
+
+/// Whether the OS currently lists `port` (e.g. "COM14").
+fn port_listed(port: &str) -> bool {
+    tokio_serial::available_ports()
+        .map(|ports| ports.iter().any(|p| p.port_name.eq_ignore_ascii_case(port)))
+        .unwrap_or(false)
 }
 
 /// Runs `attempt`, and while it fails because the port is busy, tries again
@@ -309,12 +335,20 @@ async fn open_serial(port: String, params: SerialParams) -> Result<tokio_serial:
         || {
             let builder = builder.clone();
             let port = port.clone();
+            let port_for_open = port.clone();
             async move {
                 // If the wait runs out, the blocking open still finishes on
                 // its own and the stream it returns is dropped, closing the port.
                 timeout(
                     OPEN_TIMEOUT,
-                    tokio::task::spawn_blocking(move || builder.open_native_async()),
+                    tokio::task::spawn_blocking(move || {
+                        builder.open_native_async().map_err(|e| {
+                            // Only list ports when needed (a "not found"-kind error).
+                            let listed =
+                                e.kind() == tokio_serial::ErrorKind::NoDevice && port_listed(&port_for_open);
+                            busy_if_listed(e, listed)
+                        })
+                    }),
                 )
                 .await
                 .map_err(|_| OpenError::TimedOut(format!("timed out opening {port}")))?
@@ -738,6 +772,79 @@ mod tests {
         .await;
         assert_eq!(opened.ok(), Some("port"));
         assert_eq!(tries.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_usb_adapter_that_takes_seconds_to_release_still_opens() {
+        // Seen with a CH343 USB adapter: right after Analyzer polling was stopped,
+        // COM14 kept answering "Access is denied" for about 5 s.
+        let start = tokio::time::Instant::now();
+        let opened = retry_while_busy(
+            move || async move {
+                Ok(if start.elapsed() < Duration::from_secs(5) { Err(busy()) } else { Ok("port") })
+            },
+            &BUSY_PORT_RETRY,
+        )
+        .await;
+        assert_eq!(opened.ok(), Some("port"));
+    }
+
+    /// What serialport 4.x returns on Windows for "Access is denied": the same
+    /// kind as a missing port (see `busy_if_listed`).
+    fn windows_access_denied() -> tokio_serial::Error {
+        tokio_serial::Error::new(tokio_serial::ErrorKind::NoDevice, "Access is denied.")
+    }
+
+    #[test]
+    fn windows_access_denied_on_a_listed_port_counts_as_busy() {
+        let e = busy_if_listed(windows_access_denied(), true);
+        assert!(port_busy(&e));
+        assert_eq!(e.to_string(), "Access is denied.");
+    }
+
+    #[test]
+    fn a_port_that_is_not_listed_is_missing_not_busy() {
+        let e = busy_if_listed(
+            tokio_serial::Error::new(tokio_serial::ErrorKind::NoDevice, "The system cannot find the file specified."),
+            false,
+        );
+        assert!(!port_busy(&e));
+        assert_eq!(e.kind(), tokio_serial::ErrorKind::NoDevice);
+    }
+
+    #[test]
+    fn other_errors_are_left_alone_even_on_a_listed_port() {
+        let e = busy_if_listed(
+            tokio_serial::Error::new(tokio_serial::ErrorKind::InvalidInput, "bad baud"),
+            true,
+        );
+        assert_eq!(e.kind(), tokio_serial::ErrorKind::InvalidInput);
+        assert!(!port_busy(&e));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn windows_access_denied_while_a_usb_adapter_releases_is_retried_until_it_opens() {
+        let start = tokio::time::Instant::now();
+        let opened = retry_while_busy(
+            move || async move {
+                Ok(if start.elapsed() < Duration::from_secs(5) {
+                    Err(busy_if_listed(windows_access_denied(), true))
+                } else {
+                    Ok("port")
+                })
+            },
+            &BUSY_PORT_RETRY,
+        )
+        .await;
+        assert_eq!(opened.ok(), Some("port"));
+    }
+
+    #[test]
+    fn busy_retries_give_up_within_about_ten_seconds() {
+        // A port held by another program still fails in reasonable time.
+        let total: Duration = BUSY_PORT_RETRY.iter().sum();
+        assert!(total >= Duration::from_secs(7), "{total:?}");
+        assert!(total <= Duration::from_secs(10), "{total:?}");
     }
 
     #[tokio::test(start_paused = true)]

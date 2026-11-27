@@ -79,6 +79,12 @@ export function useSimulatorData(ws: string) {
 
   useEffect(() => { void reload(); }, [reload]);
 
+  /** The Refresh button: drops an error left over from an earlier action; a failed reload sets a new one. */
+  const refresh = useCallback(async () => {
+    setError(null);
+    await reload();
+  }, [reload]);
+
   // Poll status (client list) + events every 2s while running; live values arrive
   // via the `simulator_values` push event (subscribed below) instead of polling.
   useEffect(() => {
@@ -318,7 +324,7 @@ export function useSimulatorData(ws: string) {
   return {
     config, registers, devices, rules, status, listen, live, events,
     deviceTemplates, error, busy, lastUpdated,
-    reload, saveConfig, start, stop,
+    reload, refresh, saveConfig, start, stop,
     addRegister, updateRegister, deleteRegister, duplicateRegister,
     addDevice, addSlaveDevice, updateDevice, deleteDevice, renameDevice, rebaseDevice,
     addRule, updateRule, deleteRule,

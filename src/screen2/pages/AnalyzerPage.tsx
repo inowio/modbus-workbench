@@ -22,6 +22,7 @@ import {
   reorderAnalyzerTabs,
   saveAnalyzerTileLayouts,
   setAnalyzerTilePollingEnabled,
+  isAnalyzerPollingRunning,
   startAnalyzerPolling,
   stopAnalyzerPolling,
   updateAnalyzerTile,
@@ -39,6 +40,7 @@ import {
   ConnectionSettingsForm,
   PortItem as SerialPortItem,
   normalizeConnectionSettings,
+  refreshSerialPortList,
 } from "../components/ConnectionSettingsForm";
 import AnalyzerControlBar from "./analyzer/AnalyzerControlBar";
 import AnalyzerTilesCard from "./analyzer/AnalyzerTilesCard";
@@ -840,13 +842,37 @@ export default function AnalyzerPage() {
     }, 650);
   }
 
-  async function refreshAll() {
+  // Polling keeps running in the backend when this page is left (and the slave scanner can stop it),
+  // so ask the backend instead of trusting the page's own flag. `fallback` is used if the check fails.
+  async function syncPollingState(fallback: boolean): Promise<boolean> {
+    const ws = workspaceName;
+    let running = fallback;
+    try {
+      running = await isAnalyzerPollingRunning(ws);
+    } catch {
+      running = fallback;
+    }
+    if (workspaceNameRef.current !== ws) return pollingWantedRef.current;
+    pollingWantedRef.current = running;
+    setPollingWanted(running);
+    return running;
+  }
+
+  /**
+   * Reloads everything and re-reads whether polling runs. `restartPolling` (default true) restarts a
+   * running worker so it picks up changed tiles/signals; `pollingFallback` is the state assumed when
+   * the polling check fails (default: what the page shows now).
+   */
+  async function refreshAll(options?: { restartPolling?: boolean; pollingFallback?: boolean }) {
     setLoading(true);
     setError(null);
     try {
-      const [, , nextTiles] = await Promise.all([refreshSignals(), refreshSlaves(), refreshTiles(), refreshTabs()]);
+      const [[, , nextTiles], running] = await Promise.all([
+        Promise.all([refreshSignals(), refreshSlaves(), refreshTiles(), refreshTabs()]),
+        syncPollingState(options?.pollingFallback ?? pollingWantedRef.current),
+      ]);
 
-      if (pollingWantedRef.current && nextTiles.length > 0) {
+      if ((options?.restartPolling ?? true) && running && nextTiles.length > 0) {
         await startAnalyzerPolling(workspaceName);
       }
     } catch (e) {
@@ -909,7 +935,10 @@ export default function AnalyzerPage() {
     // Tab ids belong to a workspace: forget the selection so the new workspace's remembered tab applies.
     selectedTabIdRef.current = null;
     setSelectedTabId(null);
-    void refreshAll();
+    // Show polling that kept running while the page was closed (otherwise Run is offered while
+    // polling still holds the connection, and the slave scanner refuses to start). Nothing to
+    // restart on open; a failed check counts as stopped.
+    void refreshAll({ restartPolling: false, pollingFallback: false });
   }, [workspaceName]);
 
   useEffect(() => {
@@ -1490,14 +1519,7 @@ export default function AnalyzerPage() {
                 value={connectionFormValue}
                 onChange={setConnectionFormValue}
                 serialPortOptions={connectionSerialPorts}
-                onRefreshSerialPorts={async () => {
-                  try {
-                    const ports = await invoke<SerialPortItem[]>("list_serial_ports");
-                    setConnectionSerialPorts(ports);
-                  } catch {
-                    setConnectionSerialPorts([]);
-                  }
-                }}
+                onRefreshSerialPorts={() => refreshSerialPortList(setConnectionSerialPorts)}
                 loading={loading}
                 saving={connectionSaving}
               />

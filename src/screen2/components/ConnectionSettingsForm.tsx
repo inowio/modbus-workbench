@@ -1,3 +1,5 @@
+import { invoke } from "@tauri-apps/api/core";
+import { useState } from "react";
 import { FiRefreshCw } from "react-icons/fi";
 
 export type ConnectionKind = "serial" | "tcp";
@@ -44,10 +46,21 @@ export type ConnectionSettingsFormProps = {
   value: ConnectionSettings;
   onChange: (value: ConnectionSettings) => void;
   serialPortOptions: PortItem[];
-  onRefreshSerialPorts: () => void;
+  /** Reloads the port list; a rejection is shown under the port field. */
+  onRefreshSerialPorts: () => void | Promise<void>;
   loading?: boolean;
   saving?: boolean;
 };
+
+/** Lists the serial ports into `setPorts`. On failure the list is emptied and the error is re-thrown, so the form can say why. */
+export async function refreshSerialPortList(setPorts: (ports: PortItem[]) => void): Promise<void> {
+  try {
+    setPorts(await invoke<PortItem[]>("list_serial_ports"));
+  } catch (e) {
+    setPorts([]);
+    throw e;
+  }
+}
 
 export function ConnectionSettingsForm({
   value,
@@ -59,6 +72,16 @@ export function ConnectionSettingsForm({
 }: ConnectionSettingsFormProps) {
   const kind = value.kind;
   const disabled = !!loading || !!saving;
+  const [portsError, setPortsError] = useState<string | null>(null);
+
+  async function handleRefreshPorts() {
+    try {
+      await onRefreshSerialPorts();
+      setPortsError(null);
+    } catch (e) {
+      setPortsError(`Could not list serial ports: ${String(e)}`);
+    }
+  }
 
   const setKind = (next: ConnectionKind) => {
     if (disabled) return;
@@ -123,7 +146,7 @@ export function ConnectionSettingsForm({
                   <button
                     type="button"
                     className="inline-flex items-center justify-center gap-2 rounded-xl border border-slate-300 bg-slate-100 px-4 py-2 text-sm font-semibold text-slate-700 transition hover:border-slate-400 disabled:cursor-not-allowed disabled:opacity-60 dark:border-slate-700 dark:bg-white/5 dark:text-slate-100 dark:hover:border-slate-600"
-                    onClick={onRefreshSerialPorts}
+                    onClick={() => void handleRefreshPorts()}
                     disabled={disabled}
                     aria-label="Refresh serial ports"
                     title="Refresh serial ports"
@@ -132,6 +155,11 @@ export function ConnectionSettingsForm({
                     Refresh
                   </button>
                 </div>
+                {portsError ? (
+                  <p role="alert" className="text-xs text-rose-700 dark:text-rose-300">
+                    {portsError}
+                  </p>
+                ) : null}
               </div>
             </div>
 

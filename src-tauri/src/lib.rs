@@ -84,7 +84,7 @@ use analyzer_tabs::{
     move_analyzer_tile_to_tab, rename_analyzer_tab, reorder_analyzer_tabs,
 };
 
-use analyzer_polling::{start_analyzer_polling, stop_analyzer_polling, AnalyzerPollingState};
+use analyzer_polling::{analyzer_polling_running, start_analyzer_polling, stop_analyzer_polling, AnalyzerPollingState};
 
 #[derive(Debug, Serialize)]
 struct PortItem {
@@ -200,6 +200,7 @@ pub fn run() {
             can_delete_slave_register_row,
             start_analyzer_polling,
             stop_analyzer_polling,
+            analyzer_polling_running,
             get_connection_settings,
             set_connection_settings,
             get_client_settings,

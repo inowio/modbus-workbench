@@ -34,6 +34,7 @@ import {
   ConnectionSettingsForm,
   PortItem as SerialPortItem,
   normalizeConnectionSettings,
+  refreshSerialPortList,
 } from "../components/ConnectionSettingsForm";
 import { logEvent } from "../api/logs";
 import { CTRL_S } from "../../components/ShortcutKeys";
@@ -880,6 +881,7 @@ export default function SlaveDetailPage() {
   const [maskWriteVisible, setMaskWriteVisible] = useState(false);
 
   const [leaveModalOpen, setLeaveModalOpen] = useState(false);
+  const [reloadConfirmOpen, setReloadConfirmOpen] = useState(false);
 
   const [connectionModalOpen, setConnectionModalOpen] = useState(false);
   const [connectionFormValue, setConnectionFormValue] = useState<GlobalConnectionSettings | null>(null);
@@ -3073,7 +3075,11 @@ export default function SlaveDetailPage() {
           <button
             type="button"
             className="inline-flex items-center gap-2 rounded-full border border-slate-300 bg-slate-100 px-2 py-1.5 text-sm font-semibold text-slate-700 transition hover:border-slate-400 disabled:cursor-not-allowed disabled:opacity-60 dark:border-slate-700 dark:bg-white/5 dark:text-slate-100 dark:hover:border-slate-600"
-            onClick={() => refresh()}
+            onClick={() => {
+              // Reloading replaces unsaved edits with the saved configuration, so ask first.
+              if (hasPageUnsaved) setReloadConfirmOpen(true);
+              else void refresh();
+            }}
             disabled={busyOrPolling}
             title="Reload from saved configuration"
           >
@@ -3178,14 +3184,7 @@ export default function SlaveDetailPage() {
                 value={connectionFormValue}
                 onChange={setConnectionFormValue}
                 serialPortOptions={connectionSerialPorts}
-                onRefreshSerialPorts={async () => {
-                  try {
-                    const ports = await invoke<SerialPortItem[]>("list_serial_ports");
-                    setConnectionSerialPorts(ports);
-                  } catch {
-                    setConnectionSerialPorts([]);
-                  }
-                }}
+                onRefreshSerialPorts={() => refreshSerialPortList(setConnectionSerialPorts)}
                 loading={loading}
                 saving={connectionSaving}
               />
@@ -3715,6 +3714,27 @@ export default function SlaveDetailPage() {
         }}
         onClose={() => {
           setLeaveModalOpen(false);
+        }}
+      />
+
+      <ConfirmDialog
+        open={reloadConfirmOpen}
+        title="Discard unsaved changes?"
+        description={
+          <p>
+            Reloading replaces your unsaved changes on this slave (address, base, poll interval and
+            register rows) with the saved configuration.
+          </p>
+        }
+        confirmText="Discard and reload"
+        cancelText="Keep editing"
+        tone="danger"
+        onConfirm={() => {
+          setReloadConfirmOpen(false);
+          void refresh();
+        }}
+        onClose={() => {
+          setReloadConfirmOpen(false);
         }}
       />
 

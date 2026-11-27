@@ -1113,6 +1113,14 @@ mod tests {
     }
 }
 
+/// Whether Analyzer polling is running for the workspace. Polling keeps running
+/// when the Analyzer page is left, so the page asks this when it opens instead
+/// of assuming it is stopped.
+#[tauri::command]
+pub fn analyzer_polling_running(state: tauri::State<'_, AnalyzerPollingState>, name: String) -> bool {
+    state.is_running(&name)
+}
+
 #[tauri::command]
 pub fn stop_analyzer_polling(
     state: tauri::State<'_, AnalyzerPollingState>,

@@ -14,6 +14,7 @@ const listAnalyzerTileLayoutsMock = vi.fn();
 const saveAnalyzerTileLayoutsMock = vi.fn();
 const startAnalyzerPollingMock = vi.fn();
 const stopAnalyzerPollingMock = vi.fn();
+const isAnalyzerPollingRunningMock = vi.fn();
 const setAnalyzerTilePollingEnabledMock = vi.fn();
 const deleteAnalyzerTileMock = vi.fn();
 const createAnalyzerTileMock = vi.fn();
@@ -85,6 +86,7 @@ vi.mock("../api/analyzer", () => ({
   saveAnalyzerTileLayouts: (...args: unknown[]) => saveAnalyzerTileLayoutsMock(...args),
   startAnalyzerPolling: (...args: unknown[]) => startAnalyzerPollingMock(...args),
   stopAnalyzerPolling: (...args: unknown[]) => stopAnalyzerPollingMock(...args),
+  isAnalyzerPollingRunning: (...args: unknown[]) => isAnalyzerPollingRunningMock(...args),
   setAnalyzerTilePollingEnabled: (...args: unknown[]) => setAnalyzerTilePollingEnabledMock(...args),
   deleteAnalyzerTile: (...args: unknown[]) => deleteAnalyzerTileMock(...args),
   createAnalyzerTile: (...args: unknown[]) => createAnalyzerTileMock(...args),
@@ -294,7 +296,78 @@ describe("AnalyzerPage", () => {
     setWindowFullscreenMock.mockResolvedValue(undefined);
     isWindowFullscreenMock.mockResolvedValue(false);
     onWindowResizedMock.mockResolvedValue(() => {});
+    isAnalyzerPollingRunningMock.mockResolvedValue(false);
     setupAnalyzerData();
+  });
+
+  describe("polling state when the page opens", () => {
+    it("shows polling as running when it kept running while the page was closed, without restarting it", async () => {
+      isAnalyzerPollingRunningMock.mockResolvedValue(true);
+      render(<AnalyzerPage />);
+
+      await waitFor(() => expect(lastTilesCardProps?.pollingWanted).toBe(true));
+      expect(isAnalyzerPollingRunningMock).toHaveBeenCalledWith("UnitTest");
+      await waitFor(() => expect(listAnalyzerTilesMock).toHaveBeenCalled());
+      expect(startAnalyzerPollingMock).not.toHaveBeenCalled();
+
+      fireEvent.click(screen.getByRole("button", { name: /stop polling/i }));
+      await waitFor(() => expect(stopAnalyzerPollingMock).toHaveBeenCalledWith("UnitTest"));
+      await waitFor(() => expect(lastTilesCardProps?.pollingWanted).toBe(false));
+    });
+
+    it("shows polling as stopped when the backend is not polling", async () => {
+      render(<AnalyzerPage />);
+
+      await waitFor(() => expect(isAnalyzerPollingRunningMock).toHaveBeenCalledWith("UnitTest"));
+      await waitFor(() => expect(listAnalyzerTilesMock).toHaveBeenCalled());
+      expect(lastTilesCardProps?.pollingWanted).toBe(false);
+      expect(startAnalyzerPollingMock).not.toHaveBeenCalled();
+    });
+
+    it("Refresh re-reads the polling state: stopped elsewhere shows stopped, without starting it", async () => {
+      isAnalyzerPollingRunningMock.mockResolvedValue(true);
+      render(<AnalyzerPage />);
+      await waitFor(() => expect(lastTilesCardProps?.pollingWanted).toBe(true));
+
+      isAnalyzerPollingRunningMock.mockResolvedValue(false);
+      fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+
+      await waitFor(() => expect(lastTilesCardProps?.pollingWanted).toBe(false));
+      expect(startAnalyzerPollingMock).not.toHaveBeenCalled();
+    });
+
+    it("Refresh shows polling that is running and restarts it to pick up changes", async () => {
+      render(<AnalyzerPage />);
+      await waitFor(() => expect(listAnalyzerTilesMock).toHaveBeenCalled());
+      expect(lastTilesCardProps?.pollingWanted).toBe(false);
+
+      isAnalyzerPollingRunningMock.mockResolvedValue(true);
+      fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+
+      await waitFor(() => expect(lastTilesCardProps?.pollingWanted).toBe(true));
+      await waitFor(() => expect(startAnalyzerPollingMock).toHaveBeenCalledWith("UnitTest"));
+    });
+
+    it("Refresh keeps the shown state when the status check fails", async () => {
+      isAnalyzerPollingRunningMock.mockResolvedValue(true);
+      render(<AnalyzerPage />);
+      await waitFor(() => expect(lastTilesCardProps?.pollingWanted).toBe(true));
+
+      isAnalyzerPollingRunningMock.mockRejectedValue(new Error("boom"));
+      fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+
+      await waitFor(() => expect(listAnalyzerTilesMock).toHaveBeenCalledTimes(2));
+      await waitFor(() => expect(startAnalyzerPollingMock).toHaveBeenCalledWith("UnitTest"));
+      expect(lastTilesCardProps?.pollingWanted).toBe(true);
+    });
+
+    it("treats a failed status check as stopped and still loads the page", async () => {
+      isAnalyzerPollingRunningMock.mockRejectedValue(new Error("boom"));
+      render(<AnalyzerPage />);
+
+      await waitFor(() => expect(listAnalyzerTilesMock).toHaveBeenCalled());
+      expect(lastTilesCardProps?.pollingWanted).toBe(false);
+    });
   });
 
   it("loads analyzer data on mount", async () => {
