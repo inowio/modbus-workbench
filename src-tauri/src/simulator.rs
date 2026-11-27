@@ -1208,8 +1208,11 @@ impl SimEngine {
                         let dynamics: Arc<Vec<DynReg>> = tick_dynamics.lock().map(|g| Arc::clone(&g)).unwrap_or_default();
                         let rules: Arc<Vec<RuleDef>> = tick_rules.lock().map(|g| Arc::clone(&g)).unwrap_or_default();
                         let meta: Arc<RegMetaMap> = tick_meta.lock().map(|g| Arc::clone(&g)).unwrap_or_default();
-                        if !Arc::ptr_eq(&rules, &prev_rules) && *rules != *prev_rules {
-                            reconcile_rules(&prev_rules, &rules, &mut rule_states, &mut pending_actions);
+                        if !Arc::ptr_eq(&rules, &prev_rules) {
+                            if *rules != *prev_rules {
+                                reconcile_rules(&prev_rules, &rules, &mut rule_states, &mut pending_actions);
+                            }
+                            // Re-point even when equal, so later ticks hit the ptr_eq fast path.
                             prev_rules = Arc::clone(&rules);
                         }
                         prune_next_due(&mut next_due, &dynamics);
@@ -3341,9 +3344,9 @@ type SentValue = (Option<u16>, Option<bool>, Option<&'static str>);
 /// Diff the live banks against `last_sent` for the next `simulator_values`
 /// event. Returns `(full, rows)`: `full` when `force_full` or a previously
 /// sent register no longer exists (rows = everything), else only new/changed
-/// rows. `last_sent` is replaced by the compared state. `None` when a lock is
-/// poisoned (nothing compared, `last_sent` untouched). Both locks are dropped
-/// before returning.
+/// rows. `last_sent` is replaced by the compared state. `None` when the banks
+/// lock is poisoned (nothing compared, `last_sent` untouched); a poisoned
+/// statuses lock is recovered. Both locks are dropped before returning.
 fn delta_rows(
     banks: &Banks,
     statuses: &StatusMap,
@@ -3351,7 +3354,8 @@ fn delta_rows(
     force_full: bool,
 ) -> Option<(bool, Vec<SimSnapshotRow>)> {
     let guard = banks.read().ok()?;
-    let st = statuses.lock().ok()?;
+    // A poisoned statuses map still holds usable data; don't suppress events.
+    let st = statuses.lock().unwrap_or_else(|e| e.into_inner());
     let mut current: HashMap<RegKey, SentValue> = HashMap::with_capacity(last_sent.len());
     for (&unit, b) in guard.iter() {
         for (&a, &v) in &b.coils {
@@ -5334,6 +5338,30 @@ mod tests {
         let rec = events.lock().unwrap();
         let delta = rec.iter().skip(1).find(|e| !e.full).expect("a delta event");
         assert_eq!(addrs(delta), vec![1]);
+    }
+
+    #[tokio::test]
+    async fn values_status_only_change_emits_delta() {
+        // A route register with no session reports "missing" and never changes
+        // value; its interval is long so route_loop doesn't rewrite the status.
+        let route = SimRegister {
+            value_source: "route".into(),
+            source_params: "{\"slaveUnitId\":1,\"connectionKind\":\"tcp\",\"functionCode\":3,\"address\":0}".into(),
+            interval_ms: 3_600_000,
+            ..vhold(1, 0)
+        };
+        let (mut engine, events) = start_recording(&[route]).await;
+        ms(400).await;
+        assert_eq!(events.lock().unwrap().len(), 1);
+        engine.statuses.lock().unwrap().insert((1, 3, 0), "stale");
+        ms(450).await;
+        engine.stop().await;
+        let rec = events.lock().unwrap();
+        assert_eq!(rec.len(), 2);
+        assert!(!rec[1].full);
+        assert_eq!(addrs(&rec[1]), vec![0]);
+        assert_eq!(rec[1].rows[0].source_status.as_deref(), Some("stale"));
+        assert_eq!(rec[1].rows[0].value_word, rec[0].rows[0].value_word, "value unchanged");
     }
 
     #[tokio::test]
