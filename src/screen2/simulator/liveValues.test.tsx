@@ -91,6 +91,20 @@ describe("hooks", () => {
     expect(result.current.text).toBe("35.5");
   });
 
+  it("useLiveRegister stays stable when the raw value is NaN", () => {
+    const s = createLiveStore();
+    const reg = { unitId: 1, functionCode: 3, address: 0, dataType: "f32", byteOrder: "ABCD" };
+    s.apply({ full: true, rows: [row(0, 0x7fc0), row(1, 0)] });
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    const { result, rerender } = renderHook(() => useLiveRegister(s, reg));
+    const first = result.current;
+    expect(Number.isNaN(first.raw)).toBe(true);
+    rerender();
+    expect(result.current).toBe(first);
+    expect(err).not.toHaveBeenCalled();
+    err.mockRestore();
+  });
+
   it("null register yields a dash", () => {
     const s = createLiveStore();
     const { result } = renderHook(() => useLiveRegister(s, null));

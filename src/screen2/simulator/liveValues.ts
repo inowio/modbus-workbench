@@ -115,7 +115,7 @@ export function useLiveRegister(store: LiveStore, reg: LiveRegister | null): Liv
       sourceStatus: store.get(reg.unitId, reg.functionCode, reg.address)?.sourceStatus ?? null,
     };
     const prev = cache.current;
-    if (prev.text === next.text && prev.raw === next.raw && prev.sourceStatus === next.sourceStatus && sameWords(prev.words, next.words)) {
+    if (prev.text === next.text && Object.is(prev.raw, next.raw) && prev.sourceStatus === next.sourceStatus && sameWords(prev.words, next.words)) {
       return prev;
     }
     cache.current = next;
