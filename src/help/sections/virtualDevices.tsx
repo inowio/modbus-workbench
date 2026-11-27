@@ -40,7 +40,7 @@ const virtualDevicesSection: HelpSectionDefinition = {
     "route",
   ],
   searchText:
-    "Learn what Virtual Devices are and how to build, reuse, and share them. Covers the top-level Virtual Devices tab (next to Workspaces), the built-in catalog vs custom devices, cloning a built-in, the device builder/editor (name, key, category, description, searchable icon picker, and a register map with per-register bank, data type, byte order and value source), the per-register Parameters editor with a Form/JSON toggle for generator/device-preset/route sources, using a virtual device in a workspace's TCP Simulator via Add Device (base address + Unit ID with a register-map preview and collision check), saving a configured live device as a reusable virtual device, exposing an existing workspace slave as a routed virtual device from the Workspace category, and exporting/importing a device as a self-contained .json for community sharing.",
+    "Learn what Virtual Devices are and how to build, reuse, and share them. Covers the top-level Virtual Devices tab (next to Workspaces), the built-in catalog vs custom devices, cloning a built-in, the device builder/editor (name, category list with New category, description, key under Advanced, searchable icon picker, and a two-pane register map — list on the left, settings on the right — with next-free-offset placement, overlap warnings, and per-register bank, data type, byte order, scaling and value source), the per-register Parameters editor with a Form/JSON toggle for generator/device-preset/route sources, using a virtual device in a workspace's TCP Simulator via Add Device (base address + Unit ID with a register-map preview and collision check), saving a configured live device as a reusable virtual device, exposing an existing workspace slave as a routed virtual device from the Workspace category, and exporting/importing a device as a self-contained .json for community sharing.",
   anchors: [
     { id: "overview", label: "What Virtual Devices are" },
     { id: "where", label: "Where they live" },
@@ -111,22 +111,30 @@ const virtualDevicesSection: HelpSectionDefinition = {
 
       <SectionBlock section="virtual-devices" anchor="builder" title="The device builder">
         <p>
-          The builder (opened by New Device, Edit, or Clone &amp; edit) is where a device's identity and register map are defined:
+          The builder (opened by New Device, Edit, or Clone &amp; edit) is where a device's identity and register map are defined. The device's identity sits at the top:
         </p>
         <ul className="list-disc space-y-1 pl-5">
           <li><strong>Name</strong> — the display name shown in galleries and the Add Device wizard.</li>
-          <li><strong>Key</strong> — the unique identity (lower-case, underscores). Editable when creating; <strong>locked</strong> when editing an existing custom device.</li>
-          <li><strong>Category</strong> and <strong>Description</strong> — free text for grouping and search.</li>
+          <li><strong>Category</strong> — pick one of the standard categories or one your devices already use, or choose <strong>New category…</strong> to type your own. A typed name that differs only in letter case joins the existing category, so "sensors" and "Sensors" don't become two groups in the Add Device gallery.</li>
+          <li><strong>Description</strong> — free text, used by search.</li>
+          <li><strong>Key</strong> (under <strong>Advanced</strong>) — the unique identity (lower-case, underscores). When creating a device it is filled in from the name, and you can type your own; it is <strong>locked</strong> when editing an existing custom device.</li>
           <li><strong>Icon</strong> — pick a glyph from a searchable icon chooser (sensors, meters, valves, relays, gateways, Andon lights, robots, and more). Search by keyword such as "relay", "andon", or "wireless".</li>
         </ul>
         <p>
-          Below the identity, the <strong>register map</strong> lists one card per register. For each register you set:
+          Below the identity, the register map is split in two: the <strong>register list</strong> on the left and the selected register's settings on the right. Click a register in the list to edit it.
+        </p>
+        <ul className="list-disc space-y-1 pl-5">
+          <li><strong>Add register</strong> places the new register at the next free offset in its bank. Each row also has <strong>Duplicate</strong> and <strong>Remove</strong> buttons.</li>
+          <li>Registers that overlap are flagged in the list as you type ("Overlaps offset …"), and the device can't be saved until they are fixed.</li>
+        </ul>
+        <p>
+          For each register you set:
         </p>
         <ul className="list-disc space-y-1 pl-5">
           <li><strong>Alias</strong> — a friendly name (e.g. <code>voltage_l1</code>).</li>
           <li><strong>Offset</strong> — the register's address <em>relative to the device's base</em>. When the device is added at base <code>0</code>, offset <code>1</code> becomes address <code>1</code>; at base <code>100</code> it becomes <code>101</code>.</li>
           <li><strong>Bank</strong> — Coil (1), Discrete (2), Holding (3), or Input (4).</li>
-          <li><strong>Type</strong> — <code>u16/i16</code> for single-word, <code>u32/i32/f32</code> and <code>u64/i64/f64</code> for multi-word (bit banks are always <code>bool</code>).</li>
+          <li><strong>Type</strong> — <code>u16/i16</code> for single-word, <code>u32/i32/f32</code> and <code>u64/i64/f64</code> for multi-word. Coils and discrete inputs are always a single bit, so Type just shows <code>bit</code>.</li>
           <li><strong>Byte order</strong> — <code>ABCD/BADC/CDAB/DCBA</code> for multi-word types (see the <HelpAnchorLink section="simulator" anchor="value-sources">simulator value-sources</HelpAnchorLink> reference).</li>
           <li><strong>Value source</strong> — Hold, Device preset, Generator, or Route, each with its own parameters (below).</li>
           <li><strong>Scaling</strong> (numeric registers) — a unit label plus <strong>Scale</strong>, <strong>Offset</strong> and <strong>Decimals</strong>, so a raw 235 can read as 23.5 °C (value = raw × scale + offset). Scale can't be zero. Empty fields mean the defaults (scale 1, offset 0, automatic decimals). Generator and preset min/max are entered in these units, and the unit shows in the register list (for example "sine 20–30 °C"). Bit banks have no scaling.</li>
