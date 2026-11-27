@@ -1,52 +1,51 @@
 import { useEffect, useRef, useState } from "react";
 
-export type SnapshotRow = {
-  unitId: number;
-  functionCode: number;
-  address: number;
-  valueWord: number | null;
-  valueBit: boolean | null;
-  sourceStatus?: string | null;
-};
+import type { LiveStore } from "./liveValues";
+import { engFromRaw, liveRaw, registerScaling } from "./scaling";
 
-export type ValueHistoryKey = { unitId: number; functionCode: number; address: number } | null;
+type LiveRegister = Parameters<typeof liveRaw>[0];
 
-const keyId = (k: ValueHistoryKey) => (k ? `${k.unitId}:${k.functionCode}:${k.address}` : null);
-
-export function useValueHistory(snapshot: SnapshotRow[], key: ValueHistoryKey, cap = 60): number[] {
-  const bufferRef = useRef<number[]>([]);
+/**
+ * Rolling history of a register's live engineering value (or 0/1 for bits),
+ * one point per store change while the register's row exists. Resets when the
+ * register or anything that changes how its value is decoded changes.
+ */
+export function useValueHistory(store: LiveStore, reg: LiveRegister | null, cap = 60): number[] {
   const [history, setHistory] = useState<number[]>([]);
-  const prevKeyIdRef = useRef<string | null>(keyId(key));
+  const regRef = useRef(reg);
+  regRef.current = reg;
+
+  const resetKey = reg
+    ? [reg.unitId, reg.functionCode, reg.address, reg.dataType, reg.byteOrder ?? "", reg.scale ?? "", reg.scaleOffset ?? ""].join(":")
+    : null;
 
   useEffect(() => {
-    const id = keyId(key);
-    if (id !== prevKeyIdRef.current) {
-      prevKeyIdRef.current = id;
-      bufferRef.current = [];
-      setHistory([]);
-      return; // wait for the next snapshot update before sampling the new key
-    }
-    if (!key) return;
-
-    const row = snapshot.find(
-      (r) => r.unitId === key.unitId && r.functionCode === key.functionCode && r.address === key.address,
-    );
-    if (!row) return;
-
-    let value: number | null = null;
-    if (row.valueBit !== null && row.valueBit !== undefined) {
-      value = row.valueBit ? 1 : 0;
-    } else if (row.valueWord !== null && row.valueWord !== undefined) {
-      value = row.valueWord;
-    }
-    if (value === null) return;
-
-    const next = [...bufferRef.current, value];
-    if (next.length > cap) next.splice(0, next.length - cap);
-    bufferRef.current = next;
-    setHistory(next);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [snapshot, key?.unitId, key?.functionCode, key?.address, cap]);
+    setHistory((h) => (h.length ? [] : h));
+    if (resetKey === null) return;
+    let buffer: number[] = [];
+    const record = () => {
+      const r = regRef.current;
+      if (!r) return;
+      const row = store.get(r.unitId, r.functionCode, r.address);
+      if (!row) return;
+      let value: number | null = null;
+      if (row.valueBit !== null && row.valueBit !== undefined) {
+        value = row.valueBit ? 1 : 0;
+      } else {
+        const raw = liveRaw(r, store.get);
+        if (raw !== null) {
+          const sc = registerScaling(r);
+          value = engFromRaw(raw, sc.scale, sc.offset);
+        }
+      }
+      if (value === null) return;
+      buffer = [...buffer, value];
+      if (buffer.length > cap) buffer.splice(0, buffer.length - cap);
+      setHistory(buffer);
+    };
+    record();
+    return store.subscribe(record);
+  }, [store, resetKey, cap]);
 
   return history;
 }

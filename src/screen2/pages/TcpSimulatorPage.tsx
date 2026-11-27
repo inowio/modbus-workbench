@@ -13,17 +13,15 @@ import ActivityTab from "../simulator/ActivityTab";
 import DevicesTab from "../simulator/DevicesTab";
 import LiveValuesTab from "../simulator/LiveValuesTab";
 import PromptDialog from "../simulator/PromptDialog";
-import RegisterInspector from "../simulator/RegisterInspector";
+import LiveRegisterInspector from "../simulator/LiveRegisterInspector";
 import RegistersTab from "../simulator/RegistersTab";
 import RulesTab from "../simulator/RulesTab";
 import SimFooterBar from "../simulator/SimFooterBar";
 import { fmtAddr } from "../simulator/ruleTargets";
-import { liveRaw, liveValueText, liveWords } from "../simulator/scaling";
 import { blankRegister } from "../simulator/simRegister";
 import SimStatusDashboard from "../simulator/SimStatusDashboard";
 import SimTabBar, { type TabKey } from "../simulator/SimTabBar";
 import { useSimulatorData, type PageRegister, type SimDevice } from "../simulator/useSimulatorData";
-import { useValueHistory } from "../simulator/useValueHistory";
 import { useAppAddressFormat } from "../utils/addressFormatPref";
 
 const TAB_KEY = (ws: string) => `sim.tab.${ws}`;
@@ -173,15 +171,6 @@ export default function TcpSimulatorPage() {
     return ok;
   }, [sim, setSimError]);
 
-  const selectedKey = selectedRegister
-    ? { unitId: selectedRegister.unitId, functionCode: selectedRegister.functionCode, address: selectedRegister.address }
-    : null;
-  const history = useValueHistory(sim.snapshot, selectedKey);
-
-  const liveValueOf = useCallback((r: PageRegister): string => {
-    return liveValueText(r, sim.snapshotFor);
-  }, [sim.snapshotFor]);
-
   const deleteRegister = useCallback(async (id: number) => {
     await sim.deleteRegister(id);
     if (selectedRegisterId === id) setSelectedRegisterId(null);
@@ -277,7 +266,7 @@ export default function TcpSimulatorPage() {
               registers={sim.registers}
               devices={sim.devices}
               status={sim.status}
-              snapshotFor={sim.snapshotFor}
+              live={sim.live}
               addrFmt={addrFmt}
               onAddrFmt={changeAddrFmt}
               selectedId={selectedRegister?.id ?? null}
@@ -316,7 +305,7 @@ export default function TcpSimulatorPage() {
           ) : null}
 
           {activeTab === "live" ? (
-            <LiveValuesTab registers={sim.registers} snapshotFor={sim.snapshotFor} status={sim.status} addrFmt={addrFmt} onStart={() => void sim.start()} busy={sim.busy} />
+            <LiveValuesTab registers={sim.registers} live={sim.live} status={sim.status} addrFmt={addrFmt} onStart={() => void sim.start()} busy={sim.busy} />
           ) : null}
 
           {activeTab === "activity" ? (
@@ -334,16 +323,13 @@ export default function TcpSimulatorPage() {
               className="fixed inset-0 z-30 bg-slate-950/50 lg:hidden"
             />
             <div ref={inspectorWrapRef} className="fixed inset-y-0 right-0 z-40 flex w-full max-w-md flex-col rounded-l-2xl bg-white shadow-2xl dark:bg-slate-900 lg:static lg:z-auto lg:block lg:w-96 lg:max-w-none lg:shrink-0 lg:self-start lg:rounded-none lg:bg-transparent lg:pb-2 lg:shadow-none dark:lg:bg-transparent lg:sticky lg:inset-auto lg:top-0">
-              <RegisterInspector
+              <LiveRegisterInspector
+                live={sim.live}
+                selected={selectedRegister}
                 register={inspectorRegister}
                 devices={sim.devices}
                 registers={inspectorRegisters}
                 addrFmt={addrFmt}
-                history={history}
-                liveValue={selectedRegister ? liveValueOf(selectedRegister) : "—"}
-                liveRaw={selectedRegister ? liveRaw(selectedRegister, sim.snapshotFor) : null}
-                liveWords={selectedRegister ? liveWords(selectedRegister, sim.snapshotFor) : null}
-                sourceStatus={selectedRegister ? sim.snapshotFor(selectedRegister.unitId, selectedRegister.functionCode, selectedRegister.address)?.sourceStatus : undefined}
                 running={sim.status.running}
                 error={draftOwnsError ? dialogError : null}
                 onSave={(reg) => sim.updateRegister(reg)}

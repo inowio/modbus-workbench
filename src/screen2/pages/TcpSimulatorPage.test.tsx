@@ -1,4 +1,4 @@
-import { render, screen, waitFor, fireEvent, within } from "@testing-library/react";
+import { act, render, screen, waitFor, fireEvent, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const invokeMock = vi.fn();
@@ -8,6 +8,19 @@ vi.mock("@tauri-apps/api/event", () => ({ listen: (...a: unknown[]) => listenMoc
 vi.mock("react-router-dom", async () => {
   const actual = await vi.importActual<typeof import("react-router-dom")>("react-router-dom");
   return { ...actual, useOutletContext: () => ({ workspace: { name: "WS1" } }) };
+});
+
+const registersTabRenders = vi.hoisted(() => ({ count: 0 }));
+vi.mock("../simulator/RegistersTab", async () => {
+  const actual = await vi.importActual<typeof import("../simulator/RegistersTab")>("../simulator/RegistersTab");
+  const Real = actual.default;
+  return {
+    ...actual,
+    default: (props: React.ComponentProps<typeof Real>) => {
+      registersTabRenders.count++;
+      return <Real {...props} />;
+    },
+  };
 });
 
 import TcpSimulatorPage from "./TcpSimulatorPage";
@@ -271,5 +284,39 @@ describe("TcpSimulatorPage dialogs keep open on failed saves", () => {
     const alert = await within(dialog).findByRole("alert");
     expect(alert.textContent).toMatch(/rule is invalid/i);
     expect(screen.getByRole("dialog")).toBeTruthy();
+  });
+});
+
+describe("TcpSimulatorPage live values", () => {
+  it("a values event does not re-render the page shell", async () => {
+    window.localStorage.clear();
+    let onValues: ((e: { payload: unknown }) => void) | undefined;
+    listenMock.mockReset();
+    listenMock.mockImplementation((name: string, cb: (e: { payload: unknown }) => void) => {
+      if (name === "simulator_values") onValues = cb;
+      return Promise.resolve(() => {});
+    });
+    invokeMock.mockReset();
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "simulator_get_config") return Promise.resolve({ enabled: false, host: "0.0.0.0", port: 502, tickMs: 100 });
+      if (cmd === "simulator_list_registers") return Promise.resolve([reg]);
+      if (cmd === "simulator_list_devices") return Promise.resolve([device]);
+      if (cmd === "simulator_list_rules") return Promise.resolve([]);
+      if (cmd === "simulator_list_device_templates") return Promise.resolve([]);
+      if (cmd === "simulator_status") return Promise.resolve({ running: true, listen: null, clientCount: 0 });
+      return Promise.resolve(null);
+    });
+    renderPage();
+    await screen.findByText("temp");
+    await waitFor(() => expect(onValues).toBeTypeOf("function"));
+    const row = (valueWord: number) => ({ unitId: 1, functionCode: 3, address: 100, valueWord, valueBit: null });
+    act(() => onValues!({ payload: { workspace: "WS1", full: true, rows: [row(7)] } }));
+    expect(await screen.findByText("7")).toBeTruthy();
+    await new Promise((r) => setTimeout(r, 20));
+    const before = registersTabRenders.count;
+    act(() => onValues!({ payload: { workspace: "WS1", full: false, rows: [row(8)] } }));
+    expect(screen.getByText("8")).toBeTruthy();
+    expect(screen.queryByText("7")).toBeNull();
+    expect(registersTabRenders.count).toBe(before);
   });
 });

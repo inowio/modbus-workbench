@@ -1,17 +1,8 @@
 import { useMemo, useState } from "react";
 
 import { fmtAddr } from "./ruleTargets";
-import { liveValueText } from "./scaling";
+import { useLiveRegister, type LiveStore } from "./liveValues";
 import { addressMatches, type PageRegister } from "./simFilters";
-
-export type SnapshotRow = {
-  unitId: number;
-  functionCode: number;
-  address: number;
-  valueWord: number | null;
-  valueBit: boolean | null;
-  sourceStatus?: string | null;
-};
 
 export type SimStatus = {
   running: boolean;
@@ -21,7 +12,7 @@ export type SimStatus = {
 
 type Props = {
   registers: PageRegister[];
-  snapshotFor: (unitId: number, functionCode: number, address: number) => SnapshotRow | undefined;
+  live: LiveStore;
   status: SimStatus;
   addrFmt?: "dec" | "hex";
   /** Same action as the main Start button; omit to hide the button. */
@@ -37,7 +28,30 @@ const SOURCE_STATUS_STYLE: Record<string, string> = {
   missing: "bg-rose-500/15 text-rose-800 dark:text-rose-200",
 };
 
-export default function LiveValuesTab({ registers, snapshotFor, status, addrFmt = "dec", onStart, busy = false }: Props) {
+function LiveRow({ reg: r, live, addrFmt }: { reg: PageRegister; live: LiveStore; addrFmt: "dec" | "hex" }) {
+  const { text, sourceStatus } = useLiveRegister(live, r);
+  const cls = sourceStatus ? SOURCE_STATUS_STYLE[sourceStatus] ?? "bg-slate-500/15 text-slate-700 dark:text-slate-300" : null;
+  return (
+    <tr className="border-t border-slate-100 dark:border-slate-800">
+      <td className="py-1">{r.unitId}</td>
+      <td>{FC_LABEL[r.functionCode] ?? r.functionCode}</td>
+      <td>{fmtAddr(r.address, addrFmt)}</td>
+      <td className="truncate">{r.alias}</td>
+      <td className="font-mono">{text}</td>
+      <td>
+        {sourceStatus ? (
+          <span className={`inline-block rounded-full px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${cls}`}>
+            {sourceStatus}
+          </span>
+        ) : (
+          <span className="text-xs text-slate-400">—</span>
+        )}
+      </td>
+    </tr>
+  );
+}
+
+export default function LiveValuesTab({ registers, live, status, addrFmt = "dec", onStart, busy = false }: Props) {
   const [search, setSearch] = useState("");
 
   const filtered = useMemo(() => {
@@ -94,29 +108,9 @@ export default function LiveValuesTab({ registers, snapshotFor, status, addrFmt 
             </tr>
           </thead>
           <tbody>
-            {filtered.map((r) => {
-              const row = snapshotFor(r.unitId, r.functionCode, r.address);
-              const sourceStatus = row?.sourceStatus;
-              const cls = sourceStatus ? SOURCE_STATUS_STYLE[sourceStatus] ?? "bg-slate-500/15 text-slate-700 dark:text-slate-300" : null;
-              return (
-                <tr key={r.id} className="border-t border-slate-100 dark:border-slate-800">
-                  <td className="py-1">{r.unitId}</td>
-                  <td>{FC_LABEL[r.functionCode] ?? r.functionCode}</td>
-                  <td>{fmtAddr(r.address, addrFmt)}</td>
-                  <td className="truncate">{r.alias}</td>
-                  <td className="font-mono">{liveValueText(r, snapshotFor)}</td>
-                  <td>
-                    {sourceStatus ? (
-                      <span className={`inline-block rounded-full px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${cls}`}>
-                        {sourceStatus}
-                      </span>
-                    ) : (
-                      <span className="text-xs text-slate-400">—</span>
-                    )}
-                  </td>
-                </tr>
-              );
-            })}
+            {filtered.map((r) => (
+              <LiveRow key={r.id} reg={r} live={live} addrFmt={addrFmt} />
+            ))}
           </tbody>
         </table>
       )}

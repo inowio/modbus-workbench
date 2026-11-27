@@ -35,19 +35,50 @@ describe("useSimulatorData", () => {
     await waitFor(() => expect(result.current.lastUpdated).not.toBeNull());
   });
 
-  it("live-value event updates snapshot", async () => {
-    const { result } = renderHook(() => useSimulatorData("ws"));
-    await waitFor(() => expect(listeners["simulator_values"]).toBeTypeOf("function"));
-    act(() => listeners["simulator_values"]({ payload: { workspace: "ws", rows: [{ unitId: 1, functionCode: 3, address: 5, valueWord: 42, valueBit: null }] } }));
-    await waitFor(() => expect(result.current.snapshot[0].valueWord).toBe(42));
+  const row = (address: number, valueWord: number) => ({ unitId: 1, functionCode: 3, address, valueWord, valueBit: null });
+
+  it("requests a full snapshot after subscribing", async () => {
+    renderHook(() => useSimulatorData("ws"));
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("simulator_request_full", { name: "ws" }));
   });
 
-  it("snapshotFor looks up a row by unit/fc/address", async () => {
+  it("applies full and delta events", async () => {
     const { result } = renderHook(() => useSimulatorData("ws"));
     await waitFor(() => expect(listeners["simulator_values"]).toBeTypeOf("function"));
-    act(() => listeners["simulator_values"]({ payload: { workspace: "ws", rows: [{ unitId: 1, functionCode: 3, address: 5, valueWord: 42, valueBit: null }] } }));
-    await waitFor(() => expect(result.current.snapshotFor(1, 3, 5)?.valueWord).toBe(42));
-    expect(result.current.snapshotFor(9, 9, 9)).toBeUndefined();
+    act(() => listeners["simulator_values"]({ payload: { workspace: "ws", full: true, rows: [row(5, 42), row(6, 1)] } }));
+    expect(result.current.live.get(1, 3, 5)?.valueWord).toBe(42);
+    act(() => listeners["simulator_values"]({ payload: { workspace: "ws", full: false, rows: [row(6, 9)] } }));
+    expect(result.current.live.get(1, 3, 5)?.valueWord).toBe(42);
+    expect(result.current.live.get(1, 3, 6)?.valueWord).toBe(9);
+    expect(result.current.live.get(9, 9, 9)).toBeUndefined();
+  });
+
+  it("ignores events for other workspaces", async () => {
+    const { result } = renderHook(() => useSimulatorData("ws"));
+    await waitFor(() => expect(listeners["simulator_values"]).toBeTypeOf("function"));
+    act(() => listeners["simulator_values"]({ payload: { workspace: "other", full: true, rows: [row(5, 42)] } }));
+    expect(result.current.live.get(1, 3, 5)).toBeUndefined();
+  });
+
+  it("clears live values on stop", async () => {
+    invokeMock.mockImplementation((cmd: string) => {
+      switch (cmd) {
+        case "simulator_get_config": return Promise.resolve({ enabled: false, host: "0.0.0.0", port: 502, tickMs: 100 });
+        case "simulator_list_registers": return Promise.resolve([]);
+        case "simulator_list_rules": return Promise.resolve([]);
+        case "simulator_status": return Promise.resolve({ running: true, listen: null, clientCount: 0 });
+        case "simulator_list_device_templates": return Promise.resolve([]);
+        case "simulator_list_devices": return Promise.resolve([]);
+        default: return Promise.resolve(null);
+      }
+    });
+    const { result } = renderHook(() => useSimulatorData("ws"));
+    await waitFor(() => expect(result.current.status.running).toBe(true));
+    act(() => listeners["simulator_values"]({ payload: { workspace: "ws", full: true, rows: [row(5, 42)] } }));
+    expect(result.current.live.get(1, 3, 5)?.valueWord).toBe(42);
+    await act(async () => { await result.current.stop(); });
+    expect(result.current.status.running).toBe(false);
+    expect(result.current.live.get(1, 3, 5)).toBeUndefined();
   });
 
   it("duplicateRegister clones with id:0, a (copy) alias, and the next free address, then reloads", async () => {
@@ -95,7 +126,7 @@ describe("useSimulatorData", () => {
     );
   });
 
-  it("start invokes simulator_start and fetches a snapshot", async () => {
+  it("start does not fetch simulator_snapshot", async () => {
     invokeMock.mockImplementation((cmd: string) => {
       switch (cmd) {
         case "simulator_get_config": return Promise.resolve({ enabled: false, host: "0.0.0.0", port: 502, tickMs: 100 });
@@ -113,7 +144,7 @@ describe("useSimulatorData", () => {
     await waitFor(() => expect(result.current.lastUpdated).not.toBeNull());
     await act(async () => { await result.current.start(); });
     expect(result.current.status.running).toBe(true);
-    expect(result.current.snapshot).toHaveLength(1);
+    expect(invokeMock).not.toHaveBeenCalledWith("simulator_snapshot", expect.anything());
   });
 
   it("setError sets the error message", async () => {

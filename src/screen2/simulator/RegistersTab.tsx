@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { FiChevronLeft, FiChevronRight, FiTrash2, FiX } from "react-icons/fi";
 
-import type { SimDevice, SimStatus, SnapshotRow } from "./useSimulatorData";
+import { useLiveRegister, type LiveStore } from "./liveValues";
+import type { SimDevice, SimStatus } from "./useSimulatorData";
 import {
   ALL_COLUMNS,
   EMPTY_FILTER,
@@ -15,7 +16,6 @@ import {
   type PageRegister,
   type RegisterFilter,
 } from "./simFilters";
-import { liveValueText } from "./scaling";
 import { sourceSummary } from "./sourceParams";
 
 const FC_LABEL: Record<number, string> = { 1: "Coil", 2: "Discrete", 3: "Holding", 4: "Input" };
@@ -40,6 +40,22 @@ const COLUMN_LABEL: Record<ColumnKey, string> = {
   device: "Device",
 };
 
+/** One live value: scaled text plus the source-status badge; redraws only when this register's value changes. */
+export function LiveValueCell({ live, reg }: { live: LiveStore; reg: PageRegister }) {
+  const { text, sourceStatus } = useLiveRegister(live, reg);
+  const badgeCls = sourceStatus ? SOURCE_STATUS_STYLE[sourceStatus] ?? "bg-slate-500/15 text-slate-700 dark:text-slate-300" : null;
+  return (
+    <span>
+      {text}
+      {sourceStatus ? (
+        <span className={`ml-1.5 inline-block rounded-full px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${badgeCls}`}>
+          {sourceStatus}
+        </span>
+      ) : null}
+    </span>
+  );
+}
+
 function fmtAddr(a: number, addrFmt: "dec" | "hex"): string {
   return addrFmt === "hex" ? `0x${a.toString(16).toUpperCase().padStart(4, "0")}` : String(a);
 }
@@ -54,7 +70,7 @@ export type RegistersTabProps = {
   registers: PageRegister[];
   devices: SimDevice[];
   status: SimStatus;
-  snapshotFor: (u: number, fc: number, a: number) => SnapshotRow | undefined;
+  live: LiveStore;
   addrFmt: "dec" | "hex";
   onAddrFmt: (f: "dec" | "hex") => void;
   /** Currently open register (highlighted row). */
@@ -71,7 +87,7 @@ export default function RegistersTab(props: RegistersTabProps) {
     registers,
     devices,
     status,
-    snapshotFor,
+    live,
     addrFmt,
     onAddrFmt,
     selectedId = null,
@@ -112,6 +128,8 @@ export default function RegistersTab(props: RegistersTabProps) {
     [registers]
   );
 
+  const deviceNames = useMemo(() => new Map(devices.map((d) => [d.id, d.name])), [devices]);
+
   const filtered = useMemo(() => filterRegisters(registers, filter, addrFmt), [registers, filter, addrFmt]);
   const total = filtered.length;
   const pageCount = Math.max(1, Math.ceil(total / pageSize));
@@ -143,21 +161,7 @@ export default function RegistersTab(props: RegistersTabProps) {
     if (!status.running) {
       return <span className="text-xs text-slate-500 dark:text-slate-400">{sourceSummary(r, addrFmt)}</span>;
     }
-    const row = snapshotFor(r.unitId, r.functionCode, r.address);
-    if (!row) return <span>&mdash;</span>;
-    const text = liveValueText(r, snapshotFor);
-    const sourceStatus = row.sourceStatus;
-    const badgeCls = sourceStatus ? SOURCE_STATUS_STYLE[sourceStatus] ?? "bg-slate-500/15 text-slate-700 dark:text-slate-300" : null;
-    return (
-      <span>
-        {text}
-        {sourceStatus ? (
-          <span className={`ml-1.5 inline-block rounded-full px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${badgeCls}`}>
-            {sourceStatus}
-          </span>
-        ) : null}
-      </span>
-    );
+    return <LiveValueCell live={live} reg={r} />;
   };
 
   const renderCell = (col: ColumnKey, r: PageRegister) => {
@@ -185,7 +189,7 @@ export default function RegistersTab(props: RegistersTabProps) {
       case "value":
         return liveValueCell(r);
       case "device":
-        return devices.find((d) => d.id === r.deviceInstanceId)?.name ?? "—";
+        return (r.deviceInstanceId != null ? deviceNames.get(r.deviceInstanceId) : undefined) ?? "—";
       default:
         return null;
     }

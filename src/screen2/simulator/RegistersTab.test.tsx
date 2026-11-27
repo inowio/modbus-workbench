@@ -1,7 +1,17 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import { createLiveStore, type SnapshotRow } from "./liveValues";
 import RegistersTab from "./RegistersTab";
+
+const liveOf = (rows: SnapshotRow[]) => {
+  const s = createLiveStore();
+  s.apply({ full: true, rows });
+  return s;
+};
+const wordRow = (address: number, valueWord: number, o: Partial<SnapshotRow> = {}): SnapshotRow => ({
+  unitId: 1, functionCode: 3, address, valueWord, valueBit: null, ...o,
+});
 
 const reg = (o: any = {}) => ({
   id: 1,
@@ -25,7 +35,7 @@ const base = () => ({
   registers: [reg(), reg({ id: 2, unitId: 2, alias: "Volt", valueSource: "device" })],
   devices: [],
   status: { running: false, listen: null, clientCount: 0 },
-  snapshotFor: () => undefined,
+  live: createLiveStore(),
   addrFmt: "dec" as const,
   onAddrFmt: vi.fn(),
   onSelectRegister: vi.fn(),
@@ -79,7 +89,7 @@ describe("RegistersTab", () => {
         {...base()}
         registers={[reg({ holdValue: 7 })]}
         status={{ running: true, listen: null, clientCount: 0 }}
-        snapshotFor={() => ({ unitId: 1, functionCode: 3, address: 5, valueWord: 42, valueBit: null })}
+        live={liveOf([wordRow(5, 42)])}
       />,
     );
     expect(screen.getByText("42")).toBeInTheDocument();
@@ -166,7 +176,7 @@ describe("RegistersTab", () => {
         {...base()}
         registers={[scaled]}
         status={{ running: true, listen: null, clientCount: 0 }}
-        snapshotFor={() => ({ unitId: 1, functionCode: 3, address: 5, valueWord: 235, valueBit: null })}
+        live={liveOf([wordRow(5, 235)])}
       />,
     );
     expect(screen.getByText("23.5 °C")).toBeInTheDocument();
@@ -185,9 +195,33 @@ describe("RegistersTab", () => {
         {...base()}
         registers={[f]}
         status={{ running: true, listen: null, clientCount: 0 }}
-        snapshotFor={(u, fc, a) => (a in words ? { unitId: u, functionCode: fc, address: a, valueWord: words[a], valueBit: null } : undefined)}
+        live={liveOf(Object.entries(words).map(([a, w]) => wordRow(Number(a), w)))}
       />,
     );
     expect(screen.getByText("35.5")).toBeInTheDocument();
+  });
+
+  it("shows the scaled value and the stale badge from the store", () => {
+    render(
+      <RegistersTab
+        {...base()}
+        registers={[reg({ unit: "°C", scale: 0.1 })]}
+        status={{ running: true, listen: null, clientCount: 0 }}
+        live={liveOf([wordRow(5, 235, { sourceStatus: "stale" })])}
+      />,
+    );
+    expect(screen.getByText("23.5 °C")).toBeInTheDocument();
+    expect(screen.getByText("stale")).toBeInTheDocument();
+  });
+
+  it("shows the device name from the devices list", () => {
+    render(
+      <RegistersTab
+        {...base()}
+        registers={[reg({ deviceInstanceId: 3 })]}
+        devices={[{ id: 3, templateKey: "t", name: "Roof Sensor", unitId: 1, baseAddress: 0, sortOrder: 0 }]}
+      />,
+    );
+    expect(screen.getByText("Roof Sensor")).toBeInTheDocument();
   });
 });
