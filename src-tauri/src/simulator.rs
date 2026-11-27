@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::future;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -909,6 +909,9 @@ pub struct SimEngine {
     // event log is history; `started_at_ms` is set on Start, cleared on Stop.
     observer: Observer,
     started_at_ms: Option<u64>,
+    // Set by `start` and `request_full`; the tick clears it when it sends a
+    // full `simulator_values` event (every row, `full: true`).
+    full_requested: Arc<AtomicBool>,
 }
 
 impl SimEngine {
@@ -943,6 +946,12 @@ impl SimEngine {
     /// Wall-clock start time in epoch ms while running, else `None`.
     pub fn started_at_ms(&self) -> Option<u64> {
         self.started_at_ms
+    }
+
+    /// Ask the tick to send its next `simulator_values` event as a full one
+    /// (every row), e.g. when a frontend (re)subscribes. No-op when stopped.
+    pub fn request_full(&self) {
+        self.full_requested.store(true, Ordering::Relaxed);
     }
 
     pub fn snapshot(&self) -> HashMap<u8, SimBanks> {
@@ -1068,6 +1077,7 @@ impl SimEngine {
         let banks: Banks = Arc::new(RwLock::new(initial));
         self.banks = Some(banks.clone());
         self.clients.store(0, Ordering::Relaxed);
+        self.full_requested.store(true, Ordering::Relaxed);
         self.started_at_ms = Some(now_ms());
         if let Ok(mut o) = self.observer.lock() {
             o.clients.clear();
@@ -1144,6 +1154,7 @@ impl SimEngine {
         let tick_dynamics = dynamics_arc.clone();
         let tick_rules = rules_arc.clone();
         let tick_meta = self.reg_meta.clone();
+        let tick_full = self.full_requested.clone();
         let tick_handle = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_millis(tick_ms.max(10)));
             // A late tick (busy runtime, suspended laptop) runs once, not as a
@@ -1153,6 +1164,8 @@ impl SimEngine {
             // list can change under us (add/remove) without misaligning timing.
             let mut next_due: HashMap<RegKey, Due> = HashMap::new();
             let mut last_emit = 0.0f64;
+            // What the frontend was last sent, per register, to diff against.
+            let mut last_sent: HashMap<RegKey, SentValue> = HashMap::new();
             let mut rule_states: HashMap<i64, RuleState> = HashMap::new();
             // The rule list the states/pending actions below belong to; when
             // a hot-apply changes it, `reconcile_rules` drops what's stale.
@@ -1218,8 +1231,15 @@ impl SimEngine {
                         } // lock dropped before emit
                         if elapsed - last_emit >= EMIT_INTERVAL_MS {
                             last_emit = elapsed;
-                            let rows = snapshot_rows(&tick_banks, &tick_statuses);
-                            app.emit_values(SimValuesEvent { workspace: workspace.clone(), rows });
+                            let force_full = tick_full.load(Ordering::Relaxed);
+                            if let Some((full, rows)) = delta_rows(&tick_banks, &tick_statuses, &mut last_sent, force_full) {
+                                if full {
+                                    tick_full.store(false, Ordering::Relaxed);
+                                }
+                                if full || !rows.is_empty() {
+                                    app.emit_values(SimValuesEvent { workspace: workspace.clone(), full, rows });
+                                }
+                            }
                         }
                     }
                 }
@@ -3254,6 +3274,9 @@ pub struct SimSnapshotRow {
 #[serde(rename_all = "camelCase")]
 pub struct SimValuesEvent {
     workspace: String,
+    /// `true`: `rows` is every register (replace the frontend's table);
+    /// `false`: only rows that changed since the previous event.
+    full: bool,
     rows: Vec<SimSnapshotRow>,
 }
 
@@ -3286,15 +3309,55 @@ fn rows_from_banks(
     rows
 }
 
-/// Snapshot the live banks (behind the shared `RwLock`) into rows for the
-/// `simulator_values` event, attaching route source statuses. Both locks are
-/// dropped before returning.
-fn snapshot_rows(banks: &Banks, statuses: &StatusMap) -> Vec<SimSnapshotRow> {
-    let Ok(guard) = banks.read() else { return Vec::new() };
-    match statuses.lock() {
-        Ok(s) => rows_from_banks(&guard, &s),
-        Err(_) => rows_from_banks(&guard, &HashMap::new()),
+/// What was last sent for a register: (value word, value bit, source status).
+type SentValue = (Option<u16>, Option<bool>, Option<&'static str>);
+
+/// Diff the live banks against `last_sent` for the next `simulator_values`
+/// event. Returns `(full, rows)`: `full` when `force_full` or a previously
+/// sent register no longer exists (rows = everything), else only new/changed
+/// rows. `last_sent` is replaced by the compared state. `None` when a lock is
+/// poisoned (nothing compared, `last_sent` untouched). Both locks are dropped
+/// before returning.
+fn delta_rows(
+    banks: &Banks,
+    statuses: &StatusMap,
+    last_sent: &mut HashMap<RegKey, SentValue>,
+    force_full: bool,
+) -> Option<(bool, Vec<SimSnapshotRow>)> {
+    let guard = banks.read().ok()?;
+    let st = statuses.lock().ok()?;
+    let mut current: HashMap<RegKey, SentValue> = HashMap::with_capacity(last_sent.len());
+    for (&unit, b) in guard.iter() {
+        for (&a, &v) in &b.coils {
+            current.insert((unit, 1, a), (None, Some(v), st.get(&(unit, 1, a)).copied()));
+        }
+        for (&a, &v) in &b.discrete_inputs {
+            current.insert((unit, 2, a), (None, Some(v), st.get(&(unit, 2, a)).copied()));
+        }
+        for (&a, &v) in &b.holding {
+            current.insert((unit, 3, a), (Some(v), None, st.get(&(unit, 3, a)).copied()));
+        }
+        for (&a, &v) in &b.input {
+            current.insert((unit, 4, a), (Some(v), None, st.get(&(unit, 4, a)).copied()));
+        }
     }
+    drop(st);
+    drop(guard);
+    let full = force_full || last_sent.keys().any(|k| !current.contains_key(k));
+    let rows = current
+        .iter()
+        .filter(|(k, v)| full || last_sent.get(*k) != Some(*v))
+        .map(|(&(unit_id, function_code, address), &(value_word, value_bit, status))| SimSnapshotRow {
+            unit_id,
+            function_code,
+            address,
+            value_word,
+            value_bit,
+            source_status: status.map(|s| s.to_string()),
+        })
+        .collect();
+    *last_sent = current;
+    Some((full, rows))
 }
 
 fn validate_config(cfg: &SimConfig) -> Result<(), String> {
@@ -3990,6 +4053,18 @@ pub fn simulator_snapshot(state: tauri::State<'_, SimulatorState>, name: String)
         None => Vec::new(),
     };
     Ok(rows)
+}
+
+#[tauri::command]
+pub fn simulator_request_full(state: tauri::State<'_, SimulatorState>, name: String) -> Result<(), String> {
+    let ws = validate_workspace_name(&name)?;
+    let map = state.0.lock().unwrap();
+    if let Some(engine) = map.get(&ws) {
+        if engine.is_running() {
+            engine.request_full();
+        }
+    }
+    Ok(())
 }
 
 /// Read `qty` raw words starting at `start` from a live client session, over
@@ -5145,6 +5220,102 @@ mod tests {
             recorded.iter().any(|e| e.workspace == "ws" && !e.rows.is_empty()),
             "expected an event for workspace 'ws' with non-empty rows"
         );
+    }
+
+    fn vhold(id: i64, addr: i64) -> SimRegister {
+        SimRegister {
+            id, unit_id: 1, function_code: 3, address: addr, alias: "".into(), data_type: "u16".into(),
+            hold_value: 7, value_source: "hold".into(), byte_order: "ABCD".into(),
+            source_params: "{}".into(), interval_ms: 100, sort_order: 0, device_instance_id: None,
+            unit: None, display_format: None, scale: None, scale_offset: None, decimals: None,
+        }
+    }
+
+    fn vsine(id: i64, addr: i64) -> SimRegister {
+        SimRegister {
+            value_source: "generator".into(),
+            source_params: "{\"kind\":\"sine\",\"min\":0,\"max\":1000,\"periodMs\":1000}".into(),
+            interval_ms: 100,
+            ..vhold(id, addr)
+        }
+    }
+
+    async fn start_recording(regs: &[SimRegister]) -> (SimEngine, std::sync::Arc<std::sync::Mutex<Vec<SimValuesEvent>>>) {
+        let banks = registers_to_banks(regs);
+        let dynamics: Vec<DynReg> = regs.iter().filter_map(parse_dynamic).collect();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut engine = SimEngine::new();
+        engine.start(RecordingSink(events.clone()), "ws".into(), "127.0.0.1", 0, 20, banks, dynamics, Default::default(), Default::default(), Vec::new()).await.unwrap();
+        (engine, events)
+    }
+
+    fn ms(n: u64) -> tokio::time::Sleep {
+        tokio::time::sleep(std::time::Duration::from_millis(n))
+    }
+
+    fn addrs(e: &SimValuesEvent) -> Vec<u16> {
+        let mut a: Vec<u16> = e.rows.iter().map(|r| r.address).collect();
+        a.sort();
+        a
+    }
+
+    #[tokio::test]
+    async fn values_first_emit_is_full() {
+        let (mut engine, events) = start_recording(&[vhold(1, 0), vsine(2, 1)]).await;
+        ms(300).await;
+        engine.stop().await;
+        let rec = events.lock().unwrap();
+        assert!(rec[0].full);
+        assert_eq!(addrs(&rec[0]), vec![0, 1]);
+    }
+
+    #[tokio::test]
+    async fn values_unchanged_registers_are_not_resent() {
+        let (mut engine, events) = start_recording(&[vhold(1, 0)]).await;
+        ms(200).await;
+        let n = events.lock().unwrap().len();
+        assert_eq!(n, 1);
+        ms(350).await;
+        engine.stop().await;
+        assert_eq!(events.lock().unwrap().len(), 1, "no further events for an idle hold register");
+    }
+
+    #[tokio::test]
+    async fn values_delta_carries_only_changed_rows() {
+        let (mut engine, events) = start_recording(&[vhold(1, 0), vsine(2, 1)]).await;
+        ms(700).await;
+        engine.stop().await;
+        let rec = events.lock().unwrap();
+        let delta = rec.iter().skip(1).find(|e| !e.full).expect("a delta event");
+        assert_eq!(addrs(delta), vec![1]);
+    }
+
+    #[tokio::test]
+    async fn values_removed_register_forces_full() {
+        let (mut engine, events) = start_recording(&[vhold(1, 0), vhold(2, 1)]).await;
+        ms(200).await;
+        assert_eq!(events.lock().unwrap().len(), 1);
+        engine.clear_span(1, 3, 1, 1);
+        ms(250).await;
+        engine.stop().await;
+        let rec = events.lock().unwrap();
+        assert_eq!(rec.len(), 2);
+        assert!(rec[1].full);
+        assert_eq!(addrs(&rec[1]), vec![0]);
+    }
+
+    #[tokio::test]
+    async fn values_request_full_resends_everything() {
+        let (mut engine, events) = start_recording(&[vhold(1, 0), vhold(2, 1)]).await;
+        ms(250).await;
+        assert_eq!(events.lock().unwrap().len(), 1);
+        engine.request_full();
+        ms(250).await;
+        engine.stop().await;
+        let rec = events.lock().unwrap();
+        assert_eq!(rec.len(), 2);
+        assert!(rec[1].full);
+        assert_eq!(addrs(&rec[1]), vec![0, 1]);
     }
 
     #[tokio::test]

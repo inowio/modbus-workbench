@@ -268,6 +268,7 @@ pub fn run() {
             simulator::simulator_export_profile,
             simulator::simulator_import_profile,
             simulator::simulator_snapshot,
+            simulator::simulator_request_full,
             simulator::simulator_list_device_templates,
             simulator::simulator_list_custom_templates,
             simulator::simulator_save_custom_template,
