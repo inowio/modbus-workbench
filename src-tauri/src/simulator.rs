@@ -617,41 +617,63 @@ impl Service for SimService {
     }
 }
 
+/// Protocol limits (Modbus Application Protocol v1.1b3): an out-of-range
+/// quantity is IllegalDataValue; a span running past the last address
+/// is IllegalDataAddress. Without this a 200-register read encodes a
+/// corrupt frame and a zero-quantity read "succeeds".
+fn validate_request_span(req: &Request<'_>) -> Result<(), ExceptionCode> {
+    let (addr, qty, max_qty) = match req {
+        Request::ReadCoils(a, c) | Request::ReadDiscreteInputs(a, c) => (*a, *c as usize, 2000),
+        Request::ReadHoldingRegisters(a, c) | Request::ReadInputRegisters(a, c) => (*a, *c as usize, 125),
+        Request::WriteMultipleCoils(a, v) => (*a, v.len(), 1968),
+        Request::WriteMultipleRegisters(a, v) => (*a, v.len(), 123),
+        _ => (0, 1, 1),
+    };
+    if qty == 0 || qty > max_qty {
+        return Err(ExceptionCode::IllegalDataValue);
+    }
+    if addr as usize + qty > 65536 {
+        return Err(ExceptionCode::IllegalDataAddress);
+    }
+    Ok(())
+}
+
 impl SimService {
     fn handle(&self, unit: u8, req: Request<'static>) -> Result<Response, ExceptionCode> {
+        let is_write = matches!(
+            req,
+            Request::WriteSingleCoil(..)
+                | Request::WriteSingleRegister(..)
+                | Request::WriteMultipleCoils(..)
+                | Request::WriteMultipleRegisters(..)
+        );
+        if !is_write {
+            // Reads (and unsupported functions) share the lock so concurrent
+            // clients never serialise behind each other.
+            let banks = self.banks.read().map_err(|_| ExceptionCode::ServerDeviceFailure)?;
+            // Unit IDs with no bank answer like a gateway (0x0B, target device failed
+            // to respond) so scanners can tell absent units from present ones; a
+            // missing register inside an existing unit still answers IllegalDataAddress.
+            let bank = banks.get(&unit).ok_or(ExceptionCode::GatewayTargetDevice)?;
+            validate_request_span(&req)?;
+            return match req {
+                Request::ReadCoils(a, c) => Ok(Response::ReadCoils(bank.read_coils(a, c)?)),
+                Request::ReadDiscreteInputs(a, c) => {
+                    Ok(Response::ReadDiscreteInputs(bank.read_discrete_inputs(a, c)?))
+                }
+                Request::ReadHoldingRegisters(a, c) => {
+                    Ok(Response::ReadHoldingRegisters(bank.read_holding(a, c)?))
+                }
+                Request::ReadInputRegisters(a, c) => {
+                    Ok(Response::ReadInputRegisters(bank.read_input(a, c)?))
+                }
+                _ => Err(ExceptionCode::IllegalFunction),
+            };
+        }
         let mut banks = self.banks.write().map_err(|_| ExceptionCode::ServerDeviceFailure)?;
-        // Unit IDs with no bank answer like a gateway (0x0B, target device failed
-        // to respond) so scanners can tell absent units from present ones; a
-        // missing register inside an existing unit still answers IllegalDataAddress.
         let bank = banks.get_mut(&unit).ok_or(ExceptionCode::GatewayTargetDevice)?;
-        // Protocol limits (Modbus Application Protocol v1.1b3): an out-of-range
-        // quantity is IllegalDataValue; a span running past the last address
-        // is IllegalDataAddress. Without this a 200-register read encodes a
-        // corrupt frame and a zero-quantity read "succeeds".
-        let (addr, qty, max_qty) = match &req {
-            Request::ReadCoils(a, c) | Request::ReadDiscreteInputs(a, c) => (*a, *c as usize, 2000),
-            Request::ReadHoldingRegisters(a, c) | Request::ReadInputRegisters(a, c) => (*a, *c as usize, 125),
-            Request::WriteMultipleCoils(a, v) => (*a, v.len(), 1968),
-            Request::WriteMultipleRegisters(a, v) => (*a, v.len(), 123),
-            _ => (0, 1, 1),
-        };
-        if qty == 0 || qty > max_qty {
-            return Err(ExceptionCode::IllegalDataValue);
-        }
-        if addr as usize + qty > 65536 {
-            return Err(ExceptionCode::IllegalDataAddress);
-        }
+        validate_request_span(&req)?;
         match req {
-            Request::ReadCoils(a, c) => Ok(Response::ReadCoils(bank.read_coils(a, c)?)),
-            Request::ReadDiscreteInputs(a, c) => {
-                Ok(Response::ReadDiscreteInputs(bank.read_discrete_inputs(a, c)?))
-            }
-            Request::ReadHoldingRegisters(a, c) => {
-                Ok(Response::ReadHoldingRegisters(bank.read_holding(a, c)?))
-            }
-            Request::ReadInputRegisters(a, c) => {
-                Ok(Response::ReadInputRegisters(bank.read_input(a, c)?))
-            }
             Request::WriteSingleCoil(a, v) => {
                 bank.write_single_coil(a, v)?;
                 self.push_write(unit, 1, a);
@@ -826,7 +848,7 @@ fn slave_table_kind(kind: &str) -> &str {
 async fn route_loop(
     banks: Banks,
     statuses: StatusMap,
-    dynamics: Arc<Mutex<Vec<DynReg>>>,
+    dynamics: Arc<Mutex<Arc<Vec<DynReg>>>>,
     tcp_sessions: crate::modbus::SessionMap,
     rtu_sessions: crate::modbus::SessionMap,
     workspace: String,
@@ -838,10 +860,8 @@ async fn route_loop(
     let mut next_due: HashMap<RegKey, Due> = HashMap::new();
     loop {
         ticker.tick().await;
-        let routes: Vec<DynReg> = dynamics
-            .lock()
-            .map(|g| g.iter().filter(|d| matches!(d.kind, DynKind::Route { .. })).cloned().collect())
-            .unwrap_or_default();
+        let all: Arc<Vec<DynReg>> = dynamics.lock().map(|g| Arc::clone(&g)).unwrap_or_default();
+        let routes: Vec<DynReg> = all.iter().filter(|d| matches!(d.kind, DynKind::Route { .. })).cloned().collect();
         prune_next_due(&mut next_due, &routes);
         if let Ok(mut s) = statuses.lock() {
             s.retain(|k, _| routes.iter().any(|d| (d.unit, d.bank, d.address) == *k));
@@ -866,7 +886,7 @@ async fn route_loop(
                             // edited/removed while the read was in flight, the
                             // result belongs to the old config — discard it.
                             // (Edits drop the old entry before touching banks.)
-                            let current = dynamics.lock().map(|g| route_still_current(&g, d)).unwrap_or(false);
+                            let current = dynamics.lock().map(|g| route_still_current(g.as_slice(), d)).unwrap_or(false);
                             if !current {
                                 continue; // no status either: the register changed
                             }
@@ -897,8 +917,8 @@ pub struct SimEngine {
     // Live generator/route + rule lists the tick reads each iteration. Held
     // behind a shared lock so mutations (add/edit/delete register, rule, or
     // device) take effect immediately without a Stop/Start.
-    dynamics: Arc<Mutex<Vec<DynReg>>>,
-    rules: Arc<Mutex<Vec<RuleDef>>>,
+    dynamics: Arc<Mutex<Arc<Vec<DynReg>>>>,
+    rules: Arc<Mutex<Arc<Vec<RuleDef>>>>,
     // Register metadata (type/byte order/scale/decimals by unit, bank, start
     // address) that rule conditions decode with. The tick clones the inner
     // `Arc` under a short lock each iteration. Unlike dynamics/rules this is
@@ -1019,7 +1039,7 @@ impl SimEngine {
     /// the next tick — no Stop/Start needed.
     pub fn set_dynamics(&self, dynamics: Vec<DynReg>) {
         if let Ok(mut g) = self.dynamics.lock() {
-            *g = dynamics;
+            *g = Arc::new(dynamics);
         }
     }
 
@@ -1029,7 +1049,12 @@ impl SimEngine {
     /// new value; `refresh_running_config` then re-adds the new config.
     pub fn forget_dynamic(&self, unit: u8, bank: u8, address: u16) {
         if let Ok(mut g) = self.dynamics.lock() {
-            g.retain(|d| (d.unit, d.bank, d.address) != (unit, bank, address));
+            let kept: Vec<DynReg> = g
+                .iter()
+                .filter(|d| (d.unit, d.bank, d.address) != (unit, bank, address))
+                .cloned()
+                .collect();
+            *g = Arc::new(kept);
         }
     }
 
@@ -1037,7 +1062,7 @@ impl SimEngine {
     pub fn set_rules(&self, mut rules: Vec<RuleDef>) {
         rules.sort_by_key(|r| r.sort_order);
         if let Ok(mut g) = self.rules.lock() {
-            *g = rules;
+            *g = Arc::new(rules);
         }
     }
 
@@ -1124,10 +1149,11 @@ impl SimEngine {
 
         // Store the generator/rule lists behind shared locks so mutations while
         // running take effect on the next tick (no Stop/Start).
-        let dynamics_arc: Arc<Mutex<Vec<DynReg>>> = Arc::new(Mutex::new(dynamics));
+        let dynamics_arc: Arc<Mutex<Arc<Vec<DynReg>>>> = Arc::new(Mutex::new(Arc::new(dynamics)));
         self.dynamics = dynamics_arc.clone();
         rules.sort_by_key(|r| r.sort_order);
-        let rules_arc: Arc<Mutex<Vec<RuleDef>>> = Arc::new(Mutex::new(rules.clone()));
+        let prev_rules_init: Arc<Vec<RuleDef>> = Arc::new(rules);
+        let rules_arc: Arc<Mutex<Arc<Vec<RuleDef>>>> = Arc::new(Mutex::new(Arc::clone(&prev_rules_init)));
         self.rules = rules_arc.clone();
 
         let start = std::time::Instant::now();
@@ -1169,7 +1195,7 @@ impl SimEngine {
             let mut rule_states: HashMap<i64, RuleState> = HashMap::new();
             // The rule list the states/pending actions below belong to; when
             // a hot-apply changes it, `reconcile_rules` drops what's stale.
-            let mut prev_rules: Vec<RuleDef> = rules;
+            let mut prev_rules: Arc<Vec<RuleDef>> = prev_rules_init;
             // Actions whose rule fired but whose per-action delay hasn't elapsed
             // yet. Drained each tick when due.
             let mut pending_actions: Vec<PendingAction> = Vec::new();
@@ -1179,12 +1205,12 @@ impl SimEngine {
                     _ = ticker.tick() => {
                         let elapsed = start.elapsed().as_millis() as f64;
                         // Read the live config under a short lock, cloned.
-                        let dynamics: Vec<DynReg> = tick_dynamics.lock().map(|g| g.clone()).unwrap_or_default();
-                        let rules: Vec<RuleDef> = tick_rules.lock().map(|g| g.clone()).unwrap_or_default();
+                        let dynamics: Arc<Vec<DynReg>> = tick_dynamics.lock().map(|g| Arc::clone(&g)).unwrap_or_default();
+                        let rules: Arc<Vec<RuleDef>> = tick_rules.lock().map(|g| Arc::clone(&g)).unwrap_or_default();
                         let meta: Arc<RegMetaMap> = tick_meta.lock().map(|g| Arc::clone(&g)).unwrap_or_default();
-                        if rules != prev_rules {
+                        if !Arc::ptr_eq(&rules, &prev_rules) && *rules != *prev_rules {
                             reconcile_rules(&prev_rules, &rules, &mut rule_states, &mut pending_actions);
-                            prev_rules = rules.clone();
+                            prev_rules = Arc::clone(&rules);
                         }
                         prune_next_due(&mut next_due, &dynamics);
                         // Compute generator/preset values before taking the
@@ -4152,6 +4178,26 @@ mod tests {
             clients: Arc::new(AtomicUsize::new(0)),
             writes: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    #[test]
+    fn modbus_reads_share_the_banks_lock() {
+        let mut map = HashMap::new();
+        map.insert(1u8, banks_with(&[(0, 7)], &[]));
+        let s = service_with(map);
+        let guard = s.banks.read().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let s2 = s.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(s2.handle(1, Request::ReadHoldingRegisters(0, 1)));
+        });
+        let got = rx.recv_timeout(Duration::from_secs(2)).expect("read must not wait for a write lock");
+        assert_eq!(got, Ok(Response::ReadHoldingRegisters(vec![7])));
+        drop(guard);
+        assert_eq!(
+            s.handle(1, Request::WriteSingleRegister(0, 9)),
+            Ok(Response::WriteSingleRegister(0, 9))
+        );
     }
 
     #[test]
