@@ -11,6 +11,11 @@ All notable changes to this project are tracked here following [Keep a Changelog
   ("Stop Analyzer polling before scanning"). The Analyzer now shows polling as
   running with a Stop button, and the scanner's warning has a **Stop Analyzer
   polling** button.
+- **Refresh buttons** — the Analyzer's Refresh also re-reads whether polling is
+  running; a slave's "Reload from saved configuration" asks before discarding
+  unsaved changes; the TCP Simulator's Refresh clears an error left from an
+  earlier action; and refreshing the serial port list says why when the ports
+  can't be listed instead of showing an empty list.
 
 ## [0.6.0] - 2026-11-27
 ### Added

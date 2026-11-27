@@ -324,6 +324,43 @@ describe("AnalyzerPage", () => {
       expect(startAnalyzerPollingMock).not.toHaveBeenCalled();
     });
 
+    it("Refresh re-reads the polling state: stopped elsewhere shows stopped, without starting it", async () => {
+      isAnalyzerPollingRunningMock.mockResolvedValue(true);
+      render(<AnalyzerPage />);
+      await waitFor(() => expect(lastTilesCardProps?.pollingWanted).toBe(true));
+
+      isAnalyzerPollingRunningMock.mockResolvedValue(false);
+      fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+
+      await waitFor(() => expect(lastTilesCardProps?.pollingWanted).toBe(false));
+      expect(startAnalyzerPollingMock).not.toHaveBeenCalled();
+    });
+
+    it("Refresh shows polling that is running and restarts it to pick up changes", async () => {
+      render(<AnalyzerPage />);
+      await waitFor(() => expect(listAnalyzerTilesMock).toHaveBeenCalled());
+      expect(lastTilesCardProps?.pollingWanted).toBe(false);
+
+      isAnalyzerPollingRunningMock.mockResolvedValue(true);
+      fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+
+      await waitFor(() => expect(lastTilesCardProps?.pollingWanted).toBe(true));
+      await waitFor(() => expect(startAnalyzerPollingMock).toHaveBeenCalledWith("UnitTest"));
+    });
+
+    it("Refresh keeps the shown state when the status check fails", async () => {
+      isAnalyzerPollingRunningMock.mockResolvedValue(true);
+      render(<AnalyzerPage />);
+      await waitFor(() => expect(lastTilesCardProps?.pollingWanted).toBe(true));
+
+      isAnalyzerPollingRunningMock.mockRejectedValue(new Error("boom"));
+      fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+
+      await waitFor(() => expect(listAnalyzerTilesMock).toHaveBeenCalledTimes(2));
+      await waitFor(() => expect(startAnalyzerPollingMock).toHaveBeenCalledWith("UnitTest"));
+      expect(lastTilesCardProps?.pollingWanted).toBe(true);
+    });
+
     it("treats a failed status check as stopped and still loads the page", async () => {
       isAnalyzerPollingRunningMock.mockRejectedValue(new Error("boom"));
       render(<AnalyzerPage />);

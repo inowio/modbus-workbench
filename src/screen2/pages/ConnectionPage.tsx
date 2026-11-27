@@ -9,6 +9,7 @@ import {
   ConnectionSettingsForm,
   PortItem,
   normalizeConnectionSettings,
+  refreshSerialPortList,
 } from "../components/ConnectionSettingsForm";
 import { logEvent } from "../api/logs";
 import { CTRL_S } from "../../components/ShortcutKeys";
@@ -238,7 +239,7 @@ export default function ConnectionPage() {
           value={settings}
           onChange={setSettings}
           serialPortOptions={serialPortOptions}
-          onRefreshSerialPorts={loadSerialPorts}
+          onRefreshSerialPorts={() => refreshSerialPortList(setSerialPorts)}
           loading={loading}
           saving={saving}
         />
