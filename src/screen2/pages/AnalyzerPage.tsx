@@ -22,6 +22,7 @@ import {
   reorderAnalyzerTabs,
   saveAnalyzerTileLayouts,
   setAnalyzerTilePollingEnabled,
+  isAnalyzerPollingRunning,
   startAnalyzerPolling,
   stopAnalyzerPolling,
   updateAnalyzerTile,
@@ -840,13 +841,13 @@ export default function AnalyzerPage() {
     }, 650);
   }
 
-  async function refreshAll() {
+  async function refreshAll(options?: { restartPolling?: boolean }) {
     setLoading(true);
     setError(null);
     try {
       const [, , nextTiles] = await Promise.all([refreshSignals(), refreshSlaves(), refreshTiles(), refreshTabs()]);
 
-      if (pollingWantedRef.current && nextTiles.length > 0) {
+      if ((options?.restartPolling ?? true) && pollingWantedRef.current && nextTiles.length > 0) {
         await startAnalyzerPolling(workspaceName);
       }
     } catch (e) {
@@ -909,7 +910,22 @@ export default function AnalyzerPage() {
     // Tab ids belong to a workspace: forget the selection so the new workspace's remembered tab applies.
     selectedTabIdRef.current = null;
     setSelectedTabId(null);
-    void refreshAll();
+    void (async () => {
+      // Polling keeps running in the backend when this page is left, so show its real state
+      // instead of assuming "stopped" (otherwise Run is offered while polling still holds the
+      // connection, and the slave scanner refuses to start). A failed check counts as stopped.
+      let running = false;
+      try {
+        running = await isAnalyzerPollingRunning(workspaceName);
+      } catch {
+        running = false;
+      }
+      if (workspaceNameRef.current !== workspaceName) return;
+      pollingWantedRef.current = running;
+      setPollingWanted(running);
+      // Already running means nothing to restart; not running means nothing to start.
+      await refreshAll({ restartPolling: false });
+    })();
   }, [workspaceName]);
 
   useEffect(() => {

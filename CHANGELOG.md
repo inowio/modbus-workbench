@@ -4,7 +4,13 @@ All notable changes to this project are tracked here following [Keep a Changelog
 
 ## [Unreleased]
 
-_No changes yet._
+### Fixed
+- **Analyzer shows polling that is still running** — Analyzer polling keeps
+  running when you go to another page, but coming back showed the tiles as
+  Stopped with only a Run button, while the slave scanner refused to start
+  ("Stop Analyzer polling before scanning"). The Analyzer now shows polling as
+  running with a Stop button, and the scanner's warning has a **Stop Analyzer
+  polling** button.
 
 ## [0.6.0] - 2026-11-27
 ### Added

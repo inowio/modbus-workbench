@@ -16,6 +16,7 @@ import {
   type ScanProgressEvent,
   type SerialParams,
 } from "../api/slaveScan";
+import { stopAnalyzerPolling } from "../api/analyzer";
 import {
   estimateRangeSeconds,
   estimateScanSeconds,
@@ -91,6 +92,9 @@ async function listenAll(subscriptions: Promise<UnlistenFn>[]): Promise<Unlisten
   return fns;
 }
 
+/** The backend's refusal while Analyzer polling runs (`POLLING_ACTIVE` in src-tauri/src/slave_scan/mod.rs; keep identical). */
+const ANALYZER_POLLING_ACTIVE = "Stop Analyzer polling before scanning — it is using the connection.";
+
 export default function SlaveScannerModal({ open, workspaceName, existingSlaves, onClose, onAdd }: SlaveScannerModalProps) {
   const id = useId();
 
@@ -118,6 +122,7 @@ export default function SlaveScannerModal({ open, workspaceName, existingSlaves,
   /** Addresses checked by the last finished scan (progress is cleared when it ends). */
   const [finalChecked, setFinalChecked] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [stoppingPolling, setStoppingPolling] = useState(false);
 
   const phaseRef = useRef<Phase>("idle");
   const currentScanIdRef = useRef<string | null>(null);
@@ -361,6 +366,19 @@ export default function SlaveScannerModal({ open, workspaceName, existingSlaves,
     }
   }
 
+  // Analyzer polling keeps running after the Analyzer page is left, so offer to stop it here.
+  async function stopPollingForScan() {
+    setStoppingPolling(true);
+    try {
+      await stopAnalyzerPolling(workspaceName);
+      setError(null);
+    } catch (e) {
+      setError(`Could not stop Analyzer polling: ${String(e)}`);
+    } finally {
+      setStoppingPolling(false);
+    }
+  }
+
   function requestCancel() {
     const scanId = currentScanIdRef.current;
     if (!scanId || phaseRef.current !== "scanning") return;
@@ -520,7 +538,17 @@ export default function SlaveScannerModal({ open, workspaceName, existingSlaves,
             {error ? (
               <div className="flex items-start gap-2 rounded-xl border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-800 dark:text-rose-200">
                 <FiAlertTriangle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />
-                <span>{error}</span>
+                <span className="flex-1">{error}</span>
+                {error === ANALYZER_POLLING_ACTIVE ? (
+                  <button
+                    type="button"
+                    onClick={() => void stopPollingForScan()}
+                    disabled={stoppingPolling}
+                    className="shrink-0 rounded-lg border border-rose-500/50 px-2.5 py-1 text-xs font-semibold hover:bg-rose-500/15 disabled:opacity-60"
+                  >
+                    Stop Analyzer polling
+                  </button>
+                ) : null}
               </div>
             ) : null}
 

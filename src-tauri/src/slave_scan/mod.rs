@@ -30,6 +30,8 @@ use engine::{
 use transport::{SerialOpener, TcpConnector, TcpConnectorFactory, TcpReach};
 use types::{default_range_for, validate, ScanKind, ScanRequest, ValidScan};
 
+/// The scanner window matches this exact text to offer "Stop Analyzer polling"
+/// (`ANALYZER_POLLING_ACTIVE` in SlaveScannerModal.tsx; keep identical).
 const POLLING_ACTIVE: &str = "Stop Analyzer polling before scanning — it is using the connection.";
 const PORT_RELEASE_WAIT: Duration = Duration::from_secs(3);
 const DEFAULT_CONNECT_TIMEOUT_MS: i64 = 2000;
