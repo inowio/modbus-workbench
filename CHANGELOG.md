@@ -120,7 +120,9 @@ All notable changes to this project are tracked here following [Keep a Changelog
   Uptime card replaces it; device cards show the device name, icon and real
   address ranges; while stopped, the Value column shows each register's source
   and Live Values offers Start.
-- The TCP Simulator sends only values that changed and redraws only those, so large maps stay smooth; the register panel's mini chart now plots the real value (e.g. 23.5 °C) instead of the raw word.
+- The TCP Simulator sends only values that changed and redraws only those, so
+  large maps stay smooth; the register panel's mini chart now plots the real
+  value (e.g. 23.5 °C) instead of the raw word.
 
 ## [0.5.0] - 2026-08-10
 ### Added
