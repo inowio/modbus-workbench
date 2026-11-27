@@ -4,6 +4,9 @@ All notable changes to this project are tracked here following [Keep a Changelog
 
 ## [Unreleased]
 
+_No changes yet._
+
+## [0.6.1] - 2026-11-27
 ### Fixed
 - **Analyzer shows polling that is still running** — Analyzer polling keeps
   running when you go to another page, but coming back showed the tiles as
