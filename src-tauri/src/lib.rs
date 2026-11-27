@@ -5,6 +5,8 @@ use serialport::SerialPortType;
 use tauri::Manager;
 
 mod db;
+mod analyzer_migrate;
+mod analyzer_tabs;
 mod models;
 mod settings;
 mod slaves;
@@ -18,8 +20,11 @@ mod analyzer;
 mod analyzer_polling;
 
 mod simulator;
+mod sim_scaling;
 
 mod modbus;
+mod slave_scan;
+mod workspace_close;
 use modbus::{
     modbus_rtu_connect, modbus_rtu_diagnostics_echo, modbus_rtu_disconnect,
     modbus_rtu_mask_write_register, modbus_rtu_read_device_identification,
@@ -72,6 +77,11 @@ use analyzer::{
     can_delete_slave_register_row, create_analyzer_tile, delete_analyzer_signal, delete_analyzer_tile,
     list_analyzer_signals, list_analyzer_tiles, list_analyzer_tile_layouts, list_analyzer_tile_signals,
     save_analyzer_tile_layouts, set_analyzer_tile_polling_enabled, update_analyzer_tile, upsert_analyzer_signal,
+};
+
+use analyzer_tabs::{
+    create_analyzer_tab, delete_analyzer_tab, duplicate_analyzer_tile, list_analyzer_tabs,
+    move_analyzer_tile_to_tab, rename_analyzer_tab, reorder_analyzer_tabs,
 };
 
 use analyzer_polling::{start_analyzer_polling, stop_analyzer_polling, AnalyzerPollingState};
@@ -128,6 +138,7 @@ pub fn run() {
         .manage(AnalyzerPollingState::default())
         .manage(ImportCache(Mutex::new(None)))
         .manage(simulator::SimulatorState::default())
+        .manage(slave_scan::SlaveScanState::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -170,6 +181,13 @@ pub fn run() {
             set_traffic_capture_enabled,
             list_analyzer_tiles,
             create_analyzer_tile,
+            list_analyzer_tabs,
+            create_analyzer_tab,
+            rename_analyzer_tab,
+            reorder_analyzer_tabs,
+            delete_analyzer_tab,
+            move_analyzer_tile_to_tab,
+            duplicate_analyzer_tile,
             update_analyzer_tile,
             delete_analyzer_tile,
             delete_analyzer_signal,
@@ -244,11 +262,13 @@ pub fn run() {
             simulator::simulator_delete_rule,
             simulator::simulator_start,
             simulator::simulator_stop,
+            workspace_close::close_workspace_connections,
             simulator::simulator_status,
             simulator::simulator_events,
             simulator::simulator_export_profile,
             simulator::simulator_import_profile,
             simulator::simulator_snapshot,
+            simulator::simulator_request_full,
             simulator::simulator_list_device_templates,
             simulator::simulator_list_custom_templates,
             simulator::simulator_save_custom_template,
@@ -263,6 +283,10 @@ pub fn run() {
             simulator::simulator_delete_device,
             simulator::simulator_update_device,
             simulator::simulator_rebase_device,
+            slave_scan::start_slave_scan,
+            slave_scan::cancel_slave_scan,
+            slave_scan::scan_default_ip_range,
+            slave_scan::scan_local_ipv4,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -1,17 +1,25 @@
-import type { SimRegister } from "../components/SimRegisterModal";
+import type { SimRegister } from "./simRegister";
 
 export type PageRegister = SimRegister & { deviceInstanceId?: number | null };
 
 export type RegisterFilter = { search: string; unit: number | "all"; source: string | "all"; type: string | "all" };
 export const EMPTY_FILTER: RegisterFilter = { search: "", unit: "all", source: "all", type: "all" };
 
-export function filterRegisters(rows: PageRegister[], f: RegisterFilter): PageRegister[] {
+/** True when `q` (already trimmed + lower-cased) matches the address in decimal, or, in Hex mode, as hex (`0101`, `0x101`, any case). */
+export function addressMatches(address: number, q: string, addrFmt: "dec" | "hex" = "dec"): boolean {
+  if (`${address}`.includes(q)) return true;
+  if (addrFmt !== "hex") return false;
+  const hexQ = q.startsWith("0x") ? q.slice(2) : q;
+  return hexQ !== "" && address.toString(16).padStart(4, "0").includes(hexQ);
+}
+
+export function filterRegisters(rows: PageRegister[], f: RegisterFilter, addrFmt: "dec" | "hex" = "dec"): PageRegister[] {
   const q = f.search.trim().toLowerCase();
   return rows.filter((r) => {
     if (f.unit !== "all" && r.unitId !== f.unit) return false;
     if (f.source !== "all" && r.valueSource !== f.source) return false;
     if (f.type !== "all" && r.dataType !== f.type) return false;
-    if (q && !(`${r.alias}`.toLowerCase().includes(q) || `${r.address}`.includes(q) || `${r.unitId}`.includes(q))) return false;
+    if (q && !(`${r.alias}`.toLowerCase().includes(q) || addressMatches(r.address, q, addrFmt) || `${r.unitId}`.includes(q))) return false;
     return true;
   });
 }

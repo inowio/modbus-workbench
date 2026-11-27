@@ -23,20 +23,22 @@ const VirtualDevicesView = forwardRef<VirtualDevicesHandle, { search?: string }>
   const [customKeys, setCustomKeys] = useState<Set<string>>(new Set());
   const [error, setError] = useState<string | null>(null);
   const [editing, setEditing] = useState<DeviceTemplate | null>(null);
+  // A clone is opened as a NEW device (key editable + clash-guarded), never as an edit.
+  const [editingIsNew, setEditingIsNew] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [editorOpen, setEditorOpen] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState<DeviceTemplate | null>(null);
 
   const reload = useCallback(async () => {
-    try {
-      const [all, custom] = await Promise.all([
-        invoke<DeviceTemplate[]>("simulator_list_device_templates"),
-        invoke<DeviceTemplate[]>("simulator_list_custom_templates"),
-      ]);
-      setTemplates(all ?? []);
-      setCustomKeys(new Set((custom ?? []).map((c) => c.templateKey)));
-    } catch (e) {
-      setError(String(e));
-    }
+    // Settle both: a damaged custom-template file must not hide the built-ins.
+    const [all, custom] = await Promise.allSettled([
+      invoke<DeviceTemplate[]>("simulator_list_device_templates"),
+      invoke<DeviceTemplate[]>("simulator_list_custom_templates"),
+    ]);
+    if (all.status === "fulfilled") setTemplates(all.value ?? []);
+    setCustomKeys(new Set(custom.status === "fulfilled" ? (custom.value ?? []).map((c) => c.templateKey) : []));
+    const failed = [all, custom].find((r): r is PromiseRejectedResult => r.status === "rejected");
+    setLoadError(failed ? String(failed.reason) : null);
   }, []);
 
   useEffect(() => { void reload(); }, [reload]);
@@ -44,8 +46,17 @@ const VirtualDevicesView = forwardRef<VirtualDevicesHandle, { search?: string }>
   const isCustom = useCallback((key: string) => customKeys.has(key), [customKeys]);
   const takenKeys = useMemo(() => templates.map((t) => t.templateKey), [templates]);
 
-  const openNew = useCallback(() => { setEditing(null); setEditorOpen(true); }, []);
-  const openEdit = (t: DeviceTemplate) => { setEditing(t); setEditorOpen(true); };
+  const openNew = useCallback(() => { setEditing(null); setEditingIsNew(false); setEditorOpen(true); }, []);
+  const openEdit = (t: DeviceTemplate) => { setEditing(t); setEditingIsNew(false); setEditorOpen(true); };
+  const openClone = (t: DeviceTemplate) => {
+    // First free `custom_<key>`, then `_2`, `_3`, ... so a clone can never overwrite an earlier one.
+    const base = `custom_${t.templateKey}`;
+    let key = base;
+    for (let n = 2; takenKeys.includes(key); n += 1) key = `${base}_${n}`;
+    setEditing({ ...t, templateKey: key, name: `${t.name} (copy)`, category: "Custom" });
+    setEditingIsNew(true);
+    setEditorOpen(true);
+  };
 
   const handleImport = useCallback(async () => {
     try {
@@ -61,6 +72,7 @@ const VirtualDevicesView = forwardRef<VirtualDevicesHandle, { search?: string }>
       await invoke("simulator_save_custom_template", { template: t });
       setEditorOpen(false);
       setEditing(null);
+      setEditingIsNew(false);
       await reload();
     } catch (e) { setError(String(e)); }
   };
@@ -115,7 +127,7 @@ const VirtualDevicesView = forwardRef<VirtualDevicesHandle, { search?: string }>
             </button>
           </>
         ) : (
-          <button type="button" onClick={() => openEdit({ ...t, templateKey: `custom_${t.templateKey}`, name: `${t.name} (copy)`, category: "Custom" })}
+          <button type="button" onClick={() => openClone(t)}
             className="inline-flex items-center gap-1 rounded-full border border-slate-300 px-2.5 py-1 text-xs font-semibold text-slate-700 hover:border-slate-400 dark:border-slate-700 dark:text-slate-200">
             <FiEdit2 className="h-3 w-3" aria-hidden="true" /> Clone & edit
           </button>
@@ -130,6 +142,13 @@ const VirtualDevicesView = forwardRef<VirtualDevicesHandle, { search?: string }>
         Virtual devices are reusable register-map templates shared across every workspace — add one from a workspace's TCP Simulator → Add Device. Built-in devices can be cloned; custom ones can be edited, exported to share, or deleted. Import a shared <code>.json</code> to use someone else's device.
       </div>
 
+      {loadError ? (
+        <div className="flex items-start justify-between gap-3 rounded-xl border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-800 dark:text-rose-200">
+          <span>{loadError}</span>
+          <button type="button" onClick={() => void reload()} className="shrink-0 rounded-md px-1 text-xs font-semibold underline">Retry</button>
+        </div>
+      ) : null}
+
       {error ? (
         <div className="flex items-start justify-between gap-3 rounded-xl border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-800 dark:text-rose-200">
           <span>{error}</span>
@@ -143,7 +162,7 @@ const VirtualDevicesView = forwardRef<VirtualDevicesHandle, { search?: string }>
         </div>
         {customs.length === 0 ? (
           <div className="rounded-2xl border border-dashed border-slate-300 p-6 text-center text-sm text-slate-500 dark:border-slate-700 dark:text-slate-400">
-            {searching ? "No custom devices match your search." : <>No custom devices yet. Create one, clone a built-in, or import a shared <code>.json</code>.</>}
+            {loadError ? "Custom devices couldn't be loaded." : searching ? "No custom devices match your search." : <>No custom devices yet. Create one, clone a built-in, or import a shared <code>.json</code>.</>}
           </div>
         ) : (
           <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">{customs.map((t) => card(t, true))}</div>
@@ -164,8 +183,10 @@ const VirtualDevicesView = forwardRef<VirtualDevicesHandle, { search?: string }>
       <TemplateEditorModal
         open={editorOpen}
         initial={editing}
+        forceNew={editingIsNew}
         takenKeys={takenKeys}
-        onClose={() => { setEditorOpen(false); setEditing(null); }}
+        categories={templates.map((t) => t.category)}
+        onClose={() => { setEditorOpen(false); setEditing(null); setEditingIsNew(false); }}
         onSave={handleSave}
       />
 

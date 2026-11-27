@@ -26,8 +26,31 @@ pub struct AnalyzerPollingState {
     workers: Mutex<HashMap<String, JoinHandle<()>>>,
 }
 
+impl AnalyzerPollingState {
+    /// Whether a polling worker for `ws` exists and has not finished.
+    pub fn is_running(&self, ws: &str) -> bool {
+        // A poisoned map still holds valid handles; reading it is safe.
+        let workers = self.workers.lock().unwrap_or_else(|e| e.into_inner());
+        workers.get(ws.trim()).is_some_and(|h| !h.inner().is_finished())
+    }
+
+    /// Removes and returns the polling worker for `ws`, if any.
+    pub(crate) fn take_worker(&self, ws: &str) -> Option<JoinHandle<()>> {
+        let mut workers = self.workers.lock().unwrap_or_else(|e| e.into_inner());
+        workers.remove(ws.trim())
+    }
+
+    /// Registers a worker as if polling had started for `ws`.
+    #[cfg(test)]
+    pub(crate) fn insert_worker_for_test(&self, ws: &str, handle: JoinHandle<()>) {
+        if let Ok(mut workers) = self.workers.lock() {
+            workers.insert(ws.to_string(), handle);
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
-struct SignalPollSpec {
+pub(crate) struct SignalPollSpec {
     signal_id: String,
     unit_id: i64,
     connection_kind: String,
@@ -223,7 +246,15 @@ fn build_batches(specs: &[SignalPollSpec]) -> Vec<BatchSpec> {
 
 fn load_effective_signal_specs(app: &tauri::AppHandle, workspace: &str) -> Result<Vec<SignalPollSpec>, String> {
     let conn = open_workspace_db(app, workspace)?;
+    load_effective_signal_specs_in_conn(&conn)
+}
 
+/// Register signals to poll: those on an enabled tile, plus the inputs of any
+/// calculated signal on an enabled tile. Calculated signals have no register,
+/// so the inner JOINs drop them.
+pub(crate) fn load_effective_signal_specs_in_conn(
+    conn: &rusqlite::Connection,
+) -> Result<Vec<SignalPollSpec>, String> {
     let mut stmt = conn
         .prepare(
             "SELECT
@@ -240,6 +271,12 @@ fn load_effective_signal_specs(app: &tauri::AppHandle, workspace: &str) -> Resul
              JOIN (
                SELECT DISTINCT ats.signal_id AS signal_id
                FROM analyzer_tile_signals ats
+               JOIN analyzer_tiles t ON t.id = ats.tile_id
+               WHERE t.polling_enabled = 1
+               UNION
+               SELECT asi.input_signal_id
+               FROM analyzer_signal_inputs asi
+               JOIN analyzer_tile_signals ats ON ats.signal_id = asi.signal_id
                JOIN analyzer_tiles t ON t.id = ats.tile_id
                WHERE t.polling_enabled = 1
              ) x ON x.signal_id = s.id
@@ -851,9 +888,147 @@ pub async fn start_analyzer_polling(
 #[cfg(test)]
 mod tests {
     use super::{
+        AnalyzerPollingState, JoinHandle,
         build_batches, deterministic_jitter_ms, is_disconnected_error, max_qty_for_function,
-        quantity_for_data_type, BatchItem, SignalPollSpec,
+        load_effective_signal_specs_in_conn, quantity_for_data_type, BatchItem, SignalPollSpec,
     };
+    use rusqlite::Connection;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_db() -> (PathBuf, Connection) {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("analyzer_polling_test_{nanos}"));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        crate::db::ensure_workspace_db(&dir, "workspace.db").expect("schema");
+        let conn = Connection::open(dir.join("workspace.db")).expect("open db");
+        conn.execute_batch("PRAGMA foreign_keys = ON;").expect("pragma");
+        (dir, conn)
+    }
+
+    fn cleanup(dir: PathBuf, conn: Connection) {
+        drop(conn);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Slave 1 with register rows 1..=3 (addresses 0..=2) and signals A, B, R on
+    /// them, plus calculated C with inputs A and B. Returns nothing; tiles are
+    /// added by each test.
+    fn seed_signals(conn: &Connection) {
+        conn.execute(
+            "INSERT INTO slaves (id, name, unit_id, poll_interval_ms, connection_kind, address_offset, created_at, updated_at)
+             VALUES (1, 's', 1, 500, 'tcp', 0, 't', 't');",
+            [],
+        )
+        .expect("slave");
+        for (row_id, addr) in [(1, 0), (2, 1), (3, 2)] {
+            conn.execute(
+                "INSERT INTO slave_register_rows (id, slave_id, function_code, address, data_type, display_format, updated_at)
+                 VALUES (?1, 1, 3, ?2, 'u16', 'dec', 't');",
+                rusqlite::params![row_id, addr],
+            )
+            .expect("row");
+        }
+        for (id, row_id) in [("A", 1), ("B", 2), ("R", 3)] {
+            conn.execute(
+                "INSERT INTO analyzer_signals (id, kind, slave_id, connection_kind, function_kind, register_row_id, decoder_json)
+                 VALUES (?1, 'register', 1, 'tcp', 'holding', ?2, '');",
+                rusqlite::params![id, row_id],
+            )
+            .expect("signal");
+        }
+        conn.execute(
+            "INSERT INTO analyzer_signals (id, kind, slave_id, connection_kind, function_kind, register_row_id, decoder_json)
+             VALUES ('C', 'calculated', NULL, '', '', NULL, '');",
+            [],
+        )
+        .expect("calc");
+        for input in ["A", "B"] {
+            conn.execute(
+                "INSERT INTO analyzer_signal_inputs (signal_id, input_signal_id) VALUES ('C', ?1);",
+                [input],
+            )
+            .expect("input");
+        }
+    }
+
+    fn add_tile(conn: &Connection, id: i64, enabled: i64, signal_id: &str) {
+        conn.execute(
+            "INSERT INTO analyzer_tiles (id, kind, polling_enabled, created_at, updated_at)
+             VALUES (?1, 'value', ?2, 't', 't');",
+            rusqlite::params![id, enabled],
+        )
+        .expect("tile");
+        conn.execute(
+            "INSERT INTO analyzer_tile_signals (tile_id, signal_id) VALUES (?1, ?2);",
+            rusqlite::params![id, signal_id],
+        )
+        .expect("tile signal");
+    }
+
+    fn sorted_ids(conn: &Connection) -> Vec<String> {
+        let mut ids: Vec<String> = load_effective_signal_specs_in_conn(conn)
+            .expect("specs")
+            .into_iter()
+            .map(|s| s.signal_id)
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    #[tokio::test]
+    async fn is_running_tracks_live_workers() {
+        let state = AnalyzerPollingState::default();
+        assert!(!state.is_running("ws"));
+
+        let live = tokio::spawn(std::future::pending::<()>());
+        let done = tokio::spawn(async {});
+        while !done.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        {
+            let mut workers = state.workers.lock().unwrap();
+            workers.insert("ws".into(), JoinHandle::Tokio(live));
+            workers.insert("finished".into(), JoinHandle::Tokio(done));
+        }
+        assert!(state.is_running("ws"));
+        assert!(!state.is_running("finished"));
+        assert!(!state.is_running("other"));
+        state.workers.lock().unwrap().values().for_each(|h| h.abort());
+    }
+
+    #[test]
+    fn polls_inputs_of_calculated_signals_on_enabled_tiles() {
+        let (dir, conn) = temp_db();
+        seed_signals(&conn);
+        add_tile(&conn, 1, 1, "C");
+        add_tile(&conn, 2, 1, "R");
+        assert_eq!(sorted_ids(&conn), vec!["A", "B", "R"]);
+        cleanup(dir, conn);
+    }
+
+    #[test]
+    fn skips_inputs_when_calculated_tile_disabled() {
+        let (dir, conn) = temp_db();
+        seed_signals(&conn);
+        add_tile(&conn, 1, 0, "C");
+        add_tile(&conn, 2, 1, "R");
+        assert_eq!(sorted_ids(&conn), vec!["R"]);
+        cleanup(dir, conn);
+    }
+
+    #[test]
+    fn input_polled_once_when_also_on_a_tile() {
+        let (dir, conn) = temp_db();
+        seed_signals(&conn);
+        add_tile(&conn, 1, 1, "C");
+        add_tile(&conn, 2, 1, "A");
+        assert_eq!(sorted_ids(&conn), vec!["A", "B"]);
+        cleanup(dir, conn);
+    }
 
     #[test]
     fn resolves_max_quantity_by_function() {
@@ -948,15 +1123,7 @@ pub fn stop_analyzer_polling(
         return Ok(());
     }
 
-    let handle = {
-        let mut guard = state
-            .workers
-            .lock()
-            .map_err(|_| "analyzer polling state lock poisoned".to_string())?;
-        guard.remove(&workspace)
-    };
-
-    if let Some(h) = handle {
+    if let Some(h) = state.take_worker(&workspace) {
         h.abort();
     }
 

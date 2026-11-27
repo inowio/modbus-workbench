@@ -8,7 +8,7 @@ const workspaceSection: HelpSectionDefinition = {
   title: "Workspace",
   description:
     "Understand why workspaces matter, how to search/filter them, create new ones, manage metadata, and handle logs/deletion safely.",
-  keywords: ["workspace", "search", "cards", "grid", "list", "view", "add", "rename", "export", "import", "logs", "delete", "example"],
+  keywords: ["workspace", "search", "cards", "grid", "list", "view", "add", "rename", "export", "import", "logs", "delete", "example", "backup", "upgrade", "update"],
   searchText:
     "Workspaces are the top-level containers. Learn about the header context, search, cards, add dialog, rename, export, import, metadata form, save/delete, logs separation, deletion cautions, and practical multi-site examples.",
   anchors: [
@@ -124,6 +124,11 @@ const workspaceSection: HelpSectionDefinition = {
           <li>The default filename is the workspace name with a <code>.zip</code> extension.</li>
         </ul>
         <p>Use export before deleting old workspaces, or to transfer setups between machines.</p>
+        <p className="rounded-2xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-700 dark:border-slate-800/60 dark:bg-slate-900/30 dark:text-slate-200">
+          <span className="font-semibold text-amber-700 dark:text-amber-300">Before updating the app:</span> export a backup of
+          important workspaces. A newer version may upgrade your workspaces when it first lists them, and an upgraded workspace
+          can't be opened by an older version of the app.
+        </p>
       </SectionBlock>
       <SectionBlock section="workspace" anchor="import" title="Importing a workspace">
         <p>

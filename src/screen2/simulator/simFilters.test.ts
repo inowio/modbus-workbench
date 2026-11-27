@@ -13,6 +13,20 @@ describe("filterRegisters", () => {
   it("search matches address", () => expect(filterRegisters(rows, { ...EMPTY_FILTER, search: "5" })).toHaveLength(2));
 });
 
+describe("filterRegisters hex search (F10)", () => {
+  const rows = [reg({ id: 1, address: 257, alias: "A" }), reg({ id: 2, address: 5, alias: "B" })];
+  const hex = (search: string) => filterRegisters(rows, { ...EMPTY_FILTER, search }, "hex").map((r) => r.id);
+  it("matches a 4-digit hex address", () => expect(hex("0101")).toEqual([1]));
+  it("matches 0x-prefixed, case-insensitively", () => { expect(hex("0x101")).toEqual([1]); expect(hex("0X0101")).toEqual([1]); });
+  it("matches hex letters in any case", () => {
+    const r = [reg({ id: 9, address: 0x1fa })];
+    expect(filterRegisters(r, { ...EMPTY_FILTER, search: "1FA" }, "hex")).toHaveLength(1);
+    expect(filterRegisters(r, { ...EMPTY_FILTER, search: "0x1fa" }, "hex")).toHaveLength(1);
+  });
+  it("still matches decimal in hex mode", () => expect(hex("257")).toEqual([1]));
+  it("does not match hex text in dec mode", () => expect(filterRegisters(rows, { ...EMPTY_FILTER, search: "0x101" }, "dec")).toHaveLength(0));
+});
+
 describe("rwLabel", () => {
   it("holding & coil are R/W", () => { expect(rwLabel(3)).toBe("R/W"); expect(rwLabel(1)).toBe("R/W"); });
   it("input & discrete are R", () => { expect(rwLabel(4)).toBe("R"); expect(rwLabel(2)).toBe("R"); });

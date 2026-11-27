@@ -1,8 +1,18 @@
-import { useEffect, useState } from "react";
-import { FiCode, FiList, FiPlus, FiTrash2 } from "react-icons/fi";
+import { useEffect, useRef, useState, type RefObject } from "react";
+import { FiCode, FiCopy, FiList, FiPlus, FiTrash2 } from "react-icons/fi";
 import { RiCloseLine } from "react-icons/ri";
 
+import { useAppAddressFormat } from "../utils/addressFormatPref";
+import { GENERATOR_DEFAULT_PERIOD_MS, initialPeriodText, periodPlaceholder } from "../simulator/sourceParams";
+import ScalingFields, { parseOptionalNumber, scalingTexts, validateScaling, type ScalingText } from "../simulator/ScalingFields";
 import type { DeviceTemplate, TemplateRegister } from "./AddDeviceModal";
+import {
+  categoryOptions, findOverlaps, formatOffset, nextFreeOffset, normalizeCategory, parseOffset, regLabel,
+  slugKey, sourceSummary,
+} from "./templateEditorUtils";
+
+/** Select value for the "type a new category" choice (can't clash with a real one: it has spaces trimmed out). */
+const NEW_CATEGORY = " new ";
 
 const BANKS = [
   { value: 1, label: "Coil (1)" },
@@ -112,7 +122,7 @@ function defaultParamsFor(source: string): string {
     case "generator":
       return JSON.stringify({ kind: "sine", min: 0, max: 100, periodMs: 1000 });
     case "device":
-      return JSON.stringify({ preset: "temperature", min: 0, max: 100, periodMs: 1000 });
+      return JSON.stringify({ preset: "temperature", min: 0, max: 100 });
     case "route":
       return JSON.stringify({ slaveUnitId: 1, connectionKind: "tcp", functionCode: 3, address: 1, scale: 1, offset: 0 });
     default:
@@ -120,11 +130,16 @@ function defaultParamsFor(source: string): string {
   }
 }
 
+
+const BANK_SHORT: Record<number, string> = { 1: "Coil", 2: "Discrete", 3: "Holding", 4: "Input" };
+
 export default function TemplateEditorModal(props: {
   open: boolean;
   initial: DeviceTemplate | null;
   /** Keys already used by other templates (for a uniqueness hint). */
   takenKeys: string[];
+  /** Categories already used by devices, offered alongside the standard ones. */
+  categories?: string[];
   /**
    * Treat `initial` as a *pre-filled draft for a brand-new* device rather than
    * an existing one to edit: the key stays editable and clash-guarded. Used by
@@ -138,13 +153,30 @@ export default function TemplateEditorModal(props: {
   const [t, setT] = useState<DeviceTemplate>(() => props.initial ?? emptyTemplate());
   // Editing an existing custom template keeps its key locked (it's the identity).
   const [isEdit, setIsEdit] = useState(false);
+  // Once the user types a key by hand it stops following the name.
+  const [keyTouched, setKeyTouched] = useState(false);
   const [iconModalOpen, setIconModalOpen] = useState(false);
+  // True while the user is typing a category that isn't in the list yet.
+  const [typingCategory, setTypingCategory] = useState(false);
+  const [sel, setSel] = useState(0);
+  const [focusTick, setFocusTick] = useState(0);
+  // Invalid scaling text currently typed in the selected register (it is never stored; see scalingBlock for stored values).
+  const [draftError, setDraftError] = useState<string | null>(null);
+  const aliasRef = useRef<HTMLInputElement>(null);
+  const [addrFmt] = useAppAddressFormat();
 
   useEffect(() => {
     if (!props.open) return;
     setT(props.initial ?? emptyTemplate());
     setIsEdit(!!props.initial && !props.forceNew);
+    setKeyTouched(false);
+    setTypingCategory(false);
+    setSel(0);
   }, [props.open, props.initial, props.forceNew]);
+
+  useEffect(() => {
+    if (focusTick > 0) aliasRef.current?.focus();
+  }, [focusTick]);
 
   useEffect(() => {
     if (!props.open) return;
@@ -162,23 +194,104 @@ export default function TemplateEditorModal(props: {
   if (!props.open) return null;
 
   const set = (patch: Partial<DeviceTemplate>) => setT((prev) => ({ ...prev, ...patch }));
+  const setName = (name: string) =>
+    setT((prev) => ({
+      ...prev,
+      name,
+      ...(!isEdit && !keyTouched ? { templateKey: slugKey(name, props.takenKeys) } : {}),
+    }));
+  // An undefined patch value removes the key, so cleared optional fields stay absent.
   const setReg = (i: number, patch: Partial<TemplateRegister>) =>
-    setT((prev) => ({ ...prev, registers: prev.registers.map((r, idx) => (idx === i ? { ...r, ...patch } : r)) }));
-  const addReg = () => setT((prev) => ({ ...prev, registers: [...prev.registers, blankReg()] }));
-  const removeReg = (i: number) => setT((prev) => ({ ...prev, registers: prev.registers.filter((_, idx) => idx !== i) }));
+    setT((prev) => ({
+      ...prev,
+      registers: prev.registers.map((r, idx) => {
+        if (idx !== i) return r;
+        const next: Record<string, unknown> = { ...r, ...patch };
+        for (const k of Object.keys(patch)) if (next[k] === undefined) delete next[k];
+        return next as TemplateRegister;
+      }),
+    }));
+
+  const addReg = () => {
+    const last = t.registers[t.registers.length - 1];
+    const bank = last ? last.bank : 3;
+    const reg: TemplateRegister = {
+      ...blankReg(),
+      bank,
+      dataType: bank === 1 || bank === 2 ? "bool" : "u16",
+      offset: nextFreeOffset(t.registers, bank),
+    };
+    setT((prev) => ({ ...prev, registers: [...prev.registers, reg] }));
+    setSel(t.registers.length);
+    setFocusTick((n) => n + 1);
+  };
+  const duplicateReg = (i: number) => {
+    const src = t.registers[i];
+    const copy: TemplateRegister = {
+      ...src,
+      offset: nextFreeOffset(t.registers, src.bank),
+      alias: `${regLabel(src)} (copy)`,
+    };
+    setT((prev) => ({ ...prev, registers: [...prev.registers.slice(0, i + 1), copy, ...prev.registers.slice(i + 1)] }));
+    setSel(i + 1);
+  };
+  const removeReg = (i: number) => {
+    setT((prev) => ({ ...prev, registers: prev.registers.filter((_, idx) => idx !== i) }));
+    setSel((s) => (s > i || s >= t.registers.length - 1 ? Math.max(0, s - 1) : s));
+  };
+
+  const categories = categoryOptions([...(props.categories ?? []), props.initial?.category ?? ""]);
+  const pickCategory = (value: string) => {
+    if (value === NEW_CATEGORY) {
+      setTypingCategory(true);
+      set({ category: "" });
+    } else {
+      setTypingCategory(false);
+      set({ category: value });
+    }
+  };
 
   const keyTrim = t.templateKey.trim();
   const keyClashes = !isEdit && props.takenKeys.includes(keyTrim);
-  const valid = keyTrim !== "" && t.name.trim() !== "" && !keyClashes;
+  const overlaps = findOverlaps(t.registers);
+  // Any register (including ones loaded already invalid) with unusable scaling blocks Save.
+  const scalingBlock = (() => {
+    for (let i = 0; i < t.registers.length; i += 1) {
+      const r = t.registers[i];
+      if (r.bank === 1 || r.bank === 2) continue;
+      const err = validateScaling(scalingTexts(r), false).error;
+      if (err) return `Register ${i + 1}: ${err}`;
+    }
+    return null;
+  })();
+  const valid = keyTrim !== "" && t.name.trim() !== "" && !keyClashes && overlaps.size === 0 && scalingBlock === null && draftError === null;
+  const blocker =
+    t.name.trim() === "" ? "Enter a name to save."
+      : keyTrim === "" ? "Enter a key (Advanced) to save."
+        : keyClashes ? "Choose a different key (Advanced)."
+          : overlaps.size > 0 ? `Fix overlapping registers to save (${overlaps.size}).`
+            : scalingBlock ?? draftError;
+  const selIdx = Math.min(sel, t.registers.length - 1);
+  const selected = selIdx >= 0 ? t.registers[selIdx] : null;
+
+  const save = () =>
+    void props.onSave({
+      ...t,
+      templateKey: keyTrim,
+      // "sensors" joins "Sensors" rather than starting a new gallery group.
+      category: normalizeCategory(t.category, categories),
+      // Never persist an empty alias: fall back to the placeholder shown in the list.
+      registers: t.registers.map((r) => ({ ...r, alias: regLabel(r) })),
+    });
 
   return (
     <>
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/70 p-4 backdrop-blur-sm">
       <div role="dialog" aria-modal="true" aria-labelledby="tpl-editor-title"
-        className="flex max-h-[92vh] w-full max-w-5xl flex-col rounded-2xl border border-slate-200 bg-white text-slate-900 shadow-2xl dark:border-slate-800 dark:bg-slate-900 dark:text-slate-100">
+        className="@container flex h-[92vh] w-[96vw] max-w-[1800px] flex-col overflow-hidden rounded-2xl border border-slate-200 bg-white text-slate-900 shadow-2xl dark:border-slate-800 dark:bg-slate-900 dark:text-slate-100">
 
         {/* Header */}
-        <div className="flex shrink-0 items-center justify-between gap-2 border-b border-slate-200 px-6 py-4 dark:border-slate-800">
+        <div className="flex shrink-0 items-center justify-between gap-2 border-b border-slate-200 px-6 py-3 dark:border-slate-800">
           <div className="min-w-0">
             <div id="tpl-editor-title" className="truncate text-sm font-semibold text-emerald-700 dark:text-emerald-200">
               {isEdit ? "Edit virtual device" : "New virtual device"}
@@ -193,73 +306,133 @@ export default function TemplateEditorModal(props: {
           </button>
         </div>
 
-        {/* Body */}
-        <div className="min-h-0 flex-1 space-y-6 overflow-y-auto px-6 py-5">
+        {/* Body: details on top, then list | editor panes. Stacks and scrolls on narrow widths. */}
+        <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-6 py-4 @4xl:overflow-hidden">
           {/* Identity */}
-          <section className="grid grid-cols-1 gap-5 lg:grid-cols-[minmax(0,1fr)_18rem]">
-            <div className="space-y-3">
-              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+          <section className="grid shrink-0 grid-cols-1 gap-3 @3xl:grid-cols-[auto_minmax(0,1fr)] @3xl:items-start">
+            <IconField value={t.icon} onOpen={() => setIconModalOpen(true)} />
+            <div className="space-y-2">
+              <div className="grid grid-cols-1 gap-3 @2xl:grid-cols-[minmax(0,1.2fr)_minmax(0,0.8fr)_minmax(0,2fr)]">
                 <label className={labelCls}>Name
-                  <input aria-label="Template name" placeholder="e.g. Acme Power Meter" value={t.name}
-                    onChange={(e) => set({ name: e.target.value })} className={inputCls} />
+                  <input aria-label="Template name" placeholder="e.g. Power Meter" value={t.name}
+                    onChange={(e) => setName(e.target.value)} className={inputCls} />
                 </label>
-                <label className={labelCls}>Key
-                  <input aria-label="Template key" placeholder="acme_power_meter" value={t.templateKey} disabled={isEdit}
-                    onChange={(e) => set({ templateKey: e.target.value.replace(/\s+/g, "_").toLowerCase() })}
-                    className={`${inputCls} font-mono ${isEdit ? "cursor-not-allowed opacity-60" : ""}`} />
+                <div className={labelCls}>
+                  <label htmlFor="tpl-category">Category</label>
+                  <select id="tpl-category" aria-label="Category"
+                    value={typingCategory ? NEW_CATEGORY : normalizeCategory(t.category, categories)}
+                    onChange={(e) => pickCategory(e.target.value)} className={inputCls}>
+                    {categories.map((c) => <option key={c} value={c}>{c}</option>)}
+                    <option value={NEW_CATEGORY}>New category…</option>
+                  </select>
+                  {typingCategory ? (
+                    <input aria-label="New category name" placeholder="e.g. HVAC" value={t.category} autoFocus
+                      onChange={(e) => set({ category: e.target.value })} className={inputCls} />
+                  ) : null}
+                </div>
+                <label className={labelCls}>Description
+                  <input aria-label="Description" placeholder="What this device represents" value={t.description}
+                    onChange={(e) => set({ description: e.target.value })} className={inputCls} />
                 </label>
               </div>
-              <label className={labelCls}>Category
-                <input aria-label="Category" placeholder="Custom" value={t.category}
-                  onChange={(e) => set({ category: e.target.value })} className={inputCls} />
-              </label>
-              <label className={labelCls}>Description
-                <input aria-label="Description" placeholder="What this device represents" value={t.description}
-                  onChange={(e) => set({ description: e.target.value })} className={inputCls} />
-              </label>
+              <details className="text-xs text-slate-600 dark:text-slate-300">
+                <summary className="cursor-pointer select-none font-medium">Advanced</summary>
+                <label className={`${labelCls} mt-2 max-w-sm`}>Key
+                  <input aria-label="Template key" placeholder="custom_power_meter" value={t.templateKey} disabled={isEdit}
+                    onChange={(e) => { setKeyTouched(true); set({ templateKey: e.target.value.replace(/\s+/g, "_").toLowerCase() }); }}
+                    className={`${inputCls} font-mono ${isEdit ? "cursor-not-allowed opacity-60" : ""}`} />
+                </label>
+              </details>
               {keyClashes ? (
                 <div className="rounded-lg border border-rose-300 bg-rose-50 px-3 py-2 text-xs text-rose-700 dark:border-rose-500/40 dark:bg-rose-500/10 dark:text-rose-300">
                   A device with key “{keyTrim}” already exists. Choose a different key.
                 </div>
               ) : null}
             </div>
-            <IconField value={t.icon} onOpen={() => setIconModalOpen(true)} />
           </section>
 
-          {/* Registers */}
-          <section className="space-y-3">
-            <div className="flex items-center justify-between">
-              <div>
-                <div className="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">Registers</div>
-                <div className="text-xs text-slate-500 dark:text-slate-400">Offsets are relative to the device’s base address.</div>
+          {/* Registers: list | editor */}
+          <section className="grid min-h-0 flex-1 grid-cols-1 gap-4 @4xl:grid-cols-[minmax(0,5fr)_minmax(0,6fr)]">
+            {/* List pane */}
+            <div className="flex min-h-[16rem] min-w-0 flex-col rounded-xl border border-slate-200 dark:border-slate-700">
+              <div className="flex shrink-0 items-center justify-between gap-2 border-b border-slate-200 px-3 py-2 dark:border-slate-700">
+                <div>
+                  <div className="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
+                    Registers · {t.registers.length}
+                  </div>
+                  <div className="text-xs text-slate-500 dark:text-slate-400">Offsets are relative to the device’s base address.</div>
+                </div>
+                <button type="button" onClick={addReg}
+                  className="inline-flex items-center gap-1.5 rounded-full border border-emerald-600/60 bg-emerald-500/10 px-3 py-1.5 text-xs font-semibold text-emerald-800 transition hover:bg-emerald-500/20 dark:border-emerald-500/60 dark:text-emerald-200">
+                  <FiPlus className="h-3.5 w-3.5" aria-hidden="true" /> Add register
+                </button>
               </div>
-              <button type="button" onClick={addReg}
-                className="inline-flex items-center gap-1.5 rounded-full border border-emerald-600/60 bg-emerald-500/10 px-3 py-1.5 text-xs font-semibold text-emerald-800 transition hover:bg-emerald-500/20 dark:border-emerald-500/60 dark:text-emerald-200">
-                <FiPlus className="h-3.5 w-3.5" aria-hidden="true" /> Add register
-              </button>
+              {t.registers.length === 0 ? (
+                <div className="m-3 rounded-xl border border-dashed border-slate-300 px-4 py-8 text-center text-xs text-slate-500 dark:border-slate-700 dark:text-slate-400">
+                  No registers yet. Add one to expose data on this device.
+                </div>
+              ) : (
+                <ul aria-label="Registers" className="min-h-0 flex-1 divide-y divide-slate-100 overflow-y-auto dark:divide-slate-800">
+                  {t.registers.map((r, i) => {
+                    const clash = overlaps.get(i);
+                    const active = i === selIdx;
+                    return (
+                      <li key={i}
+                        className={`flex items-center gap-1 px-2 py-1.5 ${clash !== undefined
+                          ? "bg-rose-500/10 ring-1 ring-inset ring-rose-400/60"
+                          : active ? "bg-emerald-500/10" : ""}`}>
+                        <button type="button" aria-label={`Register ${i + 1}: ${regLabel(r)}, offset ${formatOffset(r.offset, addrFmt)}, ${(BANK_SHORT[r.bank] ?? String(r.bank)).toLowerCase()}`} aria-current={active ? "true" : undefined}
+                          onClick={() => setSel(i)}
+                          className="grid min-w-0 flex-1 grid-cols-[1.5rem_minmax(0,1.4fr)_4rem_5rem_3rem_minmax(0,1.6fr)] items-center gap-2 rounded-lg px-1.5 py-1.5 text-left text-sm transition hover:bg-slate-100 dark:hover:bg-white/5">
+                          <span className="text-xs text-slate-400">{i + 1}</span>
+                          <span className={`truncate font-medium ${r.alias.trim() === "" ? "italic text-slate-400" : ""}`}>{regLabel(r)}</span>
+                          <span className="font-mono text-xs">{formatOffset(r.offset, addrFmt)}</span>
+                          <span className="text-xs">{BANK_SHORT[r.bank] ?? r.bank}</span>
+                          <span className="font-mono text-xs">{r.dataType}</span>
+                          <span className="truncate text-xs text-slate-500 dark:text-slate-400">{sourceSummary(r)}</span>
+                          {clash !== undefined ? (
+                            <span className="col-span-5 col-start-2 text-xs font-medium text-rose-700 dark:text-rose-300">
+                              Overlaps offset {formatOffset(clash, addrFmt)}
+                            </span>
+                          ) : null}
+                        </button>
+                        <button type="button" aria-label={`Duplicate register ${i + 1}: ${regLabel(r)}`} title="Duplicate register" onClick={() => duplicateReg(i)}
+                          className="shrink-0 rounded-lg p-2 text-slate-500 transition hover:bg-slate-500/10 dark:text-slate-300">
+                          <FiCopy className="h-4 w-4" aria-hidden="true" />
+                        </button>
+                        <button type="button" aria-label={`Remove register ${i + 1}: ${regLabel(r)}`} title="Remove register" onClick={() => removeReg(i)}
+                          className="shrink-0 rounded-lg p-2 text-rose-600 transition hover:bg-rose-500/10 dark:text-rose-300">
+                          <FiTrash2 className="h-4 w-4" aria-hidden="true" />
+                        </button>
+                      </li>
+                    );
+                  })}
+                </ul>
+              )}
             </div>
 
-            {t.registers.length === 0 ? (
-              <div className="rounded-xl border border-dashed border-slate-300 px-4 py-8 text-center text-xs text-slate-500 dark:border-slate-700 dark:text-slate-400">
-                No registers yet. Add one to expose data on this device.
-              </div>
-            ) : (
-              <div className="space-y-3">
-                {t.registers.map((r, i) => (
-                  <RegisterCard key={i} index={i} reg={r} onChange={(patch) => setReg(i, patch)} onRemove={() => removeReg(i)} />
-                ))}
-              </div>
-            )}
+            {/* Editor pane */}
+            <div className="@container min-h-0 min-w-0 overflow-y-auto rounded-xl border border-slate-200 p-4 dark:border-slate-700">
+              {selected ? (
+                <RegisterEditor key={`${selIdx}:${t.registers.length}`} index={selIdx} reg={selected} addrFmt={addrFmt} aliasRef={aliasRef}
+                  onChange={(patch) => setReg(selIdx, patch)} onScalingError={setDraftError} />
+              ) : (
+                <div className="py-10 text-center text-xs text-slate-500 dark:text-slate-400">
+                  Select a register to edit it.
+                </div>
+              )}
+            </div>
           </section>
         </div>
 
         {/* Footer */}
-        <div className="flex shrink-0 items-center justify-end gap-2 border-t border-slate-200 px-6 py-4 dark:border-slate-800">
+        <div className="flex shrink-0 items-center justify-end gap-3 border-t border-slate-200 px-6 py-3 dark:border-slate-800">
+          {blocker ? <span role="status" className="mr-auto text-xs text-slate-500 dark:text-slate-400">{blocker}</span> : null}
           <button type="button" onClick={props.onClose}
             className="rounded-full border border-slate-300 bg-slate-100 px-4 py-2 text-sm font-semibold text-slate-700 transition hover:border-slate-400 dark:border-slate-700 dark:bg-white/5 dark:text-slate-100 dark:hover:border-slate-500">
             Cancel
           </button>
-          <button type="button" disabled={!valid} onClick={() => void props.onSave({ ...t, templateKey: keyTrim })}
+          <button type="button" disabled={!valid} onClick={save}
             className="rounded-full border border-emerald-600/60 bg-emerald-500/10 px-4 py-2 text-sm font-semibold text-emerald-800 transition hover:bg-emerald-500/20 disabled:cursor-not-allowed disabled:opacity-50 dark:border-emerald-500/60 dark:text-emerald-200">
             Save device
           </button>
@@ -277,25 +450,22 @@ export default function TemplateEditorModal(props: {
   );
 }
 
+
 // --- Icon field (compact trigger) + picker modal --------------------------
 
 function IconField(props: { value: string; onOpen: () => void }) {
   const { value, onOpen } = props;
   return (
-    <div className="flex flex-col items-center justify-center gap-3 rounded-xl border border-slate-200 bg-slate-50/60 p-4 dark:border-slate-700 dark:bg-slate-800/40">
-      <button type="button" onClick={onOpen} aria-label="Choose device icon"
-        className="flex h-16 w-16 items-center justify-center rounded-2xl border border-slate-200 bg-white text-3xl leading-none transition hover:border-emerald-400 hover:bg-emerald-500/5 dark:border-slate-700 dark:bg-slate-900 dark:hover:border-emerald-500/60">
+    <button type="button" onClick={onOpen} aria-label="Choose device icon" title="Choose icon"
+      className="flex items-center gap-3 rounded-xl border border-slate-200 bg-slate-50/60 px-3 py-2 text-left transition hover:border-emerald-400 dark:border-slate-700 dark:bg-slate-800/40 dark:hover:border-emerald-500/60">
+      <span className="flex h-12 w-12 items-center justify-center rounded-xl border border-slate-200 bg-white text-2xl leading-none dark:border-slate-700 dark:bg-slate-900">
         {value || "❔"}
-      </button>
-      <div className="text-center">
-        <div className="text-xs font-semibold text-slate-600 dark:text-slate-300">Icon</div>
-        <div className="text-xs text-slate-500 dark:text-slate-400">Shown in the device gallery.</div>
-      </div>
-      <button type="button" onClick={onOpen}
-        className="rounded-full border border-slate-300 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 transition hover:border-emerald-400 hover:text-emerald-700 dark:border-slate-700 dark:bg-white/5 dark:text-slate-200 dark:hover:text-emerald-200">
-        Choose icon
-      </button>
-    </div>
+      </span>
+      <span className="text-xs">
+        <span className="block font-semibold text-slate-600 dark:text-slate-300">Icon</span>
+        <span className="block text-slate-500 dark:text-slate-400">Choose icon</span>
+      </span>
+    </button>
   );
 }
 
@@ -359,18 +529,61 @@ function IconPickerModal(props: { open: boolean; value: string; onPick: (icon: s
   );
 }
 
-// --- Register card --------------------------------------------------------
 
-function RegisterCard(props: {
+// --- Register editor (right pane) -----------------------------------------
+
+/** Offset field: shows the app address format, accepts decimal or 0x input. */
+function OffsetInput(props: { index: number; value: number; addrFmt: "dec" | "hex"; onChange: (n: number) => void }) {
+  const { index: i, value, addrFmt, onChange } = props;
+  const [draft, setDraft] = useState<string | null>(null);
+  const bad = draft !== null && parseOffset(draft) === null;
+  return (
+    <input aria-label={`Offset ${i}`} value={draft ?? formatOffset(value, addrFmt)}
+      aria-invalid={bad || undefined}
+      onFocus={() => setDraft(formatOffset(value, addrFmt))}
+      onChange={(e) => {
+        setDraft(e.target.value);
+        const n = parseOffset(e.target.value);
+        if (n !== null) onChange(n);
+      }}
+      onBlur={() => setDraft(null)}
+      className={`${inputCls} font-mono ${bad ? "border-rose-400" : ""}`} />
+  );
+}
+
+function RegisterEditor(props: {
   index: number;
   reg: TemplateRegister;
+  addrFmt: "dec" | "hex";
+  aliasRef: RefObject<HTMLInputElement | null>;
   onChange: (patch: Partial<TemplateRegister>) => void;
-  onRemove: () => void;
+  onScalingError: (error: string | null) => void;
 }) {
-  const { index: i, reg: r, onChange, onRemove } = props;
+  const { index: i, reg: r, addrFmt, aliasRef, onChange, onScalingError } = props;
   const isBit = r.bank === 1 || r.bank === 2;
   const isMulti = MULTI_WORD.has(r.dataType);
-  const typeOptions = isBit ? ["bool"] : r.valueSource === "hold" ? ["u16", "i16"] : NUMERIC_TYPES;
+  const typeOptions = r.valueSource === "hold" ? ["u16", "i16"] : NUMERIC_TYPES;
+
+  // Scaling is typed as text; invalid text keeps the stored value and blocks Save.
+  const [scalingText, setScalingText] = useState<ScalingText>(() => scalingTexts(r));
+  const scalingCheck = validateScaling(scalingText, isBit);
+  const draftError = scalingCheck.error;
+  useEffect(() => {
+    onScalingError(draftError);
+    return () => onScalingError(null);
+  }, [draftError, onScalingError]);
+  const editScaling = (field: keyof ScalingText, text: string) => {
+    setScalingText((prev) => ({ ...prev, [field]: text }));
+    // Values that fail validation stay in the field (with the error) but never reach the register.
+    const next = validateScaling({ ...scalingText, [field]: text }, false);
+    const fieldError = field === "scale" ? next.scaleError : field === "offset" ? next.offsetError : next.decimalsError;
+    if (fieldError) return;
+    const n = parseOptionalNumber(text);
+    if (n === undefined) return;
+    if (field === "scale") onChange({ scale: n ?? undefined });
+    else if (field === "offset") onChange({ scaleOffset: n ?? undefined });
+    else if (n === null || Number.isInteger(n)) onChange({ decimals: n ?? undefined });
+  };
 
   const changeBank = (bank: number) => {
     const patch: Partial<TemplateRegister> = { bank };
@@ -378,6 +591,9 @@ function RegisterCard(props: {
       // Bit banks only carry a boolean, driven by a fixed value.
       patch.dataType = "bool";
       patch.byteOrder = "ABCD";
+      // Bit banks carry no scaling.
+      Object.assign(patch, { scale: undefined, scaleOffset: undefined, decimals: undefined, unit: undefined });
+      setScalingText({ scale: "", offset: "", decimals: "" });
       if (r.valueSource !== "hold") { patch.valueSource = "hold"; patch.sourceParams = "{}"; }
     } else if (r.dataType === "bool") {
       patch.dataType = "u16";
@@ -400,57 +616,68 @@ function RegisterCard(props: {
   };
 
   return (
-    <div className="rounded-xl border border-slate-200 bg-slate-50/60 p-3 dark:border-slate-700 dark:bg-slate-800/40">
-      {/* Card header: index + alias + delete */}
-      <div className="mb-3 flex items-center gap-2">
-        <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-slate-200 text-xs font-semibold text-slate-600 dark:bg-slate-700 dark:text-slate-200">
-          {i + 1}
-        </span>
-        <input aria-label={`Alias ${i}`} placeholder="Alias (e.g. voltage_l1)" value={r.alias}
-          onChange={(e) => onChange({ alias: e.target.value })}
-          className="min-w-0 flex-1 rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 text-sm font-medium outline-none transition focus:border-emerald-500 focus:ring-2 focus:ring-emerald-500/20 dark:border-slate-700 dark:bg-slate-900" />
-        <button type="button" aria-label={`Remove register ${i}`} onClick={onRemove} title="Remove register"
-          className="shrink-0 rounded-lg p-2 text-rose-600 transition hover:bg-rose-500/10 dark:text-rose-300">
-          <FiTrash2 className="h-4 w-4" aria-hidden="true" />
-        </button>
+    <div className="space-y-4">
+      <div className="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
+        Register {i + 1}
       </div>
-
-      {/* Placement + type */}
-      <div className="grid grid-cols-2 gap-2.5 sm:grid-cols-4">
+      <div className="grid grid-cols-1 gap-3 @2xl:grid-cols-2">
+        <label className={`${labelCls} @2xl:col-span-2`}>Alias
+          <input ref={aliasRef} aria-label={`Alias ${i}`} placeholder={`Reg ${r.offset}`} value={r.alias}
+            onChange={(e) => onChange({ alias: e.target.value })} className={inputCls} />
+        </label>
         <label className={labelCls}>Offset
-          <input aria-label={`Offset ${i}`} type="number" min={0} value={r.offset}
-            onChange={(e) => onChange({ offset: Number(e.target.value) })} className={inputCls} />
+          <OffsetInput index={i} value={r.offset} addrFmt={addrFmt} onChange={(offset) => onChange({ offset })} />
         </label>
         <label className={labelCls}>Bank
           <select aria-label={`Bank ${i}`} value={r.bank} onChange={(e) => changeBank(Number(e.target.value))} className={inputCls}>
             {BANKS.map((b) => <option key={b.value} value={b.value}>{b.label}</option>)}
           </select>
         </label>
-        <label className={labelCls}>Type
-          <select aria-label={`Type ${i}`} value={r.dataType} disabled={isBit} onChange={(e) => changeType(e.target.value)}
-            className={`${inputCls} ${isBit ? "cursor-not-allowed opacity-60" : ""}`}>
-            {typeOptions.map((d) => <option key={d} value={d}>{d}</option>)}
-          </select>
-        </label>
-        <label className={labelCls}>Byte order
-          <select aria-label={`Order ${i}`} value={r.byteOrder} disabled={!isMulti}
-            onChange={(e) => onChange({ byteOrder: e.target.value })}
-            className={`${inputCls} ${!isMulti ? "cursor-not-allowed opacity-60" : ""}`}>
-            {BYTE_ORDERS.map((b) => <option key={b} value={b}>{b}</option>)}
+        <div className={labelCls}><span>Type</span>
+          {isBit ? (
+            <span className="px-0.5 py-1.5 text-sm font-normal text-slate-700 dark:text-slate-200">bit</span>
+          ) : (
+            <select aria-label={`Type ${i}`} value={r.dataType} onChange={(e) => changeType(e.target.value)} className={inputCls}>
+              {typeOptions.map((d) => <option key={d} value={d}>{d}</option>)}
+            </select>
+          )}
+        </div>
+        <div className={labelCls}><span>Byte order</span>
+          {isMulti ? (
+            <select aria-label={`Order ${i}`} value={r.byteOrder} onChange={(e) => onChange({ byteOrder: e.target.value })} className={inputCls}>
+              {BYTE_ORDERS.map((b) => <option key={b} value={b}>{b}</option>)}
+            </select>
+          ) : (
+            <span className="px-0.5 py-1.5 text-sm font-normal text-slate-500 dark:text-slate-400">—</span>
+          )}
+        </div>
+        <label className={`${labelCls} @2xl:col-span-2`}>Value source
+          <select aria-label={`Source ${i}`} value={r.valueSource} onChange={(e) => changeSource(e.target.value)} className={inputCls}>
+            {VALUE_SOURCES.map((s) => (
+              <option key={s.value} value={s.value} disabled={isBit && !s.bitOk}>{s.label}</option>
+            ))}
           </select>
         </label>
       </div>
 
-      {/* Value source */}
-      <label className={`${labelCls} mt-2.5`}>Value source
-        <select aria-label={`Source ${i}`} value={r.valueSource} onChange={(e) => changeSource(e.target.value)} className={inputCls}>
-          {VALUE_SOURCES.map((s) => (
-            <option key={s.value} value={s.value} disabled={isBit && !s.bitOk}>{s.label}</option>
-          ))}
-        </select>
-      </label>
+      {isBit ? null : (
+        <ScalingFields
+          dataType={r.dataType}
+          unit={r.unit}
+          onUnitChange={(u) => onChange({ unit: u === "" ? undefined : u })}
+          text={scalingText}
+          onTextChange={editScaling}
+          check={scalingCheck}
+          previewRaw={r.valueSource === "hold" ? r.holdValue ?? 0 : null}
+          nameSuffix={` ${i}`}
+          offsetName="Scaling offset"
+          unitInputId={`template-unit-${i}`}
+          labelClass={labelCls}
+          inputClass={inputCls}
+          className="space-y-2 rounded-lg border border-slate-200 p-3 dark:border-slate-800"
+        />
+      )}
 
-      {/* Parameters */}
       <ParamsEditor index={i} reg={r} isMulti={isMulti} onChange={(sourceParams) => onChange({ sourceParams })} />
     </div>
   );
@@ -491,6 +718,9 @@ function ParamsEditor(props: {
   };
 
   const hasParams = r.valueSource !== "hold";
+  // Generator/preset ranges are engineering values: label them with the unit.
+  const unitLabel = r.bank === 1 || r.bank === 2 ? "" : (r.unit ?? "").trim();
+  const unitSuffix = unitLabel ? ` (${unitLabel})` : "";
 
   return (
     <div className="mt-3 rounded-lg border border-slate-200 bg-white/70 p-3 dark:border-slate-700 dark:bg-slate-900/40">
@@ -523,9 +753,25 @@ function ParamsEditor(props: {
         </div>
       ) : (
         <ParamsForm index={i} source={r.valueSource} params={params} isMulti={isMulti} byteOrder={r.byteOrder}
-          patch={patch} setParams={(p) => onChange(JSON.stringify(p))} />
+          unitSuffix={unitSuffix} patch={patch} setParams={(p) => onChange(JSON.stringify(p))} />
       )}
     </div>
+  );
+}
+
+/** Period field with its own text draft so clearing it (to retype) doesn't snap back to 1000 mid-edit. */
+function GeneratorPeriod(props: { index: number; periodMs: unknown; onChange: (ms: number) => void }) {
+  const { index: i, periodMs, onChange } = props;
+  const [text, setText] = useState(() => String(numOr(periodMs, GENERATOR_DEFAULT_PERIOD_MS)));
+  return (
+    <label className={labelCls}>Period (ms)
+      <input aria-label={`Period ${i}`} type="number" min={0} value={text} placeholder={periodPlaceholder("generator")}
+        onChange={(e) => {
+          setText(e.target.value);
+          // Empty saves as the default period; the field stays empty while typing.
+          onChange(e.target.value === "" ? GENERATOR_DEFAULT_PERIOD_MS : Number(e.target.value));
+        }} className={inputCls} />
+    </label>
   );
 }
 
@@ -535,10 +781,12 @@ function ParamsForm(props: {
   params: Params;
   isMulti: boolean;
   byteOrder: string;
+  /** " (°C)" when the register has a unit, else "". */
+  unitSuffix: string;
   patch: (p: Params) => void;
   setParams: (p: Params) => void;
 }) {
-  const { index: i, source, params, isMulti, byteOrder, patch, setParams } = props;
+  const { index: i, source, params, isMulti, byteOrder, unitSuffix, patch, setParams } = props;
 
   if (source === "generator") {
     return (
@@ -548,15 +796,13 @@ function ParamsForm(props: {
             {GENERATOR_KINDS.map((k) => <option key={k} value={k}>{k}</option>)}
           </select>
         </label>
-        <label className={labelCls}>Min
+        <label className={labelCls}>{`Min${unitSuffix}`}
           <input aria-label={`Min ${i}`} type="number" value={numOr(params.min, 0)} onChange={(e) => patch({ min: Number(e.target.value) })} className={inputCls} />
         </label>
-        <label className={labelCls}>Max
+        <label className={labelCls}>{`Max${unitSuffix}`}
           <input aria-label={`Max ${i}`} type="number" value={numOr(params.max, 100)} onChange={(e) => patch({ max: Number(e.target.value) })} className={inputCls} />
         </label>
-        <label className={labelCls}>Period (ms)
-          <input aria-label={`Period ${i}`} type="number" min={0} value={numOr(params.periodMs, 1000)} onChange={(e) => patch({ periodMs: Number(e.target.value) })} className={inputCls} />
-        </label>
+        <GeneratorPeriod index={i} periodMs={params.periodMs} onChange={(periodMs) => patch({ periodMs })} />
       </div>
     );
   }
@@ -569,14 +815,19 @@ function ParamsForm(props: {
             {DEVICE_PRESETS.map((p) => <option key={p} value={p}>{p}</option>)}
           </select>
         </label>
-        <label className={labelCls}>Min
+        <label className={labelCls}>{`Min${unitSuffix}`}
           <input aria-label={`Min ${i}`} type="number" value={numOr(params.min, 0)} onChange={(e) => patch({ min: Number(e.target.value) })} className={inputCls} />
         </label>
-        <label className={labelCls}>Max
+        <label className={labelCls}>{`Max${unitSuffix}`}
           <input aria-label={`Max ${i}`} type="number" value={numOr(params.max, 100)} onChange={(e) => patch({ max: Number(e.target.value) })} className={inputCls} />
         </label>
         <label className={labelCls}>Period (ms)
-          <input aria-label={`Period ${i}`} type="number" min={0} value={numOr(params.periodMs, 1000)} onChange={(e) => patch({ periodMs: Number(e.target.value) })} className={inputCls} />
+          <input aria-label={`Period ${i}`} type="number" min={0} value={initialPeriodText("device", params)} placeholder={periodPlaceholder("device")}
+            onChange={(e) => {
+              // A preset only carries a period when the user types one.
+              if (e.target.value === "") { const { periodMs: _drop, ...rest } = params; setParams(rest); }
+              else patch({ periodMs: Number(e.target.value) });
+            }} className={inputCls} />
         </label>
       </div>
     );

@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { FiDownload, FiTrash2, FiUpload, FiX } from "react-icons/fi";
 import { useOutletContext } from "react-router-dom";
 
@@ -8,21 +8,21 @@ import { useToast } from "../../components/ToastProvider";
 import AddDeviceModal from "../components/AddDeviceModal";
 import TemplateEditorModal from "../components/TemplateEditorModal";
 import type { DeviceTemplate } from "../components/AddDeviceModal";
-import SimRegisterModal, { type SimRegister } from "../components/SimRegisterModal";
 import SimRuleModal, { type SimRule } from "../components/SimRuleModal";
 import ActivityTab from "../simulator/ActivityTab";
 import DevicesTab from "../simulator/DevicesTab";
 import LiveValuesTab from "../simulator/LiveValuesTab";
 import PromptDialog from "../simulator/PromptDialog";
-import RegisterInspector from "../simulator/RegisterInspector";
+import LiveRegisterInspector from "../simulator/LiveRegisterInspector";
 import RegistersTab from "../simulator/RegistersTab";
 import RulesTab from "../simulator/RulesTab";
 import SimFooterBar from "../simulator/SimFooterBar";
+import { fmtAddr } from "../simulator/ruleTargets";
+import { blankRegister } from "../simulator/simRegister";
 import SimStatusDashboard from "../simulator/SimStatusDashboard";
 import SimTabBar, { type TabKey } from "../simulator/SimTabBar";
 import { useSimulatorData, type PageRegister, type SimDevice } from "../simulator/useSimulatorData";
-import { useValueHistory } from "../simulator/useValueHistory";
-import { readAddressFormat, writeAddressFormat, type AddressFormat } from "../utils/simulatorPrefs";
+import { useAppAddressFormat } from "../utils/addressFormatPref";
 
 const TAB_KEY = (ws: string) => `sim.tab.${ws}`;
 function readTab(ws: string): TabKey {
@@ -59,9 +59,16 @@ export default function TcpSimulatorPage() {
   const { pushToast } = useToast();
 
   const [activeTab, setActiveTab] = useState<TabKey>(() => readTab(ws));
-  const [addrFmt, setAddrFmt] = useState<AddressFormat>(() => readAddressFormat(ws));
+  const [addrFmt, changeAddrFmt] = useAppAddressFormat();
   const [selectedRegisterId, setSelectedRegisterId] = useState<number | null>(null);
-  const [addRegisterOpen, setAddRegisterOpen] = useState(false);
+  // Blank "New register" draft shown in the inspector panel (null = none).
+  const [draft, setDraft] = useState<PageRegister | null>(null);
+  // Address of a just-created register to select once the reload lands.
+  const [pendingSelect, setPendingSelect] = useState<{ unitId: number; functionCode: number; address: number } | null>(null);
+  // True once Create was pressed on the draft: only then does a page error belong in the panel.
+  const [draftCreateTried, setDraftCreateTried] = useState(false);
+  const [inspectorDirty, setInspectorDirty] = useState(false);
+  const [pendingNav, setPendingNav] = useState<{ run: () => void; label: string } | null>(null);
   const [deviceModalOpen, setDeviceModalOpen] = useState(false);
   const [ruleModalOpen, setRuleModalOpen] = useState(false);
   const [modalRule, setModalRule] = useState<SimRule | null>(null);
@@ -73,25 +80,96 @@ export default function TcpSimulatorPage() {
   // template editor so the layout is visible and the key is clash-guarded.
   const [saveTemplateDraft, setSaveTemplateDraft] = useState<DeviceTemplate | null>(null);
 
-  const changeTab = useCallback((tab: TabKey) => { setActiveTab(tab); writeTab(ws, tab); }, [ws]);
-  const changeAddrFmt = useCallback((f: AddressFormat) => { setAddrFmt(f); writeAddressFormat(ws, f); }, [ws]);
+  // While a save dialog is open its own error shows inside it, not in the page banner.
+  const draftOwnsError = draft !== null && draftCreateTried;
+  const dialogOpen = draftOwnsError || deviceModalOpen || ruleModalOpen;
+  const dialogError = sim.error ? humanizeError(sim.error) : null;
+  const { setError: setSimError } = sim;
+  const openDialog = useCallback((open: () => void) => { setSimError(null); open(); }, [setSimError]);
+  const closeDialog = useCallback((close: () => void) => { setSimError(null); close(); }, [setSimError]);
 
+  // Run `run` now, or after the user confirms discarding unsaved inspector edits.
+  const guardDiscard = useCallback((run: () => void, label: string) => {
+    if (inspectorDirty) setPendingNav({ run, label });
+    else run();
+  }, [inspectorDirty]);
+
+  const applyTab = useCallback((tab: TabKey) => { setActiveTab(tab); writeTab(ws, tab); }, [ws]);
   const selectedRegister = useMemo<PageRegister | null>(
     () => sim.registers.find((r) => r.id === selectedRegisterId) ?? null,
     [sim.registers, selectedRegisterId],
   );
-  const selectedKey = selectedRegister
-    ? { unitId: selectedRegister.unitId, functionCode: selectedRegister.functionCode, address: selectedRegister.address }
-    : null;
-  const history = useValueHistory(sim.snapshot, selectedKey);
+  const inspectorRegister = draft ?? selectedRegister;
+  const inspectorLabel = draft
+    ? "the new register"
+    : selectedRegister
+      ? (selectedRegister.alias?.trim() || `unit ${selectedRegister.unitId} address ${fmtAddr(selectedRegister.address, addrFmt)}`)
+      : "this register";
+  const changeTab = useCallback((tab: TabKey) => {
+    if (tab === activeTab) return;
+    guardDiscard(() => applyTab(tab), inspectorLabel);
+  }, [activeTab, guardDiscard, applyTab, inspectorLabel]);
 
-  const liveValueOf = useCallback((r: PageRegister): string => {
-    const row = sim.snapshotFor(r.unitId, r.functionCode, r.address);
-    if (!row) return "—";
-    if (row.valueBit !== null && row.valueBit !== undefined) return row.valueBit ? "ON" : "OFF";
-    if (row.valueWord === null || row.valueWord === undefined) return "—";
-    return r.unit ? `${row.valueWord} ${r.unit}` : String(row.valueWord);
-  }, [sim.snapshotFor]);
+  // The draft's own address is "taken" by the register it just created for one
+  // render (before the panel swaps to it); hide that match so no false alert flashes.
+  const inspectorRegisters = useMemo(
+    () => !pendingSelect ? sim.registers : sim.registers.filter((r) => !(
+      r.unitId === pendingSelect.unitId && r.functionCode === pendingSelect.functionCode && r.address === pendingSelect.address
+    )),
+    [sim.registers, pendingSelect],
+  );
+
+  // Draft ended: forget that Create was tried.
+  useEffect(() => { if (!draft) setDraftCreateTried(false); }, [draft]);
+
+  // Below lg the inspector is a drawer: move focus into it when it opens.
+  const inspectorWrapRef = useRef<HTMLDivElement>(null);
+  const inspectorOpen = activeTab === "registers" && inspectorRegister !== null;
+  useEffect(() => {
+    if (!inspectorOpen) return;
+    const narrow = typeof window.matchMedia === "function" && window.matchMedia("(max-width: 1023.98px)").matches;
+    if (!narrow) return;
+    inspectorWrapRef.current?.querySelector<HTMLElement>(
+      'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [href], [tabindex]:not([tabindex="-1"])',
+    )?.focus();
+  }, [inspectorOpen]);
+
+  // After a successful Create, switch the panel to editing the new register.
+  useEffect(() => {
+    if (!pendingSelect) return;
+    const created = sim.registers.find(
+      (r) => r.unitId === pendingSelect.unitId && r.functionCode === pendingSelect.functionCode && r.address === pendingSelect.address,
+    );
+    if (!created) return;
+    setSelectedRegisterId(created.id);
+    setDraft(null);
+    setPendingSelect(null);
+  }, [pendingSelect, sim.registers]);
+
+  const closeInspector = useCallback(() => {
+    guardDiscard(() => { setDraft(null); setSelectedRegisterId(null); setSimError(null); }, inspectorLabel);
+  }, [guardDiscard, inspectorLabel, setSimError]);
+
+  const selectRegister = useCallback((r: PageRegister) => {
+    if (!draft && r.id === selectedRegisterId) return;
+    guardDiscard(() => { setDraft(null); setSimError(null); setSelectedRegisterId(r.id); }, inspectorLabel);
+  }, [draft, selectedRegisterId, guardDiscard, inspectorLabel, setSimError]);
+
+  const startNewRegister = useCallback(() => {
+    if (draft) return;
+    guardDiscard(() => { setSimError(null); setSelectedRegisterId(null); setDraft(blankRegister(sim.registers)); }, inspectorLabel);
+  }, [draft, guardDiscard, inspectorLabel, setSimError, sim.registers]);
+
+  const createRegister = useCallback(async (reg: PageRegister): Promise<boolean> => {
+    setSimError(null);
+    setDraftCreateTried(true);
+    // Mark the pending address up-front so the panel never sees the new register
+    // as a conflict with its own draft while the reload lands.
+    setPendingSelect({ unitId: reg.unitId, functionCode: reg.functionCode, address: reg.address });
+    const ok = await sim.addRegister(reg);
+    if (!ok) setPendingSelect(null);
+    return ok;
+  }, [sim, setSimError]);
 
   const deleteRegister = useCallback(async (id: number) => {
     await sim.deleteRegister(id);
@@ -147,7 +225,7 @@ export default function TcpSimulatorPage() {
         </div>
       </div>
 
-      {sim.error ? (
+      {sim.error && !dialogOpen ? (
         <div className="flex items-start justify-between gap-3 rounded-xl border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-800 dark:text-rose-200">
           <span>{humanizeError(sim.error)}</span>
           <button
@@ -169,9 +247,9 @@ export default function TcpSimulatorPage() {
         busy={sim.busy}
         onStart={() => void sim.start()}
         onStop={() => void sim.stop()}
-        onSaveConfig={(patch) => void sim.saveConfig(patch)}
+        onSaveConfig={(patch) => sim.saveConfig(patch)}
         onChangeExpose={(host) => void sim.saveConfig({ host })}
-        onChangePort={(port) => void sim.saveConfig({ port })}
+        onChangePort={(port) => sim.saveConfig({ port })}
         onRefresh={() => void sim.reload()}
         registerCount={sim.registers.length}
         unitCount={new Set(sim.registers.map((r) => r.unitId)).size}
@@ -188,13 +266,14 @@ export default function TcpSimulatorPage() {
               registers={sim.registers}
               devices={sim.devices}
               status={sim.status}
-              snapshotFor={sim.snapshotFor}
+              live={sim.live}
               addrFmt={addrFmt}
               onAddrFmt={changeAddrFmt}
-              onSelectRegister={(r) => setSelectedRegisterId(r.id)}
+              selectedId={selectedRegister?.id ?? null}
+              onSelectRegister={selectRegister}
               onDelete={(id) => setConfirmDeleteRegister(sim.registers.find((r) => r.id === id) ?? null)}
-              onAddRegister={() => setAddRegisterOpen(true)}
-              onAddDevice={() => setDeviceModalOpen(true)}
+              onAddRegister={startNewRegister}
+              onAddDevice={() => openDialog(() => setDeviceModalOpen(true))}
             />
           ) : null}
 
@@ -202,7 +281,9 @@ export default function TcpSimulatorPage() {
             <DevicesTab
               devices={sim.devices}
               registers={sim.registers}
-              onAddDevice={() => setDeviceModalOpen(true)}
+              templates={sim.deviceTemplates}
+              addrFmt={addrFmt}
+              onAddDevice={() => openDialog(() => setDeviceModalOpen(true))}
               onRename={handleRename}
               onRebase={handleRebase}
               onDelete={(device) => setConfirmDeleteDevice(device)}
@@ -214,15 +295,17 @@ export default function TcpSimulatorPage() {
             <RulesTab
               rules={sim.rules}
               devices={sim.devices}
-              onAdd={() => { setModalRule(null); setRuleModalOpen(true); }}
-              onEdit={(rule) => { setModalRule(rule); setRuleModalOpen(true); }}
+              registers={sim.registers}
+              addrFmt={addrFmt}
+              onAdd={() => openDialog(() => { setModalRule(null); setRuleModalOpen(true); })}
+              onEdit={(rule) => openDialog(() => { setModalRule(rule); setRuleModalOpen(true); })}
               onToggle={(rule, enabled) => void sim.updateRule({ ...rule, enabled })}
               onDelete={(id) => setConfirmDeleteRule(sim.rules.find((r) => r.id === id) ?? null)}
             />
           ) : null}
 
           {activeTab === "live" ? (
-            <LiveValuesTab registers={sim.registers} snapshotFor={sim.snapshotFor} status={sim.status} />
+            <LiveValuesTab registers={sim.registers} live={sim.live} status={sim.status} addrFmt={addrFmt} onStart={() => void sim.start()} busy={sim.busy} />
           ) : null}
 
           {activeTab === "activity" ? (
@@ -230,61 +313,83 @@ export default function TcpSimulatorPage() {
           ) : null}
         </div>
 
-        {activeTab === "registers" && selectedRegister ? (
-          <div className="w-full lg:w-96 lg:shrink-0">
-            <RegisterInspector
-              register={selectedRegister}
-              devices={sim.devices}
-              history={history}
-              liveValue={liveValueOf(selectedRegister)}
-              sourceStatus={sim.snapshotFor(selectedRegister.unitId, selectedRegister.functionCode, selectedRegister.address)?.sourceStatus}
-              running={sim.status.running}
-              onSave={(reg) => void sim.updateRegister(reg)}
-              onDuplicate={(reg) => void sim.duplicateRegister(reg)}
-              onDelete={(id) => setConfirmDeleteRegister(sim.registers.find((r) => r.id === id) ?? null)}
-              onClose={() => setSelectedRegisterId(null)}
-              onViewDevice={() => changeTab("devices")}
+        {activeTab === "registers" && inspectorRegister ? (
+          <>
+            {/* Below lg the inspector is a right-side drawer; the backdrop closes it. */}
+            <div
+              data-testid="inspector-backdrop"
+              aria-hidden="true"
+              onClick={closeInspector}
+              className="fixed inset-0 z-30 bg-slate-950/50 lg:hidden"
             />
-          </div>
+            <div ref={inspectorWrapRef} className="fixed inset-y-0 right-0 z-40 flex w-full max-w-md flex-col rounded-l-2xl bg-white shadow-2xl dark:bg-slate-900 lg:static lg:z-auto lg:block lg:w-96 lg:max-w-none lg:shrink-0 lg:self-start lg:rounded-none lg:bg-transparent lg:pb-2 lg:shadow-none dark:lg:bg-transparent lg:sticky lg:inset-auto lg:top-0">
+              <LiveRegisterInspector
+                live={sim.live}
+                selected={selectedRegister}
+                register={inspectorRegister}
+                devices={sim.devices}
+                registers={inspectorRegisters}
+                addrFmt={addrFmt}
+                running={sim.status.running}
+                error={draftOwnsError ? dialogError : null}
+                onSave={(reg) => sim.updateRegister(reg)}
+                onCreate={createRegister}
+                onDuplicate={(reg) => void sim.duplicateRegister(reg)}
+                onDelete={(id) => setConfirmDeleteRegister(sim.registers.find((r) => r.id === id) ?? null)}
+                onClose={closeInspector}
+                onDirtyChange={setInspectorDirty}
+                onViewDevice={() => changeTab("devices")}
+              />
+            </div>
+          </>
         ) : null}
       </div>
 
       <SimFooterBar status={sim.status} config={sim.config} lastUpdated={sim.lastUpdated} />
 
-      <SimRegisterModal
-        open={addRegisterOpen}
-        initial={null}
-        onClose={() => setAddRegisterOpen(false)}
-        onSubmit={async (reg: SimRegister) => { await sim.addRegister(reg); setAddRegisterOpen(false); }}
-      />
-
       <AddDeviceModal
         open={deviceModalOpen}
         templates={sim.deviceTemplates}
         existingRegisters={sim.registers}
-        onClose={() => setDeviceModalOpen(false)}
+        error={dialogError}
+        onClose={() => closeDialog(() => setDeviceModalOpen(false))}
         onSubmit={async (payload) => {
           // "Workspace" slave devices aren't in the shared catalog — their route
           // map is inline on the selected template, so add them via the inline path.
           const tpl = sim.deviceTemplates.find((t) => t.templateKey === payload.templateKey);
-          if (tpl && payload.templateKey.startsWith("ws-slave:")) {
-            await sim.addSlaveDevice(tpl, payload);
-          } else {
-            await sim.addDevice(payload);
-          }
-          setDeviceModalOpen(false);
+          const ok = tpl && payload.templateKey.startsWith("ws-slave:")
+            ? await sim.addSlaveDevice(tpl, payload)
+            : await sim.addDevice(payload);
+          if (ok) setDeviceModalOpen(false);
         }}
       />
 
       <SimRuleModal
         open={ruleModalOpen}
         initial={modalRule}
-        onClose={() => setRuleModalOpen(false)}
+        registers={sim.registers}
+        addrFmt={addrFmt}
+        error={dialogError}
+        onClose={() => closeDialog(() => setRuleModalOpen(false))}
         onSubmit={async (rule: SimRule) => {
-          if (rule.id) await sim.updateRule(rule);
-          else await sim.addRule(rule);
-          setRuleModalOpen(false);
+          const ok = rule.id ? await sim.updateRule(rule) : await sim.addRule(rule);
+          if (ok) setRuleModalOpen(false);
         }}
+      />
+
+      <ConfirmDialog
+        open={pendingNav !== null}
+        title="Discard changes"
+        description={<p>Discard changes to <span className="font-semibold text-emerald-700 dark:text-emerald-300">{pendingNav?.label}</span>?</p>}
+        confirmText="Discard"
+        cancelText="Keep editing"
+        onConfirm={() => {
+          const nav = pendingNav;
+          setPendingNav(null);
+          setInspectorDirty(false);
+          nav?.run();
+        }}
+        onClose={() => setPendingNav(null)}
       />
 
       <PromptDialog
@@ -355,7 +460,7 @@ export default function TcpSimulatorPage() {
         description={(() => {
           if (!confirmDeleteRegister) return null;
           const r = confirmDeleteRegister;
-          const label = r.alias?.trim() ? r.alias.trim() : `unit ${r.unitId}, address ${r.address}`;
+          const label = r.alias?.trim() ? r.alias.trim() : `unit ${r.unitId}, address ${fmtAddr(r.address, addrFmt)}`;
           const lastOfDevice =
             r.deviceInstanceId != null &&
             sim.registers.filter((x) => x.deviceInstanceId === r.deviceInstanceId).length === 1;
@@ -386,6 +491,7 @@ export default function TcpSimulatorPage() {
         initial={saveTemplateDraft}
         forceNew
         takenKeys={sim.deviceTemplates.map((t) => t.templateKey)}
+        categories={sim.deviceTemplates.map((t) => t.category)}
         onClose={() => setSaveTemplateDraft(null)}
         onSave={async (t) => {
           const ok = await sim.saveCustomTemplate(t);

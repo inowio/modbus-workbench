@@ -26,10 +26,19 @@ pub(crate) fn ensure_workspace_db(workspace_folder: &PathBuf, db_file: &str) -> 
     let conn = Connection::open(&db_path)
         .map_err(|e| format!("failed to open workspace db {:?}: {e}", db_path))?;
 
+    // Wait for another connection's lock instead of failing the schema setup or the
+    // one-time analyzer migration with "database is locked". 5000 ms = rusqlite's own
+    // default, which this function relied on in 0.5.0 (regular connections keep 2000 ms).
+    conn.execute_batch("PRAGMA busy_timeout = 5000;")
+        .map_err(|e| format!("failed to set busy_timeout: {e}"))?;
     conn.execute_batch("PRAGMA foreign_keys = ON;")
         .map_err(|e| format!("failed to enable foreign_keys: {e}"))?;
     conn.execute_batch("PRAGMA journal_mode = WAL;")
         .map_err(|e| format!("failed to enable WAL mode: {e}"))?;
+
+    // analyzer_signals shape lives in one place (shared with the migration rebuild).
+    conn.execute_batch(&crate::analyzer_migrate::analyzer_signals_ddl("analyzer_signals"))
+        .map_err(|e| format!("failed to create analyzer_signals: {e}"))?;
 
     // Single-shot schema for MVP: create all tables/indexes if they don't exist.
     conn.execute_batch(
@@ -137,21 +146,6 @@ pub(crate) fn ensure_workspace_db(workspace_folder: &PathBuf, db_file: &str) -> 
           FOREIGN KEY(tile_id) REFERENCES analyzer_tiles(id) ON DELETE CASCADE
         );
 
-        CREATE TABLE IF NOT EXISTS analyzer_signals (
-          id TEXT PRIMARY KEY,
-          slave_id INTEGER NOT NULL,
-          connection_kind TEXT NOT NULL,
-          function_kind TEXT NOT NULL,
-          register_row_id INTEGER NOT NULL,
-          decoder_json TEXT NOT NULL DEFAULT '',
-          last_value_json TEXT,
-          last_updated_ts_ms INTEGER,
-          state TEXT NOT NULL DEFAULT 'DISCONNECTED',
-          error_json TEXT,
-          FOREIGN KEY(slave_id) REFERENCES slaves(id) ON DELETE RESTRICT,
-          FOREIGN KEY(register_row_id) REFERENCES slave_register_rows(id) ON DELETE RESTRICT
-        );
-
         CREATE INDEX IF NOT EXISTS idx_analyzer_signals_slave
           ON analyzer_signals(slave_id);
 
@@ -194,6 +188,9 @@ pub(crate) fn ensure_workspace_db(workspace_folder: &PathBuf, db_file: &str) -> 
             byte_order TEXT,
             display_format TEXT,
             unit TEXT,
+            scale REAL,
+            scale_offset REAL,
+            decimals INTEGER,
             value_source TEXT NOT NULL DEFAULT 'hold',
             source_params TEXT,
             interval_ms INTEGER,
@@ -214,10 +211,18 @@ pub(crate) fn ensure_workspace_db(workspace_folder: &PathBuf, db_file: &str) -> 
     )
     .map_err(|e| format!("failed to initialize workspace db schema: {e}"))?;
 
+    // One-time rebuild of pre-0.6.0 `analyzer_signals` (adds `kind`, nullable
+    // register columns) and creation of `analyzer_signal_inputs`.
+    crate::analyzer_migrate::migrate_analyzer_signals_kind(&conn)?;
+
+    // Analyzer tabs: create `analyzer_tabs`, add `analyzer_tiles.tab_id`, put
+    // existing tiles in "Main", and back-fill any NULL `tab_id`.
+    crate::analyzer_migrate::migrate_analyzer_tabs(&conn)?;
+
     // Idempotent dev-DB migration: older workspace DBs were created before
     // `unit`/`display_format` existed on `sim_registers`. Ignore the error
     // when the column is already present.
-    for col in ["unit TEXT", "display_format TEXT"] {
+    for col in ["unit TEXT", "display_format TEXT", "scale REAL", "scale_offset REAL", "decimals INTEGER"] {
         let _ = conn.execute(&format!("ALTER TABLE sim_registers ADD COLUMN {col}"), []);
     }
 

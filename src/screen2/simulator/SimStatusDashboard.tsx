@@ -1,8 +1,11 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { FiRefreshCw } from "react-icons/fi";
+
+import { fmtDuration, useNow } from "./useNow";
 
 type SimConfig = { enabled: boolean; host: string; port: number; tickMs: number };
 type ListenInfo = { bound: string; port: number; addresses: string[] };
-type SimStatus = { running: boolean; listen: ListenInfo | null; clientCount: number };
+type SimStatus = { running: boolean; listen: ListenInfo | null; clientCount: number; startedAtMs?: number | null };
 
 type Props = {
   config: SimConfig | null;
@@ -11,16 +14,77 @@ type Props = {
   busy: boolean;
   onStart: () => void;
   onStop: () => void;
-  onSaveConfig: (patch: Partial<SimConfig>) => void;
+  /** May resolve false when the backend rejects the value (the draft then reverts). */
+  onSaveConfig: (patch: Partial<SimConfig>) => CommitResult;
   onChangeExpose: (host: string) => void;
-  onChangePort: (port: number) => void;
+  onChangePort: (port: number) => CommitResult;
   onRefresh: () => void;
   registerCount: number;
   unitCount: number;
   deviceCount: number;
 };
 
+type CommitResult = void | boolean | Promise<void | boolean>;
+
 const CARD_CLASS = "rounded-2xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-white/5";
+
+/**
+ * Integer input that edits a local draft and commits only on blur/Enter when
+ * the draft is valid. Escape reverts. Invalid drafts show a red border + message.
+ * A commit that resolves `false` (backend rejected it) reverts the draft to the
+ * saved value. `value: null` (config not loaded yet) shows an empty, disabled,
+ * unvalidated field.
+ */
+function DraftIntInput({
+  value, min, max, label, message, className, disabled, onCommit,
+}: {
+  value: number | null;
+  min: number;
+  max: number;
+  label: string;
+  message: string;
+  className: string;
+  disabled?: boolean;
+  onCommit: (n: number) => CommitResult;
+}) {
+  const saved = value === null ? "" : String(value);
+  const [draft, setDraft] = useState(saved);
+  useEffect(() => { setDraft(saved); }, [saved]);
+
+  const loading = value === null;
+  const trimmed = draft.trim();
+  const n = Number(trimmed);
+  const valid = /^\d+$/.test(trimmed) && n >= min && n <= max;
+  const invalid = !loading && !valid;
+
+  const commit = () => {
+    if (loading || !valid || n === value) return;
+    void Promise.resolve(onCommit(n)).then((ok) => {
+      if (ok === false) setDraft(saved);
+    });
+  };
+
+  return (
+    <>
+      <input
+        type="text"
+        inputMode="numeric"
+        aria-label={label}
+        aria-invalid={invalid ? "true" : undefined}
+        className={`${className} ${invalid ? "border-rose-500 dark:border-rose-500" : "border-slate-300 dark:border-slate-700"}`}
+        value={draft}
+        disabled={disabled || loading}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={commit}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") { e.preventDefault(); commit(); }
+          else if (e.key === "Escape") { e.preventDefault(); setDraft(saved); }
+        }}
+      />
+      {invalid ? <span role="alert" className="text-xs text-rose-600 dark:text-rose-300">{message}</span> : null}
+    </>
+  );
+}
 
 export default function SimStatusDashboard({
   config,
@@ -40,8 +104,11 @@ export default function SimStatusDashboard({
   const [addressesExpanded, setAddressesExpanded] = useState(false);
 
   const host = config?.host ?? "0.0.0.0";
-  const port = config?.port ?? 502;
+  const port = config ? config.port : null;
   const effectiveListen = status.listen ?? listen;
+  const now = useNow(status.running);
+  const uptime = status.running && status.startedAtMs ? fmtDuration(now - status.startedAtMs) : "—";
+  const exposeLabel = host === "127.0.0.1" ? "Local only" : "LAN / Intranet";
 
   return (
     <div className="space-y-4">
@@ -83,7 +150,9 @@ export default function SimStatusDashboard({
               ) : null}
             </div>
           ) : (
-            <p className="mt-1 text-sm text-slate-600 dark:text-slate-300">&mdash;</p>
+            <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">
+              Not listening — Start to expose on {exposeLabel}{port !== null ? `:${port}` : ""}
+            </p>
           )}
         </div>
 
@@ -93,24 +162,10 @@ export default function SimStatusDashboard({
           <p className="mt-1 text-sm text-slate-900 dark:text-slate-100">{status.clientCount}</p>
         </div>
 
-        {/* Tick Interval */}
+        {/* Uptime */}
         <div className={CARD_CLASS}>
-          <span className="text-xs font-semibold text-slate-500 dark:text-slate-400">Tick Interval</span>
-          {status.running ? (
-            <p className="mt-1 text-sm text-slate-900 dark:text-slate-100">{config?.tickMs ?? 0} ms</p>
-          ) : (
-            <label className="mt-1 flex items-center gap-2 text-sm">
-              <input
-                type="number"
-                aria-label="Tick interval (ms)"
-                className="min-w-0 flex-1 rounded-lg border border-slate-300 bg-white px-2 py-1 dark:border-slate-700 dark:bg-slate-900"
-                value={config?.tickMs ?? 0}
-                min={1}
-                onChange={(e) => onSaveConfig({ tickMs: Number(e.target.value) })}
-              />
-              <span className="shrink-0 text-slate-500 dark:text-slate-400">ms</span>
-            </label>
-          )}
+          <span className="text-xs font-semibold text-slate-500 dark:text-slate-400">Uptime</span>
+          <p data-testid="uptime-value" className="mt-1 text-sm tabular-nums text-slate-900 dark:text-slate-100">{uptime}</p>
         </div>
       </div>
 
@@ -138,16 +193,31 @@ export default function SimStatusDashboard({
 
           <label className="flex items-center gap-2 text-sm">
             Port
-            <input
-              type="number"
-              aria-label="Port"
-              className="w-24 rounded-lg border border-slate-300 bg-white px-2 py-1 dark:border-slate-700 dark:bg-slate-900"
+            <DraftIntInput
+              label="Port"
               value={port}
               min={1}
               max={65535}
+              message="Enter 1–65535."
+              className="w-24 rounded-lg border bg-white px-2 py-1 dark:bg-slate-900"
               disabled={status.running}
-              onChange={(e) => onChangePort(Number(e.target.value))}
+              onCommit={onChangePort}
             />
+          </label>
+
+          <label className="flex items-center gap-2 text-sm">
+            Tick
+            <DraftIntInput
+              label="Tick interval (ms)"
+              value={config ? config.tickMs : null}
+              min={10}
+              max={60000}
+              message="Enter 10–60000 ms."
+              className="w-20 rounded-lg border bg-white px-2 py-1 dark:bg-slate-900"
+              disabled={status.running}
+              onCommit={(tickMs) => onSaveConfig({ tickMs })}
+            />
+            <span className="text-slate-500 dark:text-slate-400">ms</span>
           </label>
 
           {status.running ? (
@@ -173,10 +243,11 @@ export default function SimStatusDashboard({
           <button
             type="button"
             aria-label="Refresh"
+            title="Refresh"
             onClick={onRefresh}
-            className="ml-auto rounded-full border border-slate-300 bg-white px-3 py-1.5 text-sm font-semibold text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-white/5"
+            className="ml-auto rounded-full border border-slate-300 bg-white p-2 text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-white/5"
           >
-            Refresh
+            <FiRefreshCw className="h-4 w-4" aria-hidden="true" />
           </button>
         </div>
       </div>

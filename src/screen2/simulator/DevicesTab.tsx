@@ -1,6 +1,9 @@
 import { useEffect, useRef, useState } from "react";
 
+import type { DeviceTemplate } from "../components/AddDeviceModal";
+import { fmtAddr, type AddrFmt } from "./ruleTargets";
 import type { PageRegister } from "./simFilters";
+import { wordSpan } from "./useSimulatorData";
 
 export type SimDevice = {
   id: number;
@@ -14,6 +17,9 @@ export type SimDevice = {
 export type DevicesTabProps = {
   devices: SimDevice[];
   registers: PageRegister[];
+  /** Loaded device templates (built-in, custom and workspace) for name/icon lookup. */
+  templates?: DeviceTemplate[];
+  addrFmt?: AddrFmt;
   onAddDevice: () => void;
   onRename: (device: SimDevice) => void;
   onRebase: (device: SimDevice) => void;
@@ -32,9 +38,27 @@ function deviceIcon(templateKey: string): string {
   return TEMPLATE_ICON[templateKey] ?? "📟";
 }
 
+const BANK_LABEL: Record<number, string> = { 1: "Coil", 2: "Discrete", 3: "Holding", 4: "Input" };
+
+/** "Holding 0x0101–0x0102 · Input 0x0001" — the actual address span per bank. */
+function rangeSummary(regs: PageRegister[], fmt: AddrFmt): string {
+  const banks = new Map<number, { lo: number; hi: number }>();
+  for (const r of regs) {
+    const hi = r.address + wordSpan(r.dataType) - 1;
+    const cur = banks.get(r.functionCode);
+    banks.set(r.functionCode, cur ? { lo: Math.min(cur.lo, r.address), hi: Math.max(cur.hi, hi) } : { lo: r.address, hi });
+  }
+  return [...banks.entries()]
+    .sort(([a], [b]) => a - b)
+    .map(([fc, { lo, hi }]) => `${BANK_LABEL[fc] ?? `FC${fc}`} ${fmtAddr(lo, fmt)}${hi > lo ? `–${fmtAddr(hi, fmt)}` : ""}`)
+    .join(" · ");
+}
+
 export default function DevicesTab({
   devices,
   registers,
+  templates = [],
+  addrFmt = "dec",
   onAddDevice,
   onRename,
   onRebase,
@@ -89,7 +113,16 @@ export default function DevicesTab({
       ) : (
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
           {devices.map((d) => {
-            const count = registers.filter((r) => r.deviceInstanceId === d.id).length;
+            const devRegs = registers.filter((r) => r.deviceInstanceId === d.id);
+            const count = devRegs.length;
+            const tpl = templates.find((t) => t.templateKey === d.templateKey);
+            const ranges = rangeSummary(devRegs, addrFmt);
+            const isWorkspaceRouted = d.templateKey.startsWith("ws-slave:");
+            const summary = [
+              `Unit ${d.unitId}`,
+              ranges,
+              isWorkspaceRouted ? "" : `Base ${fmtAddr(d.baseAddress, addrFmt)}`,
+            ].filter(Boolean).join(" · ");
             return (
               <div
                 key={d.id}
@@ -97,7 +130,7 @@ export default function DevicesTab({
               >
                 <div className="flex items-start justify-between gap-2">
                   <div className="flex min-w-0 items-center gap-2">
-                    <span className="text-lg" aria-hidden="true">{deviceIcon(d.templateKey)}</span>
+                    <span className="text-lg" aria-hidden="true">{tpl?.icon || deviceIcon(d.templateKey)}</span>
                     <span className="truncate font-bold text-slate-900 dark:text-slate-100">{d.name}</span>
                   </div>
                   <div className="relative shrink-0" ref={openMenuId === d.id ? menuRef : undefined}>
@@ -151,10 +184,8 @@ export default function DevicesTab({
                 </div>
 
                 <div className="mt-2 space-y-1 text-xs text-slate-500 dark:text-slate-400">
-                  <div>{d.templateKey}</div>
-                  <div>
-                    Unit {d.unitId} · Base {d.baseAddress}
-                  </div>
+                  {tpl ? <div>{tpl.name}</div> : null}
+                  <div>{summary}</div>
                   <div>{count} registers</div>
                 </div>
               </div>

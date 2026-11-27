@@ -1,8 +1,9 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { StrictMode } from "react";
+import { MemoryRouter, Route, Routes, useNavigate, useOutletContext } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import Screen2Layout from "./Screen2Layout";
+import Screen2Layout, { type Screen2OutletContext } from "./Screen2Layout";
 
 const invokeMock = vi.fn();
 const listenMock = vi.fn();
@@ -77,8 +78,7 @@ function setupInvoke(options?: { logsPaneOpen?: boolean }) {
         return Promise.resolve();
       case "prune_app_logs":
         return Promise.resolve();
-      case "modbus_tcp_disconnect":
-      case "modbus_rtu_disconnect":
+      case "close_workspace_connections":
         return Promise.resolve();
       default:
         return Promise.resolve(null);
@@ -87,7 +87,10 @@ function setupInvoke(options?: { logsPaneOpen?: boolean }) {
 }
 
 describe("Screen2Layout", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
+    // The previous test's unmount schedules its deferred workspace close a tick
+    // later; let it run before the mocks are cleared so it isn't counted here.
+    await new Promise((r) => setTimeout(r, 0));
     vi.clearAllMocks();
     listWorkspaceLogsMock.mockResolvedValue([]);
     listAppLogsMock.mockResolvedValue([]);
@@ -123,5 +126,107 @@ describe("Screen2Layout", () => {
         }),
       ),
     );
+  });
+
+  it("Exit Workspace closes the workspace's connections (polling, simulator, serial port)", async () => {
+    setupInvoke();
+    render(
+      <MemoryRouter initialEntries={["/app/UnitTest/workspace"]}>
+        <Routes>
+          <Route path="/app/:workspaceName/*" element={<Screen2Layout />}>
+            <Route path="workspace" element={<div />} />
+          </Route>
+          <Route path="/" element={<div>Picker</div>} />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    const [exitButton] = await screen.findAllByRole("button", { name: /exit workspace/i });
+    fireEvent.click(exitButton);
+
+    await screen.findByText("Picker");
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("close_workspace_connections", { name: "UnitTest" }),
+    );
+    const closes = invokeMock.mock.calls.filter(([cmd]) => cmd === "close_workspace_connections");
+    expect(closes).toHaveLength(1);
+  });
+
+  it("moving between pages inside a workspace keeps its connections open", async () => {
+    setupInvoke();
+    function GoToAnalyzer() {
+      const navigate = useNavigate();
+      return <button type="button" onClick={() => navigate("/app/UnitTest/analyzer")}>Go analyzer</button>;
+    }
+    render(
+      <MemoryRouter initialEntries={["/app/UnitTest/workspace"]}>
+        <Routes>
+          <Route path="/app/:workspaceName/*" element={<Screen2Layout />}>
+            <Route path="workspace" element={<GoToAnalyzer />} />
+            <Route path="analyzer" element={<div>Analyzer page</div>} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: "Go analyzer" }));
+    await screen.findByText("Analyzer page");
+    await new Promise((r) => setTimeout(r, 20));
+    expect(invokeMock).not.toHaveBeenCalledWith("close_workspace_connections", expect.anything());
+  });
+
+  it("a remount of the same workspace (React StrictMode) does not close its connections", async () => {
+    setupInvoke();
+    render(
+      <StrictMode>
+        <MemoryRouter initialEntries={["/app/UnitTest/workspace"]}>
+          <Routes>
+            <Route path="/app/:workspaceName/*" element={<Screen2Layout />}>
+              <Route path="workspace" element={<div>Workspace page</div>} />
+            </Route>
+          </Routes>
+        </MemoryRouter>
+      </StrictMode>,
+    );
+    await screen.findByText("Workspace page");
+    await new Promise((r) => setTimeout(r, 20));
+    expect(invokeMock).not.toHaveBeenCalledWith("close_workspace_connections", expect.anything());
+  });
+
+  it("focus mode hides the sidebar navigation and the app header", async () => {
+    setupInvoke();
+    function FocusChild() {
+      const { setFocusMode } = useOutletContext<Screen2OutletContext>();
+      return (
+        <>
+          <button type="button" onClick={() => setFocusMode?.(true)}>Enter focus</button>
+          <button type="button" onClick={() => setFocusMode?.(false)}>Leave focus</button>
+        </>
+      );
+    }
+    render(
+      <MemoryRouter initialEntries={["/app/UnitTest/analyzer"]}>
+        <Routes>
+          <Route path="/app/:workspaceName/*" element={<Screen2Layout />}>
+            <Route path="analyzer" element={<FocusChild />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    await screen.findByRole("button", { name: "Enter focus" });
+    expect(screen.getByRole("link", { name: "Workspace" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Analyzer" })).toBeInTheDocument();
+    expect(screen.getByRole("banner")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Enter focus" }));
+    expect(screen.queryByRole("link", { name: "Workspace" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: "Analyzer" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("banner")).not.toBeInTheDocument();
+    expect(screen.getByRole("main")).not.toHaveClass("sm:px-4");
+
+    fireEvent.click(screen.getByRole("button", { name: "Leave focus" }));
+    expect(screen.getByRole("link", { name: "Workspace" })).toBeInTheDocument();
+    expect(screen.getByRole("banner")).toBeInTheDocument();
   });
 });

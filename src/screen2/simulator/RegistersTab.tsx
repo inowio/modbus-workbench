@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { FiChevronLeft, FiChevronRight, FiTrash2, FiX } from "react-icons/fi";
 
-import type { SimDevice, SimStatus, SnapshotRow } from "./useSimulatorData";
+import { useLiveRegister, type LiveStore } from "./liveValues";
+import type { SimDevice, SimStatus } from "./useSimulatorData";
 import {
   ALL_COLUMNS,
   EMPTY_FILTER,
@@ -15,6 +16,7 @@ import {
   type PageRegister,
   type RegisterFilter,
 } from "./simFilters";
+import { sourceSummary } from "./sourceParams";
 
 const FC_LABEL: Record<number, string> = { 1: "Coil", 2: "Discrete", 3: "Holding", 4: "Input" };
 const SOURCE_OPTIONS = ["hold", "device", "generator", "route"];
@@ -38,6 +40,22 @@ const COLUMN_LABEL: Record<ColumnKey, string> = {
   device: "Device",
 };
 
+/** One live value: scaled text plus the source-status badge; redraws only when this register's value changes. */
+export function LiveValueCell({ live, reg }: { live: LiveStore; reg: PageRegister }) {
+  const { text, sourceStatus } = useLiveRegister(live, reg);
+  const badgeCls = sourceStatus ? SOURCE_STATUS_STYLE[sourceStatus] ?? "bg-slate-500/15 text-slate-700 dark:text-slate-300" : null;
+  return (
+    <span>
+      {text}
+      {sourceStatus ? (
+        <span className={`ml-1.5 inline-block rounded-full px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${badgeCls}`}>
+          {sourceStatus}
+        </span>
+      ) : null}
+    </span>
+  );
+}
+
 function fmtAddr(a: number, addrFmt: "dec" | "hex"): string {
   return addrFmt === "hex" ? `0x${a.toString(16).toUpperCase().padStart(4, "0")}` : String(a);
 }
@@ -52,9 +70,11 @@ export type RegistersTabProps = {
   registers: PageRegister[];
   devices: SimDevice[];
   status: SimStatus;
-  snapshotFor: (u: number, fc: number, a: number) => SnapshotRow | undefined;
+  live: LiveStore;
   addrFmt: "dec" | "hex";
   onAddrFmt: (f: "dec" | "hex") => void;
+  /** Currently open register (highlighted row). */
+  selectedId?: number | null;
   onSelectRegister: (reg: PageRegister) => void;
   onDelete: (id: number) => void;
   onAddRegister: () => void;
@@ -67,9 +87,10 @@ export default function RegistersTab(props: RegistersTabProps) {
     registers,
     devices,
     status,
-    snapshotFor,
+    live,
     addrFmt,
     onAddrFmt,
+    selectedId = null,
     onSelectRegister,
     onDelete,
     onAddRegister,
@@ -107,7 +128,9 @@ export default function RegistersTab(props: RegistersTabProps) {
     [registers]
   );
 
-  const filtered = useMemo(() => filterRegisters(registers, filter), [registers, filter]);
+  const deviceNames = useMemo(() => new Map(devices.map((d) => [d.id, d.name])), [devices]);
+
+  const filtered = useMemo(() => filterRegisters(registers, filter, addrFmt), [registers, filter, addrFmt]);
   const total = filtered.length;
   const pageCount = Math.max(1, Math.ceil(total / pageSize));
   const clampedPage = Math.min(page, pageCount - 1);
@@ -135,22 +158,10 @@ export default function RegistersTab(props: RegistersTabProps) {
   };
 
   const liveValueCell = (r: PageRegister) => {
-    if (!status.running) return <span>&mdash;</span>;
-    const row = snapshotFor(r.unitId, r.functionCode, r.address);
-    if (!row) return <span>&mdash;</span>;
-    const text = row.valueBit !== null ? (row.valueBit ? "ON" : "OFF") : row.valueWord === null ? "—" : String(row.valueWord);
-    const sourceStatus = row.sourceStatus;
-    const badgeCls = sourceStatus ? SOURCE_STATUS_STYLE[sourceStatus] ?? "bg-slate-500/15 text-slate-700 dark:text-slate-300" : null;
-    return (
-      <span>
-        {text}
-        {sourceStatus ? (
-          <span className={`ml-1.5 inline-block rounded-full px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${badgeCls}`}>
-            {sourceStatus}
-          </span>
-        ) : null}
-      </span>
-    );
+    if (!status.running) {
+      return <span className="text-xs text-slate-500 dark:text-slate-400">{sourceSummary(r, addrFmt)}</span>;
+    }
+    return <LiveValueCell live={live} reg={r} />;
   };
 
   const renderCell = (col: ColumnKey, r: PageRegister) => {
@@ -178,7 +189,7 @@ export default function RegistersTab(props: RegistersTabProps) {
       case "value":
         return liveValueCell(r);
       case "device":
-        return devices.find((d) => d.id === r.deviceInstanceId)?.name ?? "—";
+        return (r.deviceInstanceId != null ? deviceNames.get(r.deviceInstanceId) : undefined) ?? "—";
       default:
         return null;
     }
@@ -323,7 +334,7 @@ export default function RegistersTab(props: RegistersTabProps) {
       </div>
 
       <p className="text-xs text-slate-500 dark:text-slate-400">
-        Device/Generator registers begin updating after Start; changes apply on next Start.
+        Register edits apply immediately, even while running.
       </p>
 
       {registers.length === 0 ? (
@@ -367,8 +378,21 @@ export default function RegistersTab(props: RegistersTabProps) {
               {pageRows.map((r) => (
                 <tr
                   key={r.id}
-                  className="cursor-pointer border-t border-slate-100 hover:bg-slate-50 dark:border-slate-800 dark:hover:bg-white/5"
+                  tabIndex={0}
+                  aria-current={r.id === selectedId ? "true" : undefined}
+                  className={`cursor-pointer border-t border-slate-100 outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-emerald-500 dark:border-slate-800 ${
+                    r.id === selectedId
+                      ? "bg-emerald-500/10 hover:bg-emerald-500/15 dark:bg-emerald-500/15"
+                      : "hover:bg-slate-50 dark:hover:bg-white/5"
+                  }`}
                   onClick={() => onSelectRegister(r)}
+                  onKeyDown={(e) => {
+                    if (e.target !== e.currentTarget) return;
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.preventDefault();
+                      onSelectRegister(r);
+                    }
+                  }}
                 >
                   {columns.map((col) => (
                     <td key={col} className="px-2 py-1.5">

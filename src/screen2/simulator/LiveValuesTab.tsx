@@ -1,15 +1,8 @@
 import { useMemo, useState } from "react";
 
-import type { PageRegister } from "./simFilters";
-
-export type SnapshotRow = {
-  unitId: number;
-  functionCode: number;
-  address: number;
-  valueWord: number | null;
-  valueBit: boolean | null;
-  sourceStatus?: string | null;
-};
+import { fmtAddr } from "./ruleTargets";
+import { useLiveRegister, type LiveStore } from "./liveValues";
+import { addressMatches, type PageRegister } from "./simFilters";
 
 export type SimStatus = {
   running: boolean;
@@ -19,8 +12,12 @@ export type SimStatus = {
 
 type Props = {
   registers: PageRegister[];
-  snapshotFor: (unitId: number, functionCode: number, address: number) => SnapshotRow | undefined;
+  live: LiveStore;
   status: SimStatus;
+  addrFmt?: "dec" | "hex";
+  /** Same action as the main Start button; omit to hide the button. */
+  onStart?: () => void;
+  busy?: boolean;
 };
 
 const FC_LABEL: Record<number, string> = { 1: "Coil", 2: "Discrete", 3: "Holding", 4: "Input" };
@@ -31,27 +28,54 @@ const SOURCE_STATUS_STYLE: Record<string, string> = {
   missing: "bg-rose-500/15 text-rose-800 dark:text-rose-200",
 };
 
-function liveValueText(row: SnapshotRow | undefined): string {
-  if (!row) return "—";
-  if (row.valueBit !== null) return row.valueBit ? "ON" : "OFF";
-  return row.valueWord === null ? "—" : String(row.valueWord);
+function LiveRow({ reg: r, live, addrFmt }: { reg: PageRegister; live: LiveStore; addrFmt: "dec" | "hex" }) {
+  const { text, sourceStatus } = useLiveRegister(live, r);
+  const cls = sourceStatus ? SOURCE_STATUS_STYLE[sourceStatus] ?? "bg-slate-500/15 text-slate-700 dark:text-slate-300" : null;
+  return (
+    <tr className="border-t border-slate-100 dark:border-slate-800">
+      <td className="py-1">{r.unitId}</td>
+      <td>{FC_LABEL[r.functionCode] ?? r.functionCode}</td>
+      <td>{fmtAddr(r.address, addrFmt)}</td>
+      <td className="truncate">{r.alias}</td>
+      <td className="font-mono">{text}</td>
+      <td>
+        {sourceStatus ? (
+          <span className={`inline-block rounded-full px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${cls}`}>
+            {sourceStatus}
+          </span>
+        ) : (
+          <span className="text-xs text-slate-400">—</span>
+        )}
+      </td>
+    </tr>
+  );
 }
 
-export default function LiveValuesTab({ registers, snapshotFor, status }: Props) {
+export default function LiveValuesTab({ registers, live, status, addrFmt = "dec", onStart, busy = false }: Props) {
   const [search, setSearch] = useState("");
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
     if (!q) return registers;
     return registers.filter(
-      (r) => `${r.alias}`.toLowerCase().includes(q) || `${r.address}`.includes(q) || `${r.unitId}`.includes(q)
+      (r) => `${r.alias}`.toLowerCase().includes(q) || addressMatches(r.address, q, addrFmt) || `${r.unitId}`.includes(q)
     );
-  }, [registers, search]);
+  }, [registers, search, addrFmt]);
 
   if (!status.running) {
     return (
       <div className="rounded-2xl border border-slate-200 bg-white p-8 text-center dark:border-slate-800 dark:bg-white/5">
         <p className="text-sm text-slate-600 dark:text-slate-300">Start the server to see live values.</p>
+        {onStart ? (
+          <button
+            type="button"
+            disabled={busy}
+            onClick={onStart}
+            className="mt-3 rounded-full border border-emerald-600/60 bg-emerald-500/10 px-4 py-1.5 text-sm font-semibold text-emerald-800 disabled:opacity-60 dark:text-emerald-200"
+          >
+            Start
+          </button>
+        ) : null}
       </div>
     );
   }
@@ -84,29 +108,9 @@ export default function LiveValuesTab({ registers, snapshotFor, status }: Props)
             </tr>
           </thead>
           <tbody>
-            {filtered.map((r) => {
-              const row = snapshotFor(r.unitId, r.functionCode, r.address);
-              const sourceStatus = row?.sourceStatus;
-              const cls = sourceStatus ? SOURCE_STATUS_STYLE[sourceStatus] ?? "bg-slate-500/15 text-slate-700 dark:text-slate-300" : null;
-              return (
-                <tr key={r.id} className="border-t border-slate-100 dark:border-slate-800">
-                  <td className="py-1">{r.unitId}</td>
-                  <td>{FC_LABEL[r.functionCode] ?? r.functionCode}</td>
-                  <td>{r.address}</td>
-                  <td className="truncate">{r.alias}</td>
-                  <td className="font-mono">{liveValueText(row)}</td>
-                  <td>
-                    {sourceStatus ? (
-                      <span className={`inline-block rounded-full px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${cls}`}>
-                        {sourceStatus}
-                      </span>
-                    ) : (
-                      <span className="text-xs text-slate-400">—</span>
-                    )}
-                  </td>
-                </tr>
-              );
-            })}
+            {filtered.map((r) => (
+              <LiveRow key={r.id} reg={r} live={live} addrFmt={addrFmt} />
+            ))}
           </tbody>
         </table>
       )}

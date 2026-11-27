@@ -2,12 +2,14 @@ import { invoke } from "@tauri-apps/api/core";
 import { useEffect, useMemo, useState } from "react";
 import { useNavigate, useOutletContext } from "react-router-dom";
 import type { Screen2OutletContext } from "../Screen2Layout";
-import { FiCopy, FiEdit2, FiInfo, FiPlus, FiRefreshCcw, FiRefreshCw, FiSave, FiTrash2, FiX } from "react-icons/fi";
+import { FiCopy, FiEdit2, FiInfo, FiPlus, FiRefreshCcw, FiRefreshCw, FiSave, FiSearch, FiTrash2, FiX } from "react-icons/fi";
 import { formatLocalDateTime } from "../../datetime";
 import ConfirmDialog from "../../components/ConfirmDialog";
 import { useErrorToast, useToast } from "../../components/ToastProvider";
 import { logEvent } from "../api/logs";
 import { countSlaveRegisterRows, type SlaveRegisterCount } from "../api/slaves";
+import SlaveScannerModal, { type ScanPick } from "../components/SlaveScannerModal";
+import { formatSettings } from "../utils/slaveScan";
 import { nextFreeUnitId, suggestCloneName } from "../utils/cloneSlave";
 import { MdOpenInNew } from "react-icons/md";
 
@@ -15,6 +17,7 @@ type SlaveItem = {
   id: number;
   name: string;
   unitId: number;
+  connectionKind: string;
   createdAt: string;
   updatedAt: string;
 };
@@ -22,6 +25,7 @@ type SlaveItem = {
 type SlaveCreate = {
   name: string;
   unitId: number;
+  connectionKind: "serial" | "tcp";
 };
 
 function humanizeSlaveError(err: unknown): string {
@@ -111,6 +115,11 @@ export default function SlavesPage() {
   const [formUnitId, setFormUnitId] = useState<string>("");
   const [formError, setFormError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  const [formKind, setFormKind] = useState<"serial" | "tcp">("serial");
+  const [scanPick, setScanPick] = useState<ScanPick | null>(null);
+  const [saveSerial, setSaveSerial] = useState(false);
+  const [saveTcpHost, setSaveTcpHost] = useState(false);
+  const [scanOpen, setScanOpen] = useState(false);
 
   const [confirmDelete, setConfirmDelete] = useState<SlaveItem | null>(null);
   const [deletingId, setDeletingId] = useState<number | null>(null);
@@ -189,6 +198,23 @@ export default function SlavesPage() {
     setModalSlaveId(null);
     setFormName("");
     setFormUnitId("");
+    setFormKind("serial");
+    setScanPick(null);
+    setSaveSerial(false);
+    setSaveTcpHost(false);
+  }
+
+  function addFromScan(pick: ScanPick) {
+    setScanOpen(false);
+    setFormError(null);
+    setModalMode("add");
+    setModalSlaveId(null);
+    setFormName(pick.suggestedName);
+    setFormUnitId(String(pick.unitId));
+    setFormKind(pick.connectionKind);
+    setScanPick(pick);
+    setSaveSerial(false);
+    setSaveTcpHost(pick.tcpToSave != null);
   }
 
   function openEdit(s: SlaveItem) {
@@ -220,6 +246,10 @@ export default function SlavesPage() {
     setFormError(null);
     setModalMode(null);
     setModalSlaveId(null);
+    setScanPick(null);
+    setSaveSerial(false);
+    setSaveTcpHost(false);
+    setFormKind("serial");
   }
 
   async function submitModal() {
@@ -237,15 +267,20 @@ export default function SlavesPage() {
         setFormError("Unit ID is required");
         return;
       }
-      if (unitId <= 0) {
-        setFormError("Slave Address (Unit ID) must be a positive number");
+      const tcpAdd = modalMode === "add" && formKind === "tcp";
+      if (tcpAdd ? unitId < 0 : unitId <= 0) {
+        setFormError(
+          tcpAdd
+            ? "Slave Address (Unit ID) must be 0 or greater"
+            : "Slave Address (Unit ID) must be a positive number",
+        );
         return;
       }
 
       const nowIso = new Date().toISOString();
 
       if (modalMode === "add") {
-        const slave: SlaveCreate = { name, unitId };
+        const slave: SlaveCreate = { name, unitId, connectionKind: formKind };
         const created = await invoke<SlaveItem>("create_slave", {
           name: workspace.name,
           slave,
@@ -269,6 +304,78 @@ export default function SlavesPage() {
           },
         });
         pushToast(`Slave "${created.name}" added`, "info");
+        const toSave = saveSerial ? scanPick?.serialToSave : null;
+        if (toSave) {
+          try {
+            const current = await invoke<Record<string, unknown>>("get_connection_settings", {
+              name: workspace.name,
+            });
+            await invoke<void>("set_connection_settings", {
+              name: workspace.name,
+              settings: {
+                ...current,
+                serialPort: toSave.port,
+                serialBaud: toSave.params.baud,
+                serialParity: toSave.params.parity,
+                serialDataBits: toSave.params.dataBits,
+                serialStopBits: toSave.params.stopBits,
+                serialFlowControl: toSave.params.flowControl,
+              },
+              nowIso,
+            });
+            void logEvent({
+              scope: "workspace",
+              level: "info",
+              workspaceName: workspace.name,
+              source: "slaves",
+              message: "Serial settings saved from slave scan",
+              detailsJson: { port: toSave.port, ...toSave.params },
+            });
+          } catch (e) {
+            const message = String(e);
+            pushToast(`Slave added, but saving serial settings failed: ${message}`, "error");
+            void logEvent({
+              scope: "workspace",
+              level: "error",
+              workspaceName: workspace.name,
+              source: "slaves",
+              message: "Failed to save serial settings from slave scan",
+              detailsJson: { error: message },
+            });
+          }
+        }
+        const tcpToSave = saveTcpHost ? scanPick?.tcpToSave : null;
+        if (tcpToSave) {
+          try {
+            const current = await invoke<Record<string, unknown>>("get_connection_settings", {
+              name: workspace.name,
+            });
+            await invoke<void>("set_connection_settings", {
+              name: workspace.name,
+              settings: { ...current, tcpHost: tcpToSave.host, tcpPort: tcpToSave.port },
+              nowIso,
+            });
+            void logEvent({
+              scope: "workspace",
+              level: "info",
+              workspaceName: workspace.name,
+              source: "slaves",
+              message: "TCP host saved from slave scan",
+              detailsJson: { host: tcpToSave.host, port: tcpToSave.port },
+            });
+          } catch (e) {
+            const message = String(e);
+            pushToast(`Slave added, but saving TCP host failed: ${message}`, "error");
+            void logEvent({
+              scope: "workspace",
+              level: "error",
+              workspaceName: workspace.name,
+              source: "slaves",
+              message: "Failed to save TCP host from slave scan",
+              detailsJson: { error: message },
+            });
+          }
+        }
         closeModal(true);
         return;
       }
@@ -432,6 +539,17 @@ export default function SlavesPage() {
           >
             <FiPlus className="h-4 w-4" aria-hidden="true" />
             Add
+          </button>
+
+          <button
+            type="button"
+            className="inline-flex items-center gap-2 rounded-full border border-slate-300 bg-slate-100 px-4 py-2 text-sm font-semibold text-slate-700 transition hover:border-slate-400 disabled:cursor-not-allowed disabled:opacity-60 dark:border-slate-700 dark:bg-white/5 dark:text-slate-100 dark:hover:border-slate-600"
+            onClick={() => setScanOpen(true)}
+            disabled={loading || saving || deletingId != null}
+            title="Scan for slaves"
+          >
+            <FiSearch className="h-4 w-4" aria-hidden="true" />
+            Scan
           </button>
 
           <button
@@ -684,6 +802,60 @@ export default function SlavesPage() {
                   disabled={saving}
                 />
               </div>
+
+              {modalMode === "add" ? (
+                <div className="flex flex-col gap-2">
+                  <label className="text-sm font-semibold text-slate-700 dark:text-slate-200" htmlFor="slave-form-kind">
+                    Connection
+                  </label>
+                  <select
+                    id="slave-form-kind"
+                    className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 outline-hidden focus:border-emerald-600/60 focus:ring-2 focus:ring-emerald-500/10 dark:border-slate-700 dark:bg-slate-950/40 dark:text-slate-100 dark:focus:border-emerald-500/60"
+                    value={formKind}
+                    onChange={(e) => setFormKind(e.currentTarget.value === "tcp" ? "tcp" : "serial")}
+                    disabled={saving}
+                  >
+                    <option value="serial">Serial</option>
+                    <option value="tcp">TCP</option>
+                  </select>
+                </div>
+              ) : null}
+
+              {modalMode === "add" && scanPick?.serialToSave ? (
+                <div className="flex flex-col gap-1">
+                  <label className="flex items-center gap-2 text-sm text-slate-700 dark:text-slate-200">
+                    <input
+                      type="checkbox"
+                      checked={saveSerial}
+                      onChange={(e) => setSaveSerial(e.currentTarget.checked)}
+                      disabled={saving}
+                    />
+                    {`Also save serial settings (${formatSettings(scanPick.serialToSave.params)}, ${scanPick.serialToSave.port}) to the workspace`}
+                  </label>
+                  {scanPick.serialToSave.portDiffers ? (
+                    <div className="text-xs text-amber-700 dark:text-amber-300">
+                      Changes the port and settings for all serial slaves in this workspace
+                    </div>
+                  ) : null}
+                </div>
+              ) : null}
+
+              {modalMode === "add" && scanPick?.tcpToSave ? (
+                <div className="flex flex-col gap-1">
+                  <label className="flex items-center gap-2 text-sm text-slate-700 dark:text-slate-200">
+                    <input
+                      type="checkbox"
+                      checked={saveTcpHost}
+                      onChange={(e) => setSaveTcpHost(e.currentTarget.checked)}
+                      disabled={saving}
+                    />
+                    {`Also set the workspace TCP host to ${scanPick.tcpToSave.host}:${scanPick.tcpToSave.port}`}
+                  </label>
+                  <div className="text-xs text-amber-700 dark:text-amber-300">
+                    Changes the host for all TCP slaves in this workspace
+                  </div>
+                </div>
+              ) : null}
             </div>
 
             <div className="mt-6 flex flex-wrap justify-end gap-2">
@@ -722,6 +894,14 @@ export default function SlavesPage() {
           </div>
         </div>
       ) : null}
+
+      <SlaveScannerModal
+        open={scanOpen}
+        workspaceName={workspace.name}
+        existingSlaves={items.map((x) => ({ unitId: x.unitId, connectionKind: x.connectionKind, name: x.name }))}
+        onClose={() => setScanOpen(false)}
+        onAdd={addFromScan}
+      />
 
       <ConfirmDialog
         open={confirmDelete != null}

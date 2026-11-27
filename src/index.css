@@ -83,6 +83,20 @@
     color: rgb(226 232 240);
   }
 
+  /* Placeholder / unavailable options: dimmer than normal ones, but still readable (slate-400). */
+  .dark option:disabled {
+    color: rgb(148 163 184) !important;
+  }
+
+  /* Highlighted / selected option in the open native list: opaque emerald-800 with light text
+     (a translucent tint blends with the OS list colour and can turn unreadable).
+     !important is needed so it beats the `.dark optgroup option` background/colour rule. */
+  .dark option:checked:not(:disabled),
+  .dark option:hover:not(:disabled) {
+    background-color: rgb(6 95 70) !important;
+    color: rgb(236 253 245) !important;
+  }
+
   body {
     @apply m-0 min-h-screen bg-slate-50 font-sans text-slate-900 antialiased;
   }
@@ -98,6 +112,14 @@
   .brand-name {
     font-family: "Roboto", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   }
+}
+
+/* Analyzer grid outside Edit layout: place tiles instantly. react-grid-layout's stylesheet animates
+   every tile (left/top/width/height or transform) and the grid height over 200 ms, which made each
+   tab switch and focus-view cycle visibly "settle" and resized every chart on each frame. */
+.react-grid-layout.analyzer-grid-static,
+.react-grid-layout.analyzer-grid-static > .react-grid-item {
+  transition: none !important;
 }
 
 .react-resizable-handle {

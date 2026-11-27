@@ -8,6 +8,13 @@ export type AnalyzerTile = {
   pollingEnabled: boolean;
   createdAt: string;
   updatedAt: string;
+  tabId: number;
+};
+
+export type AnalyzerTab = {
+  id: number;
+  name: string;
+  position: number;
 };
 
 export type AnalyzerTileLayout = {
@@ -29,11 +36,18 @@ export type AnalyzerTileLayoutUpsert = {
 
 export type AnalyzerSignal = {
   id: string;
-  slaveId: number;
+  kind: "register" | "calculated";
+  slaveId: number | null;
   connectionKind: string;
   functionKind: string;
-  registerRowId: number;
-  address: number;
+  registerRowId: number | null;
+  address: number | null;
+  functionCode: number | null;
+  alias: string | null;
+  dataType: string | null;
+  order: string | null;
+  displayFormat: string | null;
+  inputSignalIds: string[];
   decoderJson: string;
   lastValueJson?: string | null;
   lastUpdatedTsMs?: number | null;
@@ -43,15 +57,17 @@ export type AnalyzerSignal = {
 
 export type AnalyzerSignalUpsert = {
   id: string;
-  slaveId: number;
+  kind?: "register" | "calculated";
+  slaveId: number | null;
   functionKind: string;
-  registerRowId: number;
+  registerRowId: number | null;
   decoderJson?: string;
 };
 
 export type AnalyzerTileSignalInfo = {
   tileId: number;
   signalId: string;
+  kind: "register" | "calculated";
   role: string;
   functionCode: number;
   address: number;
@@ -141,6 +157,7 @@ export async function createAnalyzerTile(
     title: string;
     configJson: string;
     pollingEnabled: boolean;
+    tabId: number;
     layouts: Array<{ breakpoint: string; x: number; y: number; w: number; h: number }>;
     signalLinks: Array<{ signalId: string; role: string }>;
   },
@@ -185,4 +202,53 @@ export async function listAnalyzerTileSignals(
     name: workspaceName,
     tileId,
   });
+}
+
+export async function listAnalyzerTabs(workspaceName: string): Promise<AnalyzerTab[]> {
+  return await invoke<AnalyzerTab[]>("list_analyzer_tabs", { name: workspaceName });
+}
+
+export async function createAnalyzerTab(workspaceName: string, tabName: string): Promise<AnalyzerTab> {
+  const nowIso = new Date().toISOString();
+  return await invoke<AnalyzerTab>("create_analyzer_tab", { name: workspaceName, tabName, nowIso });
+}
+
+export async function renameAnalyzerTab(
+  workspaceName: string,
+  tabId: number,
+  tabName: string,
+): Promise<AnalyzerTab> {
+  const nowIso = new Date().toISOString();
+  return await invoke<AnalyzerTab>("rename_analyzer_tab", { name: workspaceName, tabId, tabName, nowIso });
+}
+
+export async function reorderAnalyzerTabs(workspaceName: string, tabIds: number[]): Promise<void> {
+  await invoke<void>("reorder_analyzer_tabs", { name: workspaceName, tabIds });
+}
+
+/** Deleting a tab with tiles requires one choice: move them to another tab, or delete them. */
+export async function deleteAnalyzerTab(
+  workspaceName: string,
+  tabId: number,
+  opts: { moveTilesTo?: number; deleteTiles?: boolean },
+): Promise<void> {
+  await invoke<void>("delete_analyzer_tab", {
+    name: workspaceName,
+    tabId,
+    moveTilesTo: opts.moveTilesTo ?? null,
+    deleteTiles: opts.deleteTiles ?? false,
+  });
+}
+
+export async function moveAnalyzerTileToTab(workspaceName: string, tileId: number, tabId: number): Promise<void> {
+  await invoke<void>("move_analyzer_tile_to_tab", { name: workspaceName, tileId, tabId });
+}
+
+export async function duplicateAnalyzerTile(
+  workspaceName: string,
+  tileId: number,
+  tabId: number,
+): Promise<AnalyzerTile> {
+  const nowIso = new Date().toISOString();
+  return await invoke<AnalyzerTile>("duplicate_analyzer_tile", { name: workspaceName, tileId, tabId, nowIso });
 }

@@ -6,6 +6,127 @@ All notable changes to this project are tracked here following [Keep a Changelog
 
 _No changes yet._
 
+## [0.6.0] - 2026-11-27
+### Added
+- **Slave scanner** — a **Scan** button on the Slaves page finds a device's
+  Unit ID over serial (one or several ports, optional baud/parity sweep) or TCP
+  (parallel checks), lists answers live, flags gateway and garbled replies, and
+  adds a result as a slave with its serial settings if you choose.
+- **IP range scan** — the scanner's TCP target can be an IP range (your local
+  network or a custom range up to 1024 addresses); it finds hosts with the Modbus
+  port open, then scans unit IDs on each and lists the devices it finds.
+- **Unit dropdown** — Analyzer signals now pick a unit from a grouped list
+  (Temperature, Electrical, Pressure, Flow, Vibration, Time and more), with
+  **Custom…** for your own label. The unit is only a label and never converts
+  the value; existing units open as Custom.
+- **Data and Math tabs with guided variables** — the signal editor has a
+  **Math** tab where you build named variables as step-by-step **Calculations**
+  (evaluated strictly left to right) or **Rules** (IF / AND / OR → value, with
+  OTHERWISE). **Show value** picks the register value or any variable for
+  tiles. When a value can't be computed, tiles show the reason (for example
+  "division by zero") instead of a number, never an invented one, and text
+  results stay off trend charts.
+- **Calculated signals** — create a signal with no register that combines
+  other register signals as inputs (for example power = V × A), usable on value
+  and trend tiles. Signals used as inputs are protected from deletion.
+- **Try it panel** — test your math with live values or typed values before
+  saving, without touching the device.
+- **Larger signal editor** — a sticky header and footer give the new Data and
+  Math tabs room to work.
+- **Tile tabs** — organise Analyzer tiles into named tabs (for example one per
+  machine). Click to switch, double-click to rename, drag to reorder, delete
+  with a choice to move or delete its tiles (signals are never deleted), and
+  use Ctrl+1…Ctrl+9 to jump. Tiles can be moved or duplicated between tabs from
+  the tile menu. A red or amber dot shows a problem or stale tile on a tab
+  while running. The last open tab is remembered.
+- **Focus view** — a full-window view of the Analyzer tiles for wall displays
+  and quick checks. Move the mouse to show an overlay with the tab name, ◀ ▶,
+  Run/Stop, **Cycle tabs** (Off / 10 s / 30 s / 60 s), Full screen and Exit.
+  Esc closes a popup first, then leaves focus view.
+- **One control bar** — the Analyzer controls are now a single, tidier bar:
+  Trends ▾ (trend history window), Signals, Connection, + Tile, Edit layout
+  (acts on the current tab), a Refresh icon and a Focus view button.
+- **Engineering units in the TCP Simulator and Virtual Devices** — each
+  register can have a unit, scale, offset and decimals (e.g. °C, ×0.1).
+  Generators, presets and initial values are then entered in real-world
+  values, live values show "23.5 °C", and Virtual Devices carry the scaling
+  when shared. What clients read on the wire is unchanged; with the default
+  scale 1 and offset 0 everything behaves as before.
+- **Rules in real-world values** — pick registers by name, compare in their
+  units ("Temperature ≥ 35.0 °C"), add a deadband so a rule doesn't flicker at
+  the limit, and combine conditions with All of / Any of. Set, Increment,
+  Decrement and Copy take real-world values, and the dialog says when a value
+  will be rounded to the register's step.
+
+### Fixed
+- **Trend chart time labels** — on narrow trend tiles the time labels no longer
+  overlap; the number of labels now follows the tile width.
+- **Dark-mode dropdowns** — unavailable (greyed-out) options, such as
+  "Add a variable in the Math tab first", are readable in dark mode.
+- **Analyzer tiles appear instantly** — switching tabs and focus-view cycling no
+  longer slide every tile into place; tiles only animate while editing the
+  layout, and trend charts update in place instead of being rebuilt.
+- **Exiting a workspace frees its serial port** — leaving a workspace now stops
+  its Analyzer polling and TCP simulator and closes its connections, so another
+  workspace (or the slave scanner) can open the same COM port without
+  "Access is denied".
+- **TCP Simulator server** — reads of more registers than Modbus allows are
+  rejected with an "illegal data value" exception instead of a broken reply;
+  multi-register and multi-coil writes are all-or-nothing; "on write" rules see
+  every written address.
+- **TCP Simulator rules** — rules no longer create registers or units that were
+  never configured, and a condition on a missing register never fires. Deleted
+  or edited rules no longer run leftover delayed actions or old timers, and
+  interval rules and generators keep time without drifting.
+- **TCP Simulator stays responsive** — a slow or unplugged route source no
+  longer freezes generators, rules and live values; device presets drift slowly
+  as intended instead of sweeping their range every second.
+- **TCP Simulator edits** — moving a device by a small offset and importing a
+  profile are all-or-nothing; dialogs stay open and show the error when a save
+  fails; Port and Tick interval are checked and saved when you leave the field;
+  the register panel's buttons stay visible; the rule dialog requires a name and
+  an action, warns about targets with no register, and uses plain-language
+  labels; the Rules table shows register names and flags missing targets; hex
+  search works; the "changes apply on next Start" notes are gone (edits apply
+  immediately).
+- **Virtual Devices** — a damaged custom-device file is backed up and reported
+  instead of being silently replaced on the next save; "Clone & edit" creates a
+  new device instead of overwriting an earlier clone; templates with
+  overlapping registers are rejected; saving a device as a template keeps each
+  register's unit, display format, interval and hold value.
+
+### Changed
+- **Workspace upgrade** — when 0.6.0 starts, every workspace is upgraded as the
+  workspace list loads, and upgraded workspaces can no longer be opened by
+  0.5.x. Existing Analyzer tiles appear in a tab named "Main". Export a backup
+  of important workspaces before upgrading.
+- **Register address format** — the Dec / Hex choice moved from the Analyzer
+  bar to Settings → Display. It is app-wide, remembered, and used by the
+  Analyzer and TCP Simulator. It only changes how addresses are written, never
+  values.
+- **Simulator rules read the register's real value** — conditions now decode
+  the register by its type: signed (i16) negatives, 32/64-bit and float
+  registers compare correctly. Existing rules on such registers, and rules
+  that pointed at the second word of a 32-bit register, may need their
+  threshold or target re-checked. On scaled registers, Set/Increment/Decrement
+  and Copy clamp at the register's limits instead of wrapping around (plain
+  16-bit registers at the default scale still wrap as before); Copy between
+  registers of different types now clamps too.
+- **Virtual Device editor** — a larger two-pane editor: the register list on
+  the left, the selected register's settings on the right. New registers go to
+  the next free offset, overlaps are flagged as you type, fields that don't
+  apply (type and byte order for coils) are hidden, and the key is generated
+  from the name (under Advanced).
+- **TCP Simulator page** — registers are added and edited in the side panel
+  (the Add Register dialog is gone), with an unsaved-changes guard, Esc to
+  close, and a drawer on narrow windows. Tick interval sits next to Port and an
+  Uptime card replaces it; device cards show the device name, icon and real
+  address ranges; while stopped, the Value column shows each register's source
+  and Live Values offers Start.
+- The TCP Simulator sends only values that changed and redraws only those, so
+  large maps stay smooth; the register panel's mini chart now plots the real
+  value (e.g. 23.5 °C) instead of the raw word.
+
 ## [0.5.0] - 2026-08-10
 ### Added
 - **Clone a slave** — duplicate any slave from the Slaves list, including its

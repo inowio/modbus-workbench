@@ -1,13 +1,14 @@
-import { Suspense, lazy, useEffect, useMemo, useState, type RefObject } from "react";
-import { FiLink, FiMenu, FiMoreVertical, FiPlay, FiPlus, FiRefreshCw, FiSettings, FiTrash2, FiX } from "react-icons/fi";
+import { Suspense, lazy, useEffect, useMemo, useRef, useState, type RefObject } from "react";
+import { FiCopy, FiCornerUpRight, FiMoreVertical, FiPlus, FiSettings, FiTrash2, FiX } from "react-icons/fi";
 import { Responsive } from "react-grid-layout";
 import "react-grid-layout/css/styles.css";
 import "react-resizable/css/styles.css";
-import type { AnalyzerTile } from "../../api/analyzer";
+import type { AnalyzerTab, AnalyzerTile } from "../../api/analyzer";
 import type { AnalyzerTrendPoint } from "../../components/AnalyzerTrendTile";
 import type { BreakpointLayouts, GridLayout } from "./layoutTypes";
 import { coerceBreakpointLayouts, coerceGridLayout } from "./layoutTypes";
 import { getChartKind } from "./chartKind";
+import PickTabDialog from "./PickTabDialog";
 import { MdOutlineSync, MdOutlineSyncDisabled } from "react-icons/md";
 import { RiInformation2Line, RiLayout4Line, RiStopMiniFill } from "react-icons/ri";
 
@@ -15,15 +16,17 @@ const LazyAnalyzerTrendTile = lazy(() => import("../../components/AnalyzerTrendT
 const ResponsiveAny = Responsive as any;
 
 type Props = {
+  /** The selected tab's tiles. */
   tiles: AnalyzerTile[];
+  /** Any tab has tiles: an empty grid is then just an empty tab. */
+  workspaceHasTiles: boolean;
 
   pollingWanted: boolean;
-  onStartPollingAll: () => void;
-  onStopPollingAll: () => void;
 
   gridReady: boolean;
   layoutEditMode: boolean;
-  onToggleLayoutEditMode: () => void;
+  /** Focus view: no tile menus (only read-only tile information) and no layout editing. */
+  focusMode: boolean;
 
   gridHostRef: RefObject<HTMLDivElement | null>;
   effectiveGridWidth: number;
@@ -50,29 +53,35 @@ type Props = {
     registerAddress: number | null;
     registerAddressFormatted: string;
     registerType: string;
+    calculatedSource: string | null;
     pollIntervalMs: number | null;
   } | null;
 
-  onRefresh: () => void;
-  onOpenConnectionSettings: () => void;
   onConfigureSignals: () => void;
   onAddTile: () => void;
 
   onToggleTilePolling: (tile: AnalyzerTile) => void;
   onEditTile: (tile: AnalyzerTile) => void;
   onDeleteTile: (tile: AnalyzerTile) => void;
+
+  tabs: AnalyzerTab[];
+  onMoveTile: (tile: AnalyzerTile, tabId: number) => void;
+  onDuplicateTile: (tile: AnalyzerTile, tabId: number) => void;
+  /** Reports whether a tile's Info dialog is open (focus view pauses tab cycling meanwhile). */
+  onInfoOpenChange?: (open: boolean) => void;
 };
 
 export default function AnalyzerTilesCard(props: Props) {
-  const [menuOpen, setMenuOpen] = useState(false);
   const [tileMenuOpenId, setTileMenuOpenId] = useState<number | null>(null);
   const [infoTileId, setInfoTileId] = useState<number | null>(null);
+  const [pickTab, setPickTab] = useState<{ mode: "move" | "duplicate"; tile: AnalyzerTile } | null>(null);
 
+  const editingLayout = props.layoutEditMode && !props.focusMode;
   const hasTiles = props.tiles.length > 0;
   const skeletonCount = Math.min(hasTiles ? props.tiles.length : 6, 6);
 
   const effectiveLayouts = useMemo(() => {
-    const makeStatic = !props.layoutEditMode;
+    const makeStatic = !editingLayout;
     const mapLayout = (items: GridLayout): GridLayout =>
       items.map((it) => ({
         ...it,
@@ -83,7 +92,7 @@ export default function AnalyzerTilesCard(props: Props) {
       desktop: mapLayout(props.gridLayouts.desktop ?? []),
       mobile: mapLayout(props.gridLayouts.mobile ?? []),
     } satisfies BreakpointLayouts;
-  }, [props.gridLayouts, props.layoutEditMode]);
+  }, [props.gridLayouts, editingLayout]);
 
   const runningByTileId = useMemo(() => {
     const out = new Map<number, boolean>();
@@ -93,33 +102,44 @@ export default function AnalyzerTilesCard(props: Props) {
     return out;
   }, [props.pollingWanted, props.tiles]);
 
+  const onInfoOpenChangeRef = useRef(props.onInfoOpenChange);
+  onInfoOpenChangeRef.current = props.onInfoOpenChange;
+  const infoOpen = infoTileId != null;
   useEffect(() => {
-    if (!menuOpen && tileMenuOpenId == null) return;
+    onInfoOpenChangeRef.current?.(infoOpen);
+    if (!infoOpen) return;
+    return () => onInfoOpenChangeRef.current?.(false);
+  }, [infoOpen]);
+
+  // Focus view hides the tile menu; close it too, or its Escape handler would eat the first Escape.
+  useEffect(() => {
+    if (props.focusMode) setTileMenuOpenId(null);
+  }, [props.focusMode]);
+
+  useEffect(() => {
+    if (tileMenuOpenId == null) return;
 
     const onMouseDown = (e: MouseEvent) => {
       const target = e.target as HTMLElement | null;
       if (!target) {
-        setMenuOpen(false);
         setTileMenuOpenId(null);
         return;
       }
 
       if (
         target.closest("[data-tile-menu-root]") ||
-        target.closest("[data-tile-menu-btn]") ||
-        target.closest("[data-tiles-menu-root]") ||
-        target.closest("[data-tiles-menu-btn]")
+        target.closest("[data-tile-menu-btn]")
       ) {
         return;
       }
 
-      setMenuOpen(false);
       setTileMenuOpenId(null);
     };
 
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key !== "Escape") return;
-      setMenuOpen(false);
+      // Handled: the page's focus-view Escape (on window) skips prevented events.
+      e.preventDefault();
       setTileMenuOpenId(null);
     };
 
@@ -129,7 +149,7 @@ export default function AnalyzerTilesCard(props: Props) {
       document.removeEventListener("mousedown", onMouseDown);
       document.removeEventListener("keydown", onKeyDown);
     };
-  }, [menuOpen, tileMenuOpenId]);
+  }, [tileMenuOpenId]);
 
   useEffect(() => {
     if (infoTileId == null) return;
@@ -145,211 +165,65 @@ export default function AnalyzerTilesCard(props: Props) {
 
   return (
     <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm dark:border-slate-800/70 dark:bg-slate-900/60">
-      <div className="flex items-center justify-between gap-3">
-        <div>
-          <div className="text-sm font-semibold text-slate-900 dark:text-slate-100">Tiles</div>
-          <div className="text-xs text-slate-600 dark:text-slate-400">
-            {props.layoutEditMode ? (
-              <div className="text-xs text-amber-800 dark:text-amber-200">Drag tiles to move. Resize from the bottom-right corner.</div>
-            ) : (
-              "Click Edit Layout button to resize or rearrange the tiles."
-            )}
-          </div>
-        </div>
-
-        <div className="flex items-center gap-2">
-          {props.layoutEditMode ? null : (
-            <div className="flex items-center gap-2">
-              {/* Large screens (xl+): inline action buttons replace the Options menu */}
-              <div className="hidden items-center gap-2 xl:flex">
-                <button
-                  type="button"
-                  className="inline-flex items-center gap-2 rounded-md border border-slate-300 bg-slate-100 px-3 py-2 text-xs font-semibold text-slate-700 transition hover:border-slate-400 dark:border-slate-700 dark:bg-white/5 dark:text-slate-100 dark:hover:border-slate-600"
-                  onClick={props.onConfigureSignals}
-                  title="Configure Signals"
-                >
-                  <FiSettings className="h-4 w-4" aria-hidden="true" />
-                  Signals
-                </button>
-                <button
-                  type="button"
-                  className="inline-flex items-center gap-2 rounded-md border border-slate-300 bg-slate-100 px-3 py-2 text-xs font-semibold text-slate-700 transition hover:border-slate-400 dark:border-slate-700 dark:bg-white/5 dark:text-slate-100 dark:hover:border-slate-600"
-                  onClick={props.onAddTile}
-                  title="Add Tile"
-                >
-                  <FiPlus className="h-4 w-4" aria-hidden="true" />
-                  Add Tile
-                </button>
-                <button
-                  type="button"
-                  className="inline-flex items-center gap-2 rounded-md border border-slate-300 bg-slate-100 px-3 py-2 text-xs font-semibold text-slate-700 transition hover:border-slate-400 dark:border-slate-700 dark:bg-white/5 dark:text-slate-100 dark:hover:border-slate-600"
-                  onClick={props.onOpenConnectionSettings}
-                  title="Connection Settings"
-                >
-                  <FiLink className="h-4 w-4" aria-hidden="true" />
-                  Connection
-                </button>
-                <button
-                  type="button"
-                  className="inline-flex items-center gap-2 rounded-md border border-slate-300 bg-slate-100 px-3 py-2 text-xs font-semibold text-slate-700 transition hover:border-slate-400 dark:border-slate-700 dark:bg-white/5 dark:text-slate-100 dark:hover:border-slate-600"
-                  onClick={props.onRefresh}
-                  title="Refresh"
-                >
-                  <FiRefreshCw className="h-4 w-4" aria-hidden="true" />
-                  Refresh
-                </button>
-              </div>
-
-              {/* Small screens (<xl): Options dropdown */}
-              <div className="relative xl:hidden">
-                <button
-                  type="button"
-                  data-tiles-menu-btn
-                  className="inline-flex items-center gap-2 rounded-md border border-slate-300 bg-slate-100 px-3 py-2 text-xs font-semibold text-slate-700 transition hover:border-slate-400 dark:border-slate-700 dark:bg-white/5 dark:text-slate-100 dark:hover:border-slate-600"
-                  onClick={() => setMenuOpen((prev) => !prev)}
-                  title="Options"
-                >
-                  <FiMenu className="h-4 w-4" aria-hidden="true" />
-                  Options
-                </button>
-
-              {menuOpen ? (
-                <div
-                  data-tiles-menu-root
-                  className="absolute right-0 top-11 z-50 w-56 rounded-xl border border-slate-200 bg-white p-1 shadow-sm dark:border-slate-700 dark:bg-slate-950/95"
-                >
-                  <button
-                    type="button"
-                    className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-xs text-slate-700 hover:bg-slate-100 dark:text-slate-100 dark:hover:bg-white/5"
-                    onClick={() => {
-                      setMenuOpen(false);
-                      props.onConfigureSignals();
-                    }}
-                  >
-                    <FiSettings className="h-4 w-4" aria-hidden="true" />
-                    Configure Signals
-                  </button>
-
-                  <button
-                    type="button"
-                    className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-xs text-slate-700 hover:bg-slate-100 dark:text-slate-100 dark:hover:bg-white/5"
-                    onClick={() => {
-                      setMenuOpen(false);
-                      props.onAddTile();
-                    }}
-                  >
-                    <FiPlus className="h-4 w-4" aria-hidden="true" />
-                    Add Tile
-                  </button>
-
-                  <div className="my-1 h-px bg-slate-200 dark:bg-slate-800" />
-
-                  <button
-                    type="button"
-                    className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-xs text-slate-700 hover:bg-slate-100 dark:text-slate-100 dark:hover:bg-white/5"
-                    onClick={() => {
-                      setMenuOpen(false);
-                      props.onOpenConnectionSettings();
-                    }}
-                  >
-                    <FiLink className="h-4 w-4" aria-hidden="true" />
-                    Connection Settings
-                  </button>
-
-                  <div className="my-1 h-px bg-slate-200 dark:bg-slate-800" />
-
-                  <button
-                    type="button"
-                    className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-xs text-slate-700 hover:bg-slate-100 dark:text-slate-100 dark:hover:bg-white/5"
-                    onClick={() => {
-                      setMenuOpen(false);
-                      props.onRefresh();
-                    }}
-                  >
-                    <FiRefreshCw className="h-4 w-4" aria-hidden="true" />
-                    Refresh
-                  </button>
-                </div>
-              ) : null}
-              </div>
-
-              {props.pollingWanted ? (
-                <button
-                  type="button"
-                  className="inline-flex w-20 items-center justify-center gap-2 rounded-full border border-rose-500/60 bg-rose-500/10 px-4 py-2 text-xs font-semibold text-rose-800 transition hover:border-rose-500/70 hover:text-rose-900 disabled:cursor-not-allowed disabled:opacity-60 dark:text-rose-100 dark:hover:border-rose-400 dark:hover:text-rose-50"
-                  onClick={props.onStopPollingAll}
-                  title="Stop polling"
-                >
-                  <FiRefreshCw className="h-4 w-4 animate-spin" aria-hidden="true" />
-                  Stop
-                </button>
-              ) : (
-                <button
-                  type="button"
-                  className="inline-flex w-20 items-center justify-center gap-2 rounded-full border border-emerald-600/60 bg-emerald-500/10 px-4 py-2 text-xs font-semibold text-emerald-800 transition hover:border-emerald-500 hover:text-emerald-900 disabled:cursor-not-allowed disabled:opacity-60 dark:border-emerald-500/60 dark:text-emerald-200 dark:hover:border-emerald-400 dark:hover:text-emerald-100"
-                  onClick={props.onStartPollingAll}
-                  title="Run polling"
-                >
-                  <FiPlay className="h-4 w-4" aria-hidden="true" />
-                  Run
-                </button>
-              )}
-            </div>
-          )}
-
-          {hasTiles ? (
-            <button
-              type="button"
-              className={`rounded-full inline-flex items-center justify-center gap-2 border px-3 py-2 text-xs font-semibold transition ${props.layoutEditMode
-                ? "border-amber-500/40 bg-amber-500/10 text-amber-800 hover:border-amber-500/60 dark:text-amber-200 dark:hover:border-amber-400/60"
-                : "border-slate-300 bg-slate-100 text-slate-700 hover:border-slate-400 dark:border-slate-700 dark:bg-white/5 dark:text-slate-200 dark:hover:border-slate-600"}`}
-              onClick={props.onToggleLayoutEditMode}
-              title="Toggle layout edit mode"
-            >
-              <RiLayout4Line className="h-4 w-4" aria-hidden="true" />
-              {props.layoutEditMode ? "Done" : "Edit layout"}
-            </button>
-          ) : null}
-        </div>
-      </div>
+      {editingLayout ? (
+        <div className="text-xs text-amber-800 dark:text-amber-200">Drag tiles to move. Resize from the bottom-right corner.</div>
+      ) : null}
 
       {props.tiles.length === 0 ? (
         <div className="mt-3 flex flex-col items-center justify-center gap-3 rounded-2xl border border-dashed border-slate-300 bg-slate-50/60 px-6 py-10 text-center dark:border-slate-700 dark:bg-slate-950/30">
           <span className="flex h-12 w-12 items-center justify-center rounded-full bg-emerald-500/10 text-emerald-700 dark:text-emerald-300">
             <RiLayout4Line className="h-6 w-6" aria-hidden="true" />
           </span>
-          <div className="text-sm font-semibold text-slate-900 dark:text-slate-100">No tiles yet</div>
-          <div className="max-w-md text-xs text-slate-600 dark:text-slate-300">
-            Tiles show live values and trends for the signals you configure on this workspace. Start by
-            configuring your signals, then add a tile to visualize one.
-          </div>
-          <div className="mt-1 flex flex-wrap items-center justify-center gap-2">
-            <button
-              type="button"
-              className="inline-flex items-center gap-2 rounded-full border border-emerald-600/60 bg-emerald-500/10 px-4 py-2 text-xs font-semibold text-emerald-800 transition hover:border-emerald-500 hover:text-emerald-900 dark:border-emerald-500/60 dark:text-emerald-200 dark:hover:border-emerald-400 dark:hover:text-emerald-100"
-              onClick={props.onConfigureSignals}
-            >
-              <FiSettings className="h-4 w-4" aria-hidden="true" />
-              Configure Signals
-            </button>
-            <button
-              type="button"
-              className="inline-flex items-center gap-2 rounded-full border border-slate-300 bg-slate-100 px-4 py-2 text-xs font-semibold text-slate-700 transition hover:border-slate-400 dark:border-slate-700 dark:bg-white/5 dark:text-slate-100 dark:hover:border-slate-600"
-              onClick={props.onAddTile}
-            >
-              <FiPlus className="h-4 w-4" aria-hidden="true" />
-              Add Tile
-            </button>
-          </div>
+          {props.workspaceHasTiles ? (
+            <>
+              <div className="text-sm font-semibold text-slate-900 dark:text-slate-100">This tab has no tiles</div>
+              <div className="max-w-md text-xs text-slate-600 dark:text-slate-300">
+                Add a tile to show a live value or trend on this tab.
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="text-sm font-semibold text-slate-900 dark:text-slate-100">No tiles yet</div>
+              <div className="max-w-md text-xs text-slate-600 dark:text-slate-300">
+                Tiles show live values and trends for the signals you configure on this workspace. Start by
+                configuring your signals, then add a tile to visualize one.
+              </div>
+            </>
+          )}
+          {props.focusMode ? null : (
+            <div className="mt-1 flex flex-wrap items-center justify-center gap-2">
+              {props.workspaceHasTiles ? null : (
+                <button
+                  type="button"
+                  className="inline-flex items-center gap-2 rounded-full border border-emerald-600/60 bg-emerald-500/10 px-4 py-2 text-xs font-semibold text-emerald-800 transition hover:border-emerald-500 hover:text-emerald-900 dark:border-emerald-500/60 dark:text-emerald-200 dark:hover:border-emerald-400 dark:hover:text-emerald-100"
+                  onClick={props.onConfigureSignals}
+                >
+                  <FiSettings className="h-4 w-4" aria-hidden="true" />
+                  Configure Signals
+                </button>
+              )}
+              <button
+                type="button"
+                className="inline-flex items-center gap-2 rounded-full border border-slate-300 bg-slate-100 px-4 py-2 text-xs font-semibold text-slate-700 transition hover:border-slate-400 dark:border-slate-700 dark:bg-white/5 dark:text-slate-100 dark:hover:border-slate-600"
+                onClick={props.onAddTile}
+              >
+                <FiPlus className="h-4 w-4" aria-hidden="true" />
+                Add a tile
+              </button>
+            </div>
+          )}
         </div>
       ) : (
         <div
           ref={props.gridHostRef}
-          className={`mt-3 transition-all duration-200 ${props.gridReady ? "opacity-100" : "pointer-events-none opacity-0"}`}
+          className={`mt-3 ${props.gridReady ? "" : "pointer-events-none opacity-0"}`}
         >
           {props.gridReady ? (
             <ResponsiveAny
-              className="layout"
+              // Tiles only animate while the layout is being edited (drag/resize feedback). Viewing,
+              // switching tabs and focus-view cycling place them instantly: no 200 ms slide of every
+              // tile and of the grid height, and no chart resizes on every animation frame.
+              className={editingLayout ? "layout" : "layout analyzer-grid-static"}
               width={props.effectiveGridWidth}
               layouts={effectiveLayouts as any}
               breakpoints={{ desktop: 768, mobile: 0 }}
@@ -357,12 +231,12 @@ export default function AnalyzerTilesCard(props: Props) {
               rowHeight={22}
               margin={[12, 12]}
               containerPadding={[0, 0]}
-              isDraggable={props.layoutEditMode}
-              isResizable={props.layoutEditMode}
+              isDraggable={editingLayout}
+              isResizable={editingLayout}
               draggableHandle=".tile-drag-handle"
-              resizeHandles={props.layoutEditMode ? ["se"] : []}
+              resizeHandles={editingLayout ? ["se"] : []}
               onLayoutChange={(current: unknown, all: unknown) => {
-                if (!props.layoutEditMode) return;
+                if (!editingLayout) return;
                 const nextAll = coerceBreakpointLayouts(all);
                 props.onGridLayoutsChange(nextAll);
                 props.schedulePersistLayouts(props.derivedBreakpoint, coerceGridLayout(current));
@@ -395,7 +269,7 @@ export default function AnalyzerTilesCard(props: Props) {
                   className={`relative flex h-full flex-col overflow-visible rounded-2xl border border-slate-200 bg-slate-50/70 p-4 dark:border-slate-800 dark:bg-slate-950/30 ${tileMenuOpenId === t.id ? "z-10" : ""}`}
                 >
                   <div
-                    className={`tile-drag-handle flex items-start justify-between gap-3 ${props.layoutEditMode ? "cursor-move" : "cursor-default"}`}
+                    className={`tile-drag-handle flex items-start justify-between gap-3 ${editingLayout ? "cursor-move" : "cursor-default"}`}
                   >
                     <div className="min-w-0">
                       <div
@@ -418,22 +292,34 @@ export default function AnalyzerTilesCard(props: Props) {
                     </div>
 
                     <div className="flex shrink-0 items-center gap-2">
-                      <button
-                        type="button"
-                        data-tile-menu-btn
-                        className="rounded-xl border border-slate-300 bg-slate-100 p-2 text-slate-700 transition hover:border-slate-400 dark:border-slate-700 dark:bg-white/5 dark:text-slate-200 dark:hover:border-slate-600"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          setTileMenuOpenId((prev) => (prev === t.id ? null : t.id));
-                        }}
-                        title="Tile menu"
-                      >
-                        <FiMoreVertical className="h-4 w-4" />
-                      </button>
+                      {props.focusMode ? (
+                        <button
+                          type="button"
+                          className="rounded-xl border border-slate-300 bg-slate-100 p-2 text-slate-700 transition hover:border-slate-400 dark:border-slate-700 dark:bg-white/5 dark:text-slate-200 dark:hover:border-slate-600"
+                          onClick={() => setInfoTileId(t.id)}
+                          aria-label="Tile information"
+                          title="Tile information"
+                        >
+                          <RiInformation2Line className="h-4 w-4" aria-hidden="true" />
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          data-tile-menu-btn
+                          className="rounded-xl border border-slate-300 bg-slate-100 p-2 text-slate-700 transition hover:border-slate-400 dark:border-slate-700 dark:bg-white/5 dark:text-slate-200 dark:hover:border-slate-600"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setTileMenuOpenId((prev) => (prev === t.id ? null : t.id));
+                          }}
+                          title="Tile menu"
+                        >
+                          <FiMoreVertical className="h-4 w-4" />
+                        </button>
+                      )}
                     </div>
                   </div>
 
-                  {tileMenuOpenId === t.id ? (
+                  {tileMenuOpenId === t.id && !props.focusMode ? (
                     <div
                       data-tile-menu-root
                       className="absolute right-3 top-12 z-50 w-44 rounded-xl border border-slate-200 bg-white p-1 shadow-sm dark:border-slate-700 dark:bg-slate-950/95"
@@ -477,6 +363,33 @@ export default function AnalyzerTilesCard(props: Props) {
                       </button>
 
                       <div className="my-1 h-px bg-slate-200 dark:bg-slate-800" />
+
+                      {props.tabs.length > 1 ? (
+                      <button
+                        type="button"
+                        className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-xs text-slate-700 hover:bg-slate-100 dark:text-slate-100 dark:hover:bg-white/5"
+                        onClick={() => {
+                          setTileMenuOpenId(null);
+                          setPickTab({ mode: "move", tile: t });
+                        }}
+                      >
+                        <FiCornerUpRight className="h-4 w-4" aria-hidden="true" />
+                        Move to tab…
+                      </button>
+                      ) : null}
+
+                      <button
+                        type="button"
+                        className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-xs text-slate-700 hover:bg-slate-100 dark:text-slate-100 dark:hover:bg-white/5"
+                        onClick={() => {
+                          setTileMenuOpenId(null);
+                          setPickTab({ mode: "duplicate", tile: t });
+                        }}
+                      >
+                        <FiCopy className="h-4 w-4" aria-hidden="true" />
+                        Duplicate…
+                      </button>
+
 
                       <button
                         type="button"
@@ -524,7 +437,7 @@ export default function AnalyzerTilesCard(props: Props) {
                     </div>
                   )}
 
-                  {props.layoutEditMode ? (
+                  {editingLayout ? (
                     <div className="pointer-events-none absolute bottom-1 right-1 text-slate-400/80 dark:text-slate-500/80">
                       <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
                         <path d="M6 14L14 6" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" />
@@ -549,6 +462,22 @@ export default function AnalyzerTilesCard(props: Props) {
           )}
         </div>
       )}
+
+      {pickTab ? (
+        <PickTabDialog
+          mode={pickTab.mode}
+          tileTitle={pickTab.tile.title || `Tile ${pickTab.tile.id}`}
+          tabs={props.tabs}
+          currentTabId={pickTab.tile.tabId}
+          onCancel={() => setPickTab(null)}
+          onConfirm={(tabId) => {
+            const { mode, tile } = pickTab;
+            setPickTab(null);
+            if (mode === "move") props.onMoveTile(tile, tabId);
+            else props.onDuplicateTile(tile, tabId);
+          }}
+        />
+      ) : null}
 
       {infoTileId != null ? (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/70 p-4 backdrop-blur-sm">
@@ -616,17 +545,26 @@ export default function AnalyzerTilesCard(props: Props) {
                           <div className="mt-1 text-sm text-slate-900 dark:text-slate-100">{slaveLabel}</div>
                         </div>
 
-                        <div>
-                          <div className="text-xs font-semibold text-slate-500 dark:text-slate-400">Register Type:</div>
-                          <div className="mt-1 ml-1 text-sm text-slate-900 dark:text-slate-100">{info.registerType}</div>
-                        </div>
-
-                        <div>
-                          <div className="text-xs font-semibold text-slate-500 dark:text-slate-400">Register Address:</div>
-                          <div className="mt-1 ml-1 text-sm text-slate-900 dark:text-slate-100">
-                            {info.registerAddress != null ? info.registerAddressFormatted : ""}
+                        {info.calculatedSource != null ? (
+                          <div className="sm:col-span-2">
+                            <div className="text-xs font-semibold text-slate-500 dark:text-slate-400">Source:</div>
+                            <div className="mt-1 ml-1 text-sm text-slate-900 dark:text-slate-100">{info.calculatedSource}</div>
                           </div>
-                        </div>
+                        ) : (
+                          <>
+                            <div>
+                              <div className="text-xs font-semibold text-slate-500 dark:text-slate-400">Register Type:</div>
+                              <div className="mt-1 ml-1 text-sm text-slate-900 dark:text-slate-100">{info.registerType}</div>
+                            </div>
+
+                            <div>
+                              <div className="text-xs font-semibold text-slate-500 dark:text-slate-400">Register Address:</div>
+                              <div className="mt-1 ml-1 text-sm text-slate-900 dark:text-slate-100">
+                                {info.registerAddress != null ? info.registerAddressFormatted : ""}
+                              </div>
+                            </div>
+                          </>
+                        )}
 
                         <div>
                           <div className="text-xs font-semibold text-slate-500 dark:text-slate-400">Poll interval:</div>

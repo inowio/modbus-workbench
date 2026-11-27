@@ -35,6 +35,12 @@ export default function AnalyzerTrendTile(props: {
 
   const lastWindowMsRef = useRef<number | null>(props.windowMs);
 
+  /** Tile width, bucketed to 40px so resizing doesn't rebuild the chart on every pixel. */
+  const [chartWidthPx, setChartWidthPx] = useState(480);
+  const trackWidth = (w: number) => {
+    if (Number.isFinite(w) && w > 0) setChartWidthPx(Math.max(40, Math.round(w / 40) * 40));
+  };
+
   useEffect(() => {
     if (typeof document === "undefined") return;
     const root = document.documentElement;
@@ -82,8 +88,10 @@ export default function AnalyzerTrendTile(props: {
         type: "time",
         min: minTs ?? undefined,
         max: maxTs,
+        // ~1 time label per 90px; never draw labels on top of each other (narrow tiles).
+        splitNumber: Math.max(2, Math.floor((chartWidthPx - 62) / 90)),
         axisLine: { lineStyle: { color: axisLine } },
-        axisLabel: { color: axisLabel },
+        axisLabel: { color: axisLabel, hideOverlap: true, showMinLabel: false, showMaxLabel: false },
         splitLine: { lineStyle: { color: splitLine } },
       },
       yAxis: {
@@ -114,7 +122,7 @@ export default function AnalyzerTrendTile(props: {
         },
       ],
     } satisfies EChartsOption;
-  }, [isDark, props.nowTsMs, renderPoints, props.title, props.windowMs]);
+  }, [isDark, props.nowTsMs, renderPoints, props.title, props.windowMs, chartWidthPx]);
 
   function clearResizeTimers() {
     for (const id of resizeTimeoutIdsRef.current) {
@@ -158,8 +166,10 @@ export default function AnalyzerTrendTile(props: {
     if (!host) return;
 
     scheduleResize(80);
+    trackWidth(host.getBoundingClientRect().width);
 
     const ro = new ResizeObserver(() => {
+      trackWidth(host.getBoundingClientRect().width);
       scheduleResize(24);
     });
     ro.observe(host);
@@ -213,20 +223,18 @@ export default function AnalyzerTrendTile(props: {
     }, 250);
   }, [props.points]);
 
+  // Rebuild the chart from scratch only when its structure changes (trend window, theme, title,
+  // binary/step mode); every other update — new points, the clock moving the axis and zoom window —
+  // is merged into the existing chart, which is far cheaper than recreating it several times a second.
+  const isBinaryNow = (option.series as { step?: unknown }[] | undefined)?.[0]?.step != null;
+  const structureKey = `${props.windowMs ?? "all"}|${isDark ? "dark" : "light"}|${props.title}|${isBinaryNow ? "step" : "line"}`;
+  // Compared with the last *committed* render (updated in an effect), so it stays correct when
+  // React renders twice before committing.
+  const committedStructureKeyRef = useRef<string | null>(null);
+  const rebuild = committedStructureKeyRef.current !== null && committedStructureKeyRef.current !== structureKey;
   useEffect(() => {
-    const inst = chartRef.current?.getEchartsInstance?.();
-    if (!inst?.dispatchAction) return;
-    if (props.windowMs == null) return;
-
-    const maxTs = props.nowTsMs;
-    const minTs = maxTs - props.windowMs;
-    inst.dispatchAction({
-      type: "dataZoom",
-      dataZoomIndex: 0,
-      startValue: minTs,
-      endValue: maxTs,
-    });
-  }, [props.nowTsMs, props.windowMs]);
+    committedStructureKeyRef.current = structureKey;
+  });
 
   return (
     <div ref={hostRef} className="h-full w-full" style={{ width: "100%", height: "100%" }}>
@@ -235,7 +243,7 @@ export default function AnalyzerTrendTile(props: {
         echarts={echarts}
         option={option}
         lazyUpdate
-        notMerge
+        notMerge={rebuild}
         opts={{ renderer: "canvas" }}
         onChartReady={() => {
           scheduleResize(80);

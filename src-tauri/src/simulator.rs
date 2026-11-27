@@ -1,17 +1,22 @@
 //! Modbus TCP **server** ("TCP Simulator"): exposes configured registers so
 //! external masters can poll/write the app as one or more virtual devices.
 //!
-//! Layer 1 (this module): in-memory banks per Unit ID, a tokio-modbus TCP
-//! server task, Hold registers, register CRUD, Start/Stop. Generators, rules,
-//! route-from-slave, and device templates arrive in later plans.
+//! Contents: in-memory banks per Unit ID served by a tokio-modbus TCP server;
+//! register sources (Hold, generator, device preset, route-from-slave); rules
+//! (interval / condition / on-write triggers, delayed actions); devices
+//! instantiated from built-in, custom (app-global) or workspace-slave
+//! templates; profile export/import; and the CRUD commands. Register, device
+//! and rule edits apply to a running simulator immediately (the tick and the
+//! route reader re-read their live lists); port, expose host and tick
+//! interval apply on the next Start.
 
-#![allow(dead_code)] // trimmed as later tasks consume these items
+#![allow(dead_code)] // a few items (e.g. SimEngine::new, create_sim_schema) are only used by tests
 
 use std::collections::HashMap;
 use std::future;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -27,6 +32,8 @@ use tokio_modbus::prelude::*;
 use tokio_modbus::server::tcp::{accept_tcp_connection, Server};
 use tokio_modbus::server::Service;
 
+use crate::sim_scaling::{build_reg_meta, eng_from_raw, f32_shortest, raw_from_eng, round_to, RegMetaMap};
+
 /// Number of 16-bit words a data type occupies (1-, 2- and 4-word types).
 pub fn word_count(data_type: &str) -> usize {
     match data_type {
@@ -40,15 +47,17 @@ fn swap_bytes_word(w: u16) -> u16 {
     (w << 8) | (w >> 8)
 }
 
-/// Big-endian bytes of the value for the given type. Integer casts saturate
-/// (Rust float→int semantics); precision beyond 2^53 is lossy for u64/i64 —
-/// acceptable for simulated values.
+/// Big-endian bytes of the value for the given type. Every integer type
+/// saturates at its own range (Rust float→int `as` semantics: out-of-range
+/// clamps to MIN/MAX, NaN → 0) — e.g. 70000 as u16 is 65535, never a wrapped
+/// 4464. Precision beyond 2^53 is lossy for u64/i64 — acceptable for
+/// simulated values.
 fn value_to_be_bytes(data_type: &str, value: f64) -> Result<Vec<u8>, String> {
     match data_type {
-        "u16" => Ok(((value as i64) as u16).to_be_bytes().to_vec()),
-        "i16" => Ok(((value as i64) as i16).to_be_bytes().to_vec()),
-        "u32" => Ok(((value as i64) as u32).to_be_bytes().to_vec()),
-        "i32" => Ok(((value as i64) as i32).to_be_bytes().to_vec()),
+        "u16" => Ok((value as u16).to_be_bytes().to_vec()),
+        "i16" => Ok((value as i16).to_be_bytes().to_vec()),
+        "u32" => Ok((value as u32).to_be_bytes().to_vec()),
+        "i32" => Ok((value as i32).to_be_bytes().to_vec()),
         "f32" => Ok((value as f32).to_be_bytes().to_vec()),
         "u64" => Ok((value as u64).to_be_bytes().to_vec()),
         "i64" => Ok((value as i64).to_be_bytes().to_vec()),
@@ -149,7 +158,7 @@ pub fn decode_value(data_type: &str, byte_order: &str, words: &[u16]) -> Option<
 
 use std::f64::consts::PI;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GenParams {
     pub min: f64,
     pub max: f64,
@@ -201,7 +210,7 @@ pub fn generator_value(kind: &str, p: &GenParams, elapsed_ms: f64, seed: u64) ->
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PresetParams {
     pub min: f64,
     pub max: f64,
@@ -270,7 +279,7 @@ pub fn transform_route_words(
 /// Dynamic (device/generator) register resolved from a `SimRegister`'s
 /// `value_source` + `source_params`. `None` from `parse_dynamic` for hold
 /// registers (Plan 1 behavior) or unparseable params.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum DynKind {
     Generator { kind: String, params: GenParams, seed: u64 },
     Preset { preset: String, params: PresetParams, seed: u64 },
@@ -285,13 +294,13 @@ pub enum DynKind {
         scale: f64,
         offset: f64,
         /// Byte order the SOURCE value is decoded with. When it equals the
-        /// register's own `byte_order` and scale/offset are identity, the tick
-        /// takes a fast path and mirrors the raw words verbatim.
+        /// register's own `byte_order` and scale/offset are identity, the
+        /// route reader takes a fast path and mirrors the raw words verbatim.
         src_byte_order: String,
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DynReg {
     pub unit: u8,
     pub bank: u8,
@@ -300,6 +309,11 @@ pub struct DynReg {
     pub byte_order: String,
     pub kind: DynKind,
     pub interval_ms: f64,
+    /// Engineering scale/offset of the register (engineering = raw * scale +
+    /// scale_offset). Generators/presets produce engineering values; routes
+    /// keep their own source-side transform inside `DynKind::Route`.
+    pub scale: f64,
+    pub scale_offset: f64,
 }
 
 fn json_f64(v: &serde_json::Value, key: &str, default: f64) -> f64 {
@@ -313,16 +327,18 @@ pub fn parse_dynamic(reg: &SimRegister) -> Option<DynReg> {
     let v: serde_json::Value = serde_json::from_str(&reg.source_params).ok()?;
     let interval_ms = if reg.interval_ms > 0 { reg.interval_ms as f64 } else { 1000.0 };
     let seed = ((reg.unit_id as u64) << 32) ^ (reg.function_code as u64) << 16 ^ (reg.address as u64);
-    let common = (json_f64(&v, "min", 0.0), json_f64(&v, "max", 100.0), json_f64(&v, "periodMs", 1000.0));
+    let (min, max) = (json_f64(&v, "min", 0.0), json_f64(&v, "max", 100.0));
     let kind = match reg.value_source.as_str() {
         "generator" => DynKind::Generator {
             kind: v.get("kind").and_then(|x| x.as_str()).unwrap_or("sine").to_string(),
-            params: GenParams { min: common.0, max: common.1, period_ms: common.2 },
+            params: GenParams { min, max, period_ms: json_f64(&v, "periodMs", 1000.0) },
             seed,
         },
+        // No `periodMs` → 0, so `preset_value` applies its own slow default
+        // (60 s): presets model physical signals that drift, not 1 s waves.
         "device" => DynKind::Preset {
             preset: v.get("preset").and_then(|x| x.as_str()).unwrap_or("analog").to_string(),
-            params: PresetParams { min: common.0, max: common.1, period_ms: common.2 },
+            params: PresetParams { min, max, period_ms: json_f64(&v, "periodMs", 0.0) },
             seed,
         },
         "route" => DynKind::Route {
@@ -344,6 +360,7 @@ pub fn parse_dynamic(reg: &SimRegister) -> Option<DynReg> {
     Some(DynReg {
         unit: reg.unit_id as u8, bank: reg.function_code as u8, address: reg.address as u16,
         data_type: reg.data_type.clone(), byte_order: reg.byte_order.clone(), kind, interval_ms,
+        scale: reg.scale.unwrap_or(1.0), scale_offset: reg.scale_offset.unwrap_or(0.0),
     })
 }
 
@@ -356,16 +373,63 @@ pub fn dyn_value(d: &DynReg, elapsed_ms: f64) -> f64 {
             generator_value(kind, params, elapsed_ms, seed ^ (elapsed_ms as u64))
         }
         DynKind::Preset { preset, params, seed } => preset_value(preset, params, elapsed_ms, *seed),
-        // Route registers are populated by the tick's routed network read
-        // (Task 4), not by `dyn_value`; this arm only exists to keep the
-        // match exhaustive.
+        // Route registers are populated by `route_loop`'s network reads, not
+        // by `dyn_value`; this arm only exists to keep the match exhaustive.
         DynKind::Route { .. } => 0.0,
+    }
+}
+
+/// Raw register value of a generator/preset register: the engineering value
+/// from `dyn_value` converted through the register's scale/offset and clamped
+/// to its data type (`raw_from_eng`; identity at scale 1 / offset 0).
+pub fn dyn_raw_value(d: &DynReg, elapsed_ms: f64) -> f64 {
+    crate::sim_scaling::raw_from_eng(dyn_value(d, elapsed_ms), d.scale, d.scale_offset, &d.data_type)
+}
+
+/// Overwrite `words` at consecutive addresses starting at `address`, but ONLY
+/// when every address of the span is already configured: a missing unit, a
+/// missing address anywhere in the span, or a span past 65535 writes nothing
+/// (all-or-nothing, so e.g. an f32 action never lands half a value on a
+/// single u16 register). This is the runtime write path
+/// (rule actions, generator/device/route updates) — nothing but configured
+/// registers ever exists, and a register deleted or moved while the tick was
+/// computing its value is not resurrected ("ghost register"). Seeding
+/// (`registers_to_banks`, `apply_to_running`) uses `place_words` instead.
+pub fn update_existing_words(banks: &mut HashMap<u8, SimBanks>, unit: u8, bank: u8, address: u16, words: &[u16]) {
+    let Some(b) = banks.get_mut(&unit) else { return };
+    if address as usize + words.len() > 65536 {
+        return;
+    }
+    let all_present = (0..words.len()).all(|i| {
+        let addr = address + i as u16;
+        match bank {
+            1 => b.coils.contains_key(&addr),
+            2 => b.discrete_inputs.contains_key(&addr),
+            3 => b.holding.contains_key(&addr),
+            4 => b.input.contains_key(&addr),
+            _ => false,
+        }
+    });
+    if !all_present {
+        return;
+    }
+    for (i, &w) in words.iter().enumerate() {
+        let addr = address + i as u16;
+        match bank {
+            1 => { if let Some(slot) = b.coils.get_mut(&addr) { *slot = w != 0; } }
+            2 => { if let Some(slot) = b.discrete_inputs.get_mut(&addr) { *slot = w != 0; } }
+            3 => { if let Some(slot) = b.holding.get_mut(&addr) { *slot = w; } }
+            4 => { if let Some(slot) = b.input.get_mut(&addr) { *slot = w; } }
+            _ => {}
+        }
     }
 }
 
 /// Write `words` at consecutive addresses starting at `address`, in the bank
 /// selected by Modbus function code (1=coils, 2=discrete inputs, 3=holding,
-/// 4=input). Bit banks store a word as `!= 0`.
+/// 4=input), CREATING the unit/addresses as needed. Bit banks store a word as
+/// `!= 0`. Only for seeding configured registers — runtime updates go through
+/// `update_existing_words`.
 pub fn place_words(banks: &mut HashMap<u8, SimBanks>, unit: u8, bank: u8, address: u16, words: &[u16]) {
     let b = banks.entry(unit).or_default();
     for (i, &w) in words.iter().enumerate() {
@@ -553,21 +617,63 @@ impl Service for SimService {
     }
 }
 
+/// Protocol limits (Modbus Application Protocol v1.1b3): an out-of-range
+/// quantity is IllegalDataValue; a span running past the last address
+/// is IllegalDataAddress. Without this a 200-register read encodes a
+/// corrupt frame and a zero-quantity read "succeeds".
+fn validate_request_span(req: &Request<'_>) -> Result<(), ExceptionCode> {
+    let (addr, qty, max_qty) = match req {
+        Request::ReadCoils(a, c) | Request::ReadDiscreteInputs(a, c) => (*a, *c as usize, 2000),
+        Request::ReadHoldingRegisters(a, c) | Request::ReadInputRegisters(a, c) => (*a, *c as usize, 125),
+        Request::WriteMultipleCoils(a, v) => (*a, v.len(), 1968),
+        Request::WriteMultipleRegisters(a, v) => (*a, v.len(), 123),
+        _ => (0, 1, 1),
+    };
+    if qty == 0 || qty > max_qty {
+        return Err(ExceptionCode::IllegalDataValue);
+    }
+    if addr as usize + qty > 65536 {
+        return Err(ExceptionCode::IllegalDataAddress);
+    }
+    Ok(())
+}
+
 impl SimService {
     fn handle(&self, unit: u8, req: Request<'static>) -> Result<Response, ExceptionCode> {
+        let is_write = matches!(
+            req,
+            Request::WriteSingleCoil(..)
+                | Request::WriteSingleRegister(..)
+                | Request::WriteMultipleCoils(..)
+                | Request::WriteMultipleRegisters(..)
+        );
+        if !is_write {
+            // Reads (and unsupported functions) share the lock so concurrent
+            // clients never serialise behind each other.
+            let banks = self.banks.read().map_err(|_| ExceptionCode::ServerDeviceFailure)?;
+            // Unit IDs with no bank answer like a gateway (0x0B, target device failed
+            // to respond) so scanners can tell absent units from present ones; a
+            // missing register inside an existing unit still answers IllegalDataAddress.
+            let bank = banks.get(&unit).ok_or(ExceptionCode::GatewayTargetDevice)?;
+            validate_request_span(&req)?;
+            return match req {
+                Request::ReadCoils(a, c) => Ok(Response::ReadCoils(bank.read_coils(a, c)?)),
+                Request::ReadDiscreteInputs(a, c) => {
+                    Ok(Response::ReadDiscreteInputs(bank.read_discrete_inputs(a, c)?))
+                }
+                Request::ReadHoldingRegisters(a, c) => {
+                    Ok(Response::ReadHoldingRegisters(bank.read_holding(a, c)?))
+                }
+                Request::ReadInputRegisters(a, c) => {
+                    Ok(Response::ReadInputRegisters(bank.read_input(a, c)?))
+                }
+                _ => Err(ExceptionCode::IllegalFunction),
+            };
+        }
         let mut banks = self.banks.write().map_err(|_| ExceptionCode::ServerDeviceFailure)?;
-        let bank = banks.get_mut(&unit).ok_or(ExceptionCode::IllegalDataAddress)?;
+        let bank = banks.get_mut(&unit).ok_or(ExceptionCode::GatewayTargetDevice)?;
+        validate_request_span(&req)?;
         match req {
-            Request::ReadCoils(a, c) => Ok(Response::ReadCoils(bank.read_coils(a, c)?)),
-            Request::ReadDiscreteInputs(a, c) => {
-                Ok(Response::ReadDiscreteInputs(bank.read_discrete_inputs(a, c)?))
-            }
-            Request::ReadHoldingRegisters(a, c) => {
-                Ok(Response::ReadHoldingRegisters(bank.read_holding(a, c)?))
-            }
-            Request::ReadInputRegisters(a, c) => {
-                Ok(Response::ReadInputRegisters(bank.read_input(a, c)?))
-            }
             Request::WriteSingleCoil(a, v) => {
                 bank.write_single_coil(a, v)?;
                 self.push_write(unit, 1, a);
@@ -578,14 +684,21 @@ impl SimService {
                 self.push_write(unit, 3, a);
                 Ok(Response::WriteSingleRegister(a, v))
             }
+            // Multi-writes are all-or-nothing (see `write_bits`/`write_words`)
+            // and report every written address, so an `onWrite` rule on any
+            // address inside the span sees the write.
             Request::WriteMultipleCoils(a, vals) => {
                 bank.write_multiple_coils(a, &vals)?;
-                self.push_write(unit, 1, a);
+                for i in 0..vals.len() as u16 {
+                    self.push_write(unit, 1, a + i);
+                }
                 Ok(Response::WriteMultipleCoils(a, vals.len() as u16))
             }
             Request::WriteMultipleRegisters(a, vals) => {
                 bank.write_multiple_registers(a, &vals)?;
-                self.push_write(unit, 3, a);
+                for i in 0..vals.len() as u16 {
+                    self.push_write(unit, 3, a + i);
+                }
                 Ok(Response::WriteMultipleRegisters(a, vals.len() as u16))
             }
             _ => Err(ExceptionCode::IllegalFunction),
@@ -624,6 +737,173 @@ impl<R: tauri::Runtime> ValuesSink for tauri::AppHandle<R> {
 /// animate at each register's own interval; this only caps the display refresh.
 const EMIT_INTERVAL_MS: f64 = 100.0;
 
+/// Upper bound on one route-from-slave read, INCLUDING the wait for the shared
+/// client session lock. A read that exceeds it marks the register "stale".
+const ROUTE_READ_TIMEOUT_MS: u64 = 1000;
+
+/// Key of a configured register in the banks: (unit, bank/function code, address).
+type RegKey = (u8, u8, u16);
+
+/// Next-due time of a periodic register update, plus the period it was
+/// scheduled with (so a changed interval is detected and re-timed).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Due {
+    pub at: f64,
+    pub period: f64,
+}
+
+/// Next due time after a fire that was due at `due`: stays on the
+/// `due + period` grid (no cumulative drift from tick jitter), but if that is
+/// still not in the future (more than one period behind) it resyncs to
+/// `elapsed + period` instead of bursting to catch up.
+pub fn advance_due(due: f64, period: f64, elapsed: f64) -> f64 {
+    let next = due + period;
+    if next <= elapsed { elapsed + period } else { next }
+}
+
+/// Whether the register `d` is due at `elapsed`; if so, reschedules it in
+/// `next_due`. A register seen for the first time (or whose interval changed)
+/// is due immediately.
+fn take_due(next_due: &mut HashMap<RegKey, Due>, d: &DynReg, elapsed: f64) -> bool {
+    let key = (d.unit, d.bank, d.address);
+    let at = match next_due.get(&key) {
+        Some(due) if due.period == d.interval_ms => {
+            if elapsed < due.at {
+                return false;
+            }
+            advance_due(due.at, d.interval_ms, elapsed)
+        }
+        _ => elapsed + d.interval_ms,
+    };
+    next_due.insert(key, Due { at, period: d.interval_ms });
+    true
+}
+
+/// Drop scheduling state for registers no longer in `dynamics` (deleted or
+/// moved) or whose interval changed, so the live list's edits take effect
+/// cleanly; unchanged registers keep their schedule.
+pub fn prune_next_due(next_due: &mut HashMap<RegKey, Due>, dynamics: &[DynReg]) {
+    let live: HashMap<RegKey, f64> = dynamics
+        .iter()
+        .map(|d| ((d.unit, d.bank, d.address), d.interval_ms))
+        .collect();
+    next_due.retain(|k, due| live.get(k) == Some(&due.period));
+}
+
+/// A rule action whose rule fired but whose per-action delay hasn't elapsed.
+#[derive(Debug, Clone)]
+pub struct PendingAction {
+    pub due: f64,
+    pub rule_id: i64,
+    pub action: TimedAction,
+    pub seed: u64,
+}
+
+/// Bring per-rule runtime state in line with a hot-applied rule list: a rule
+/// that was removed, disabled, or changed in any way loses its `RuleState`
+/// (interval due time, last combined condition/value, per-condition deadband
+/// latches) and its queued delayed actions;
+/// an identical rule keeps both.
+pub fn reconcile_rules(
+    prev: &[RuleDef],
+    next: &[RuleDef],
+    states: &mut HashMap<i64, RuleState>,
+    pending: &mut Vec<PendingAction>,
+) {
+    let unchanged = |id: i64| {
+        let before = prev.iter().find(|r| r.id == id);
+        let after = next.iter().find(|r| r.id == id);
+        matches!((before, after), (Some(a), Some(b)) if a == b && b.enabled)
+    };
+    states.retain(|id, _| unchanged(*id));
+    pending.retain(|p| unchanged(p.rule_id));
+}
+
+/// True when the route register `d` a read was started for is still exactly
+/// configured in the live list (same register, same route params). A read that
+/// completes after its register was edited, moved, or deleted is discarded.
+pub fn route_still_current(dynamics: &[DynReg], d: &DynReg) -> bool {
+    dynamics.iter().any(|x| x == d)
+}
+
+/// Route connection kinds: `"serial"` and `"rtu"` both mean the workspace's
+/// RTU session (matches `modbus::ensure_route_session`); anything else is TCP.
+fn is_serial_kind(kind: &str) -> bool {
+    matches!(kind, "serial" | "rtu")
+}
+
+/// The `slaves.connection_kind` spelling for a route connection kind (the
+/// slaves table stores `"serial"`, never `"rtu"`).
+fn slave_table_kind(kind: &str) -> &str {
+    if is_serial_kind(kind) { "serial" } else { kind }
+}
+
+/// Route-from-slave reader, run as its own task so a slow or hung source
+/// never stalls the tick (generators, rules, delayed actions, emits). Reads
+/// each due route register through the workspace's shared client session and
+/// writes the result through `update_existing_words` (a register deleted
+/// mid-read is not resurrected; a result whose register was edited mid-read
+/// is discarded — see `route_still_current`). Status per register: "ok", "stale" (read
+/// failed/timed out — last-good value kept) or "missing" (no session).
+async fn route_loop(
+    banks: Banks,
+    statuses: StatusMap,
+    dynamics: Arc<Mutex<Arc<Vec<DynReg>>>>,
+    tcp_sessions: crate::modbus::SessionMap,
+    rtu_sessions: crate::modbus::SessionMap,
+    workspace: String,
+    tick_ms: u64,
+    start: std::time::Instant,
+) {
+    let mut ticker = tokio::time::interval(Duration::from_millis(tick_ms.max(10)));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut next_due: HashMap<RegKey, Due> = HashMap::new();
+    loop {
+        ticker.tick().await;
+        let all: Arc<Vec<DynReg>> = dynamics.lock().map(|g| Arc::clone(&g)).unwrap_or_default();
+        let routes: Vec<DynReg> = all.iter().filter(|d| matches!(d.kind, DynKind::Route { .. })).cloned().collect();
+        prune_next_due(&mut next_due, &routes);
+        if let Ok(mut s) = statuses.lock() {
+            s.retain(|k, _| routes.iter().any(|d| (d.unit, d.bank, d.address) == *k));
+        }
+        for d in routes.iter() {
+            let elapsed = start.elapsed().as_millis() as f64;
+            if !take_due(&mut next_due, d, elapsed) {
+                continue;
+            }
+            let DynKind::Route { slave_unit, connection_kind, src_fc, src_addr, count, scale, offset, src_byte_order } = &d.kind else {
+                continue;
+            };
+            let map = if is_serial_kind(connection_kind) { &rtu_sessions } else { &tcp_sessions };
+            let session = map.lock().ok().and_then(|g| g.get(&workspace).cloned());
+            let status = match session {
+                None => "missing",
+                Some(sess) => match route_read_words(sess, *slave_unit, *src_fc, *src_addr, *count, ROUTE_READ_TIMEOUT_MS).await {
+                    Ok(words) => {
+                        let out = transform_route_words(d, &words, *scale, *offset, src_byte_order);
+                        if let Ok(mut guard) = banks.write() {
+                            // Re-check under the banks lock: if the register was
+                            // edited/removed while the read was in flight, the
+                            // result belongs to the old config — discard it.
+                            // (Edits drop the old entry before touching banks.)
+                            let current = dynamics.lock().map(|g| route_still_current(g.as_slice(), d)).unwrap_or(false);
+                            if !current {
+                                continue; // no status either: the register changed
+                            }
+                            update_existing_words(&mut guard, d.unit, d.bank, d.address, &out);
+                        }
+                        "ok"
+                    }
+                    Err(_) => "stale",
+                },
+            };
+            if let Ok(mut s) = statuses.lock() {
+                s.insert((d.unit, d.bank, d.address), status);
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct SimEngine {
     banks: Option<Banks>,
@@ -632,17 +912,26 @@ pub struct SimEngine {
     handle: Option<JoinHandle<()>>,
     tick_shutdown: Option<oneshot::Sender<()>>,
     tick_handle: Option<JoinHandle<()>>,
+    route_handle: Option<JoinHandle<()>>,
     statuses: StatusMap,
     // Live generator/route + rule lists the tick reads each iteration. Held
     // behind a shared lock so mutations (add/edit/delete register, rule, or
     // device) take effect immediately without a Stop/Start.
-    dynamics: Arc<Mutex<Vec<DynReg>>>,
-    rules: Arc<Mutex<Vec<RuleDef>>>,
+    dynamics: Arc<Mutex<Arc<Vec<DynReg>>>>,
+    rules: Arc<Mutex<Arc<Vec<RuleDef>>>>,
+    // Register metadata (type/byte order/scale/decimals by unit, bank, start
+    // address) that rule conditions decode with. The tick clones the inner
+    // `Arc` under a short lock each iteration. Unlike dynamics/rules this is
+    // not replaced by `start`, so it can be set before the first tick.
+    reg_meta: Arc<Mutex<Arc<RegMetaMap>>>,
     // Observability: live client registry + event ring, and the wall-clock
     // start time (for uptime). `observer` persists across Start/Stop so the
     // event log is history; `started_at_ms` is set on Start, cleared on Stop.
     observer: Observer,
     started_at_ms: Option<u64>,
+    // Set by `start` and `request_full`; the tick clears it when it sends a
+    // full `simulator_values` event (every row, `full: true`).
+    full_requested: Arc<AtomicBool>,
 }
 
 impl SimEngine {
@@ -677,6 +966,12 @@ impl SimEngine {
     /// Wall-clock start time in epoch ms while running, else `None`.
     pub fn started_at_ms(&self) -> Option<u64> {
         self.started_at_ms
+    }
+
+    /// Ask the tick to send its next `simulator_values` event as a full one
+    /// (every row), e.g. when a frontend (re)subscribes. No-op when stopped.
+    pub fn request_full(&self) {
+        self.full_requested.store(true, Ordering::Relaxed);
     }
 
     pub fn snapshot(&self) -> HashMap<u8, SimBanks> {
@@ -744,7 +1039,22 @@ impl SimEngine {
     /// the next tick — no Stop/Start needed.
     pub fn set_dynamics(&self, dynamics: Vec<DynReg>) {
         if let Ok(mut g) = self.dynamics.lock() {
-            *g = dynamics;
+            *g = Arc::new(dynamics);
+        }
+    }
+
+    /// Drop the register at `(unit, bank, address)` from the live generator/
+    /// route list. Edits call this before touching the banks so an in-flight
+    /// route read for the old config is discarded instead of overwriting the
+    /// new value; `refresh_running_config` then re-adds the new config.
+    pub fn forget_dynamic(&self, unit: u8, bank: u8, address: u16) {
+        if let Ok(mut g) = self.dynamics.lock() {
+            let kept: Vec<DynReg> = g
+                .iter()
+                .filter(|d| (d.unit, d.bank, d.address) != (unit, bank, address))
+                .cloned()
+                .collect();
+            *g = Arc::new(kept);
         }
     }
 
@@ -752,7 +1062,16 @@ impl SimEngine {
     pub fn set_rules(&self, mut rules: Vec<RuleDef>) {
         rules.sort_by_key(|r| r.sort_order);
         if let Ok(mut g) = self.rules.lock() {
-            *g = rules;
+            *g = Arc::new(rules);
+        }
+    }
+
+    /// Replace the register metadata rule conditions decode with (built by
+    /// `build_reg_meta`). Takes effect on the next tick. Call it before
+    /// `start` so the first tick already sees it.
+    pub fn set_register_meta(&self, meta: RegMetaMap) {
+        if let Ok(mut g) = self.reg_meta.lock() {
+            *g = Arc::new(meta);
         }
     }
 
@@ -767,7 +1086,7 @@ impl SimEngine {
         dynamics: Vec<DynReg>,
         tcp_sessions: crate::modbus::SessionMap,
         rtu_sessions: crate::modbus::SessionMap,
-        rules: Vec<RuleDef>,
+        mut rules: Vec<RuleDef>,
     ) -> Result<ListenInfo, String> {
         if self.is_running() {
             return Err("simulator already running".to_string());
@@ -783,6 +1102,7 @@ impl SimEngine {
         let banks: Banks = Arc::new(RwLock::new(initial));
         self.banks = Some(banks.clone());
         self.clients.store(0, Ordering::Relaxed);
+        self.full_requested.store(true, Ordering::Relaxed);
         self.started_at_ms = Some(now_ms());
         if let Ok(mut o) = self.observer.lock() {
             o.clients.clear();
@@ -821,92 +1141,98 @@ impl SimEngine {
         self.shutdown = Some(tx);
         self.handle = Some(handle);
 
-        // Interval tick task: recomputes device/generator registers and pushes
-        // live values via the `simulator_values` event. Never holds the banks
-        // write lock across an `.await`.
+        // Route-from-slave reads run in their own task (see `route_loop`), so
+        // the tick below never awaits the network. Both tasks share the banks,
+        // statuses and live generator/route list.
         let statuses: StatusMap = Arc::new(Mutex::new(HashMap::new()));
         self.statuses = statuses.clone();
 
         // Store the generator/rule lists behind shared locks so mutations while
         // running take effect on the next tick (no Stop/Start).
-        let dynamics_arc: Arc<Mutex<Vec<DynReg>>> = Arc::new(Mutex::new(dynamics));
+        let dynamics_arc: Arc<Mutex<Arc<Vec<DynReg>>>> = Arc::new(Mutex::new(Arc::new(dynamics)));
         self.dynamics = dynamics_arc.clone();
-        let rules_arc: Arc<Mutex<Vec<RuleDef>>> = Arc::new(Mutex::new(rules));
+        rules.sort_by_key(|r| r.sort_order);
+        let prev_rules_init: Arc<Vec<RuleDef>> = Arc::new(rules);
+        let rules_arc: Arc<Mutex<Arc<Vec<RuleDef>>>> = Arc::new(Mutex::new(Arc::clone(&prev_rules_init)));
         self.rules = rules_arc.clone();
 
+        let start = std::time::Instant::now();
+        self.route_handle = Some(tokio::spawn(route_loop(
+            banks.clone(),
+            statuses.clone(),
+            dynamics_arc.clone(),
+            tcp_sessions,
+            rtu_sessions,
+            workspace.clone(),
+            tick_ms,
+            start,
+        )));
+
+        // Interval tick task: recomputes generator/device registers, runs
+        // rules and their delayed actions, and pushes live values via the
+        // `simulator_values` event. Fully synchronous per tick — it never
+        // awaits anything but the ticker, and never holds the banks write lock
+        // across an `.await`.
         let (tick_tx, mut tick_rx) = oneshot::channel::<()>();
         let tick_banks = banks.clone();
         let tick_statuses = statuses.clone();
         let tick_writes = writes.clone();
         let tick_dynamics = dynamics_arc.clone();
         let tick_rules = rules_arc.clone();
+        let tick_meta = self.reg_meta.clone();
+        let tick_full = self.full_requested.clone();
         let tick_handle = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_millis(tick_ms.max(10)));
-            let start = std::time::Instant::now();
+            // A late tick (busy runtime, suspended laptop) runs once, not as a
+            // burst of catch-up ticks.
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             // Per-register next-due time keyed by (unit, bank, address) so the
             // list can change under us (add/remove) without misaligning timing.
-            let mut next_due: HashMap<(u8, u8, u16), f64> = HashMap::new();
+            let mut next_due: HashMap<RegKey, Due> = HashMap::new();
             let mut last_emit = 0.0f64;
+            // What the frontend was last sent, per register, to diff against.
+            let mut last_sent: HashMap<RegKey, SentValue> = HashMap::new();
             let mut rule_states: HashMap<i64, RuleState> = HashMap::new();
+            // The rule list the states/pending actions below belong to; when
+            // a hot-apply changes it, `reconcile_rules` drops what's stale.
+            let mut prev_rules: Arc<Vec<RuleDef>> = prev_rules_init;
             // Actions whose rule fired but whose per-action delay hasn't elapsed
-            // yet: (due_ms, action, rng_seed). Drained each tick when due.
-            let mut pending_actions: Vec<(f64, TimedAction, u64)> = Vec::new();
+            // yet. Drained each tick when due.
+            let mut pending_actions: Vec<PendingAction> = Vec::new();
             loop {
                 tokio::select! {
                     _ = &mut tick_rx => break,
                     _ = ticker.tick() => {
                         let elapsed = start.elapsed().as_millis() as f64;
-                        // Read the live config under a short lock, cloned so the
-                        // lock is never held across the route-read `.await` below.
-                        let dynamics: Vec<DynReg> = tick_dynamics.lock().map(|g| g.clone()).unwrap_or_default();
-                        let rules: Vec<RuleDef> = tick_rules.lock().map(|g| g.clone()).unwrap_or_default();
-                        // Collect updates WITHOUT holding the banks lock: route
-                        // reads await the network, generator/preset values are
-                        // computed synchronously. The std write lock is taken
-                        // once below, after every `.await` has resolved.
+                        // Read the live config under a short lock, cloned.
+                        let dynamics: Arc<Vec<DynReg>> = tick_dynamics.lock().map(|g| Arc::clone(&g)).unwrap_or_default();
+                        let rules: Arc<Vec<RuleDef>> = tick_rules.lock().map(|g| Arc::clone(&g)).unwrap_or_default();
+                        let meta: Arc<RegMetaMap> = tick_meta.lock().map(|g| Arc::clone(&g)).unwrap_or_default();
+                        if !Arc::ptr_eq(&rules, &prev_rules) {
+                            if *rules != *prev_rules {
+                                reconcile_rules(&prev_rules, &rules, &mut rule_states, &mut pending_actions);
+                            }
+                            // Re-point even when equal, so later ticks hit the ptr_eq fast path.
+                            prev_rules = Arc::clone(&rules);
+                        }
+                        prune_next_due(&mut next_due, &dynamics);
+                        // Compute generator/preset values before taking the
+                        // write lock (route registers are `route_loop`'s job).
                         let mut updates: Vec<(u8, u8, u16, Vec<u16>)> = Vec::new();
                         for d in dynamics.iter() {
-                            let key = (d.unit, d.bank, d.address);
-                            if elapsed < *next_due.get(&key).unwrap_or(&0.0) { continue; }
-                            next_due.insert(key, elapsed + d.interval_ms);
-                            match &d.kind {
-                                DynKind::Generator { .. } | DynKind::Preset { .. } => {
-                                    if let Ok(words) = encode_value(&d.data_type, &d.byte_order, dyn_value(d, elapsed)) {
-                                        updates.push((d.unit, d.bank, d.address, words));
-                                    }
-                                }
-                                DynKind::Route { slave_unit, connection_kind, src_fc, src_addr, count, scale, offset, src_byte_order } => {
-                                    let map = if connection_kind == "serial" { &rtu_sessions } else { &tcp_sessions };
-                                    let session = map.lock().ok().and_then(|g| g.get(&workspace).cloned());
-                                    // "missing" = no client session for this workspace (client not
-                                    // connected). "stale" = a session exists but the source read
-                                    // errored/timed out. Last-good value is kept in both cases; a
-                                    // finer "dangling config / deleted slave" distinction is a
-                                    // possible future refinement.
-                                    let status = match session {
-                                        None => "missing", // no session yet → keep last-good
-                                        Some(sess) => match route_read_words(sess, *slave_unit, *src_fc, *src_addr, *count, 1000).await {
-                                            Ok(words) => {
-                                                let out = transform_route_words(d, &words, *scale, *offset, src_byte_order);
-                                                updates.push((d.unit, d.bank, d.address, out));
-                                                "ok"
-                                            }
-                                            Err(_) => "stale", // read error/timeout → keep last-good
-                                        },
-                                    };
-                                    if let Ok(mut s) = tick_statuses.lock() {
-                                        s.insert((d.unit, d.bank, d.address), status);
-                                    }
-                                }
+                            if matches!(d.kind, DynKind::Route { .. }) { continue; }
+                            if !take_due(&mut next_due, d, elapsed) { continue; }
+                            if let Ok(words) = encode_value(&d.data_type, &d.byte_order, dyn_raw_value(d, elapsed)) {
+                                updates.push((d.unit, d.bank, d.address, words));
                             }
                         }
                         {
                             let Ok(mut guard) = tick_banks.write() else { continue };
                             for (u, b, a, w) in &updates {
-                                place_words(&mut guard, *u, *b, *a, w);
+                                update_existing_words(&mut guard, *u, *b, *a, w);
                             }
                             // Rules run last, synchronously, under the same
-                            // write lock: they see this tick's generator/route
+                            // write lock: they see this tick's generator
                             // updates and their own actions apply before serve.
                             let drained: Vec<(u8, u8, u16)> = tick_writes
                                 .lock()
@@ -914,28 +1240,35 @@ impl SimEngine {
                                 .unwrap_or_default();
                             // First apply any previously-scheduled delayed actions
                             // that have come due, then evaluate rules for this tick.
-                            pending_actions.retain(|(due, ta, seed)| {
-                                if *due <= elapsed {
-                                    apply_timed_action(&mut guard, ta, *seed);
+                            pending_actions.retain(|p| {
+                                if p.due <= elapsed {
+                                    apply_timed_action(&mut guard, &meta, &p.action, p.seed);
                                     false
                                 } else {
                                     true
                                 }
                             });
-                            let acts = eval_rules(&rules, &mut rule_states, &guard, elapsed, &drained);
+                            let acts = eval_rules(&rules, &mut rule_states, &guard, &meta, elapsed, &drained);
                             for (id, ta) in acts {
                                 let seed = elapsed as u64 ^ id as u64;
                                 if ta.delay_ms <= 0.0 {
-                                    apply_timed_action(&mut guard, &ta, seed);
+                                    apply_timed_action(&mut guard, &meta, &ta, seed);
                                 } else {
-                                    pending_actions.push((elapsed + ta.delay_ms, ta, seed));
+                                    pending_actions.push(PendingAction { due: elapsed + ta.delay_ms, rule_id: id, action: ta, seed });
                                 }
                             }
-                        } // lock dropped before any await/emit
+                        } // lock dropped before emit
                         if elapsed - last_emit >= EMIT_INTERVAL_MS {
                             last_emit = elapsed;
-                            let rows = snapshot_rows(&tick_banks, &tick_statuses);
-                            app.emit_values(SimValuesEvent { workspace: workspace.clone(), rows });
+                            let force_full = tick_full.load(Ordering::Relaxed);
+                            if let Some((full, rows)) = delta_rows(&tick_banks, &tick_statuses, &mut last_sent, force_full) {
+                                if full {
+                                    tick_full.store(false, Ordering::Relaxed);
+                                }
+                                if full || !rows.is_empty() {
+                                    app.emit_values(SimValuesEvent { workspace: workspace.clone(), full, rows });
+                                }
+                            }
                         }
                     }
                 }
@@ -966,6 +1299,10 @@ impl SimEngine {
             let _ = handle.await;
         }
         if let Some(handle) = self.tick_handle.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+        if let Some(handle) = self.route_handle.take() {
             handle.abort();
             let _ = handle.await;
         }
@@ -1007,7 +1344,7 @@ fn resolve_client_addresses(host: &str, port: u16) -> Vec<String> {
     vec![format!("{host}:{port}")]
 }
 
-fn primary_local_ipv4() -> Option<std::net::Ipv4Addr> {
+pub(crate) fn primary_local_ipv4() -> Option<std::net::Ipv4Addr> {
     use std::net::{IpAddr, UdpSocket};
     let sock = UdpSocket::bind("0.0.0.0:0").ok()?;
     sock.connect("8.8.8.8:80").ok()?;
@@ -1046,26 +1383,28 @@ fn read_words(map: &HashMap<u16, u16>, addr: u16, cnt: u16) -> Result<Vec<u16>, 
     Ok(out)
 }
 
-fn write_bits(map: &mut HashMap<u16, bool>, addr: u16, vals: &[bool]) -> Result<(), ExceptionCode> {
-    for (i, &v) in vals.iter().enumerate() {
-        let a = addr.checked_add(i as u16).ok_or(ExceptionCode::IllegalDataAddress)?;
-        match map.get_mut(&a) {
-            Some(slot) => *slot = v,
-            None => return Err(ExceptionCode::IllegalDataAddress),
+/// Write `vals` at consecutive addresses from `addr`, all-or-nothing: every
+/// target address is checked first, so a span with one unconfigured address
+/// fails with IllegalDataAddress and changes nothing.
+fn write_span<T: Copy>(map: &mut HashMap<u16, T>, addr: u16, vals: &[T]) -> Result<(), ExceptionCode> {
+    for i in 0..vals.len() {
+        let a = u16::try_from(addr as usize + i).map_err(|_| ExceptionCode::IllegalDataAddress)?;
+        if !map.contains_key(&a) {
+            return Err(ExceptionCode::IllegalDataAddress);
         }
+    }
+    for (i, &v) in vals.iter().enumerate() {
+        map.insert(addr + i as u16, v);
     }
     Ok(())
 }
 
+fn write_bits(map: &mut HashMap<u16, bool>, addr: u16, vals: &[bool]) -> Result<(), ExceptionCode> {
+    write_span(map, addr, vals)
+}
+
 fn write_words(map: &mut HashMap<u16, u16>, addr: u16, vals: &[u16]) -> Result<(), ExceptionCode> {
-    for (i, &v) in vals.iter().enumerate() {
-        let a = addr.checked_add(i as u16).ok_or(ExceptionCode::IllegalDataAddress)?;
-        match map.get_mut(&a) {
-            Some(slot) => *slot = v,
-            None => return Err(ExceptionCode::IllegalDataAddress),
-        }
-    }
-    Ok(())
+    write_span(map, addr, vals)
 }
 
 impl SimBanks {
@@ -1120,6 +1459,9 @@ pub fn create_sim_schema(conn: &Connection) -> rusqlite::Result<()> {
             byte_order TEXT,
             display_format TEXT,
             unit TEXT,
+            scale REAL,
+            scale_offset REAL,
+            decimals INTEGER,
             value_source TEXT NOT NULL DEFAULT 'hold',
             source_params TEXT,
             interval_ms INTEGER,
@@ -1181,7 +1523,7 @@ pub fn db_list_registers(conn: &Connection) -> rusqlite::Result<Vec<SimRegister>
         "SELECT id, unit_id, function_code, address, alias, data_type, hold_value, sort_order,
                 COALESCE(value_source,'hold'), COALESCE(byte_order,'ABCD'),
                 COALESCE(source_params,'{}'), COALESCE(interval_ms,1000), device_instance_id,
-                unit, display_format
+                unit, display_format, scale, scale_offset, decimals
          FROM sim_registers ORDER BY unit_id, function_code, address",
     )?;
     let rows = stmt.query_map([], |r| Ok(SimRegister {
@@ -1200,6 +1542,9 @@ pub fn db_list_registers(conn: &Connection) -> rusqlite::Result<Vec<SimRegister>
         device_instance_id: r.get::<_, Option<i64>>(12)?,
         unit: r.get::<_, Option<String>>(13)?,
         display_format: r.get::<_, Option<String>>(14)?,
+        scale: r.get::<_, Option<f64>>(15)?,
+        scale_offset: r.get::<_, Option<f64>>(16)?,
+        decimals: r.get::<_, Option<i64>>(17)?,
     }))?;
     rows.collect()
 }
@@ -1208,12 +1553,13 @@ pub fn db_insert_register(conn: &Connection, reg: &SimRegister) -> rusqlite::Res
     conn.execute(
         "INSERT INTO sim_registers
             (unit_id, function_code, address, alias, data_type, hold_value, sort_order,
-             value_source, byte_order, source_params, interval_ms, unit, display_format)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+             value_source, byte_order, source_params, interval_ms, unit, display_format, scale, scale_offset, decimals)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
         rusqlite::params![
             reg.unit_id, reg.function_code, reg.address, reg.alias, reg.data_type,
             reg.hold_value, reg.sort_order, reg.value_source, reg.byte_order,
-            reg.source_params, reg.interval_ms, reg.unit, reg.display_format
+            reg.source_params, reg.interval_ms, reg.unit, reg.display_format,
+            reg.scale, reg.scale_offset, reg.decimals
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -1224,12 +1570,13 @@ pub fn db_update_register(conn: &Connection, reg: &SimRegister) -> rusqlite::Res
         "UPDATE sim_registers SET
             unit_id=?2, function_code=?3, address=?4, alias=?5, data_type=?6, hold_value=?7,
             sort_order=?8, value_source=?9, byte_order=?10, source_params=?11, interval_ms=?12,
-            unit=?13, display_format=?14
+            unit=?13, display_format=?14, scale=?15, scale_offset=?16, decimals=?17
          WHERE id=?1",
         rusqlite::params![
             reg.id, reg.unit_id, reg.function_code, reg.address, reg.alias, reg.data_type,
             reg.hold_value, reg.sort_order, reg.value_source, reg.byte_order,
-            reg.source_params, reg.interval_ms, reg.unit, reg.display_format
+            reg.source_params, reg.interval_ms, reg.unit, reg.display_format,
+            reg.scale, reg.scale_offset, reg.decimals
         ],
     )?;
     Ok(())
@@ -1311,7 +1658,7 @@ pub fn db_list_registers_for_device(conn: &Connection, device_id: i64) -> rusqli
         "SELECT id, unit_id, function_code, address, alias, data_type, hold_value, sort_order,
                 COALESCE(value_source,'hold'), COALESCE(byte_order,'ABCD'),
                 COALESCE(source_params,'{}'), COALESCE(interval_ms,1000), device_instance_id,
-                unit, display_format
+                unit, display_format, scale, scale_offset, decimals
          FROM sim_registers WHERE device_instance_id = ?1 ORDER BY unit_id, function_code, address",
     )?;
     let rows = stmt.query_map([device_id], |r| Ok(SimRegister {
@@ -1330,6 +1677,9 @@ pub fn db_list_registers_for_device(conn: &Connection, device_id: i64) -> rusqli
         device_instance_id: r.get::<_, Option<i64>>(12)?,
         unit: r.get::<_, Option<String>>(13)?,
         display_format: r.get::<_, Option<String>>(14)?,
+        scale: r.get::<_, Option<f64>>(15)?,
+        scale_offset: r.get::<_, Option<f64>>(16)?,
+        decimals: r.get::<_, Option<i64>>(17)?,
     }))?;
     rows.collect()
 }
@@ -1342,7 +1692,7 @@ pub fn db_list_registers_excluding_device(conn: &Connection, device_id: i64) -> 
         "SELECT id, unit_id, function_code, address, alias, data_type, hold_value, sort_order,
                 COALESCE(value_source,'hold'), COALESCE(byte_order,'ABCD'),
                 COALESCE(source_params,'{}'), COALESCE(interval_ms,1000), device_instance_id,
-                unit, display_format
+                unit, display_format, scale, scale_offset, decimals
          FROM sim_registers WHERE device_instance_id IS NULL OR device_instance_id != ?1
          ORDER BY unit_id, function_code, address",
     )?;
@@ -1362,6 +1712,9 @@ pub fn db_list_registers_excluding_device(conn: &Connection, device_id: i64) -> 
         device_instance_id: r.get::<_, Option<i64>>(12)?,
         unit: r.get::<_, Option<String>>(13)?,
         display_format: r.get::<_, Option<String>>(14)?,
+        scale: r.get::<_, Option<f64>>(15)?,
+        scale_offset: r.get::<_, Option<f64>>(16)?,
+        decimals: r.get::<_, Option<i64>>(17)?,
     }))?;
     rows.collect()
 }
@@ -1383,6 +1736,29 @@ pub struct TemplateRegister {
     pub source_params: String,
     #[serde(default)]
     pub alias: String,
+    /// Engineering unit label (e.g. "°C"), carried to `SimRegister.unit`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+    /// Display format (e.g. "dec", "hex"), carried to `SimRegister.display_format`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_format: Option<String>,
+    /// Engineering scale; `None` → 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale: Option<f64>,
+    /// Engineering offset (eng = raw * scale + offset); `None` → 0. Named
+    /// `scaleOffset` on the wire because `offset` is the register's address
+    /// offset within the template.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale_offset: Option<f64>,
+    /// Display decimals; `None` → auto.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decimals: Option<i64>,
+    /// Update interval for dynamic registers; `None` → 1000 ms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval_ms: Option<i64>,
+    /// Initial Hold value; `None` → 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold_value: Option<i64>,
 }
 
 fn default_u16() -> String { "u16".into() }
@@ -1390,7 +1766,8 @@ fn default_abcd() -> String { "ABCD".into() }
 fn default_hold() -> String { "hold".into() }
 fn default_empty_obj() -> String { "{}".into() }
 
-/// A built-in (or, in a later plan, custom) device register-map template.
+/// A device register-map template: built-in, custom (user-authored or
+/// imported, stored app-globally), or a synthetic workspace-slave template.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct DeviceTemplate {
@@ -1418,6 +1795,10 @@ fn treg(offset: u16, bank: u8, data_type: &str, byte_order: &str, value_source: 
         value_source: value_source.into(),
         source_params: source_params.into(),
         alias: alias.into(),
+        unit: None,
+        display_format: None, scale: None, scale_offset: None, decimals: None,
+        interval_ms: None,
+        hold_value: None,
     }
 }
 
@@ -1432,10 +1813,10 @@ pub fn builtin_templates() -> Vec<DeviceTemplate> {
             description: "Learn Modbus with mixed live values".into(),
             icon: "🎓".into(),
             registers: vec![
-                treg(0, 1, "bool", "ABCD", "hold", "{}", ""),
-                treg(1, 1, "bool", "ABCD", "hold", "{}", ""),
-                treg(2, 1, "bool", "ABCD", "hold", "{}", ""),
-                treg(3, 1, "bool", "ABCD", "hold", "{}", ""),
+                treg(0, 1, "bool", "ABCD", "hold", "{}", "Coil 0"),
+                treg(1, 1, "bool", "ABCD", "hold", "{}", "Coil 1"),
+                treg(2, 1, "bool", "ABCD", "hold", "{}", "Coil 2"),
+                treg(3, 1, "bool", "ABCD", "hold", "{}", "Coil 3"),
                 treg(0, 3, "u16", "ABCD", "hold", "{}", "Setpoint"),
                 treg(1, 3, "u16", "ABCD", "generator", r#"{"kind":"sine","min":0,"max":1000,"periodMs":5000}"#, "Sine"),
                 treg(2, 3, "u16", "ABCD", "generator", r#"{"kind":"ramp","min":0,"max":100,"periodMs":4000}"#, "Ramp"),
@@ -1525,49 +1906,116 @@ fn custom_templates_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, S
     Ok(dir.join("custom_device_templates.json"))
 }
 
-/// Read the custom template catalog (empty if the file is absent or invalid).
-fn read_custom_templates(app: &tauri::AppHandle) -> Vec<DeviceTemplate> {
-    let Ok(path) = custom_templates_path(app) else { return Vec::new() };
-    let Ok(text) = std::fs::read_to_string(&path) else { return Vec::new() };
-    serde_json::from_str(&text).unwrap_or_default()
+/// Read the custom template catalog from `path`. A missing (or empty) file is
+/// an empty catalog. A file that can't be read or parsed is an ERROR, never an
+/// empty list — otherwise the next save would overwrite the user's templates.
+/// A corrupt file is first copied aside (see `backup_corrupt_file`) and left
+/// in place untouched.
+fn read_templates_file(path: &std::path::Path) -> Result<Vec<DeviceTemplate>, String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("failed to read custom virtual devices file {}: {e}", path.display())),
+    };
+    if text.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    serde_json::from_str(&text).map_err(|parse_err| {
+        let saved = match backup_corrupt_file(path, &text) {
+            Ok(bak) => format!("a backup was saved as {}", bak.display()),
+            Err(e) => format!("a backup could not be saved ({e})"),
+        };
+        format!(
+            "The custom virtual devices file {} is corrupt ({parse_err}); {saved}. \
+             Fix or remove the file — it will not be modified until then.",
+            path.display()
+        )
+    })
+}
+
+/// Copy a corrupt catalog to `<file>.bak`. An existing `.bak` is never
+/// overwritten: a different backup gets a timestamp suffix
+/// (`<file>.bak.<epoch-ms>`). If an identical backup already exists it is
+/// reused, so repeated reads of the same corrupt file don't pile up copies.
+fn backup_corrupt_file(path: &std::path::Path, text: &str) -> Result<std::path::PathBuf, String> {
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .ok_or_else(|| "invalid catalog path".to_string())?;
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let prefix = format!("{file_name}.bak");
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with(&prefix) && std::fs::read_to_string(entry.path()).ok().as_deref() == Some(text) {
+                return Ok(entry.path());
+            }
+        }
+    }
+    let mut bak = dir.join(&prefix);
+    if bak.exists() {
+        bak = dir.join(format!("{prefix}.{}", now_ms()));
+    }
+    std::fs::write(&bak, text).map_err(|e| e.to_string())?;
+    Ok(bak)
+}
+
+/// Write the catalog atomically: write a temp file in the same directory,
+/// then rename it over the real one, so a crash mid-write can't leave a
+/// truncated catalog.
+fn write_templates_file(path: &std::path::Path, templates: &[DeviceTemplate]) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(templates).map_err(|e| e.to_string())?;
+    let mut tmp_name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    tmp_name.push(".tmp");
+    let tmp = path.with_file_name(tmp_name);
+    std::fs::write(&tmp, json).map_err(|e| format!("failed to write template catalog: {e}"))?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("failed to write template catalog: {e}")
+    })
+}
+
+fn read_custom_templates(app: &tauri::AppHandle) -> Result<Vec<DeviceTemplate>, String> {
+    read_templates_file(&custom_templates_path(app)?)
 }
 
 fn write_custom_templates(app: &tauri::AppHandle, templates: &[DeviceTemplate]) -> Result<(), String> {
-    let path = custom_templates_path(app)?;
-    let json = serde_json::to_string_pretty(templates).map_err(|e| e.to_string())?;
-    std::fs::write(&path, json).map_err(|e| format!("failed to write template catalog: {e}"))
+    write_templates_file(&custom_templates_path(app)?, templates)
 }
 
-/// Validate a template before it enters the catalog: keys/name present and
-/// every register well-formed (bank/type/order), reusing `validate_register`
-/// against a probe instance at base 0.
+/// Key prefix reserved for the synthetic workspace-slave templates built by
+/// `simulator_list_slave_device_templates`.
+const RESERVED_TEMPLATE_PREFIX: &str = "ws-slave:";
+
+/// Validate a template before it enters the catalog: the shape checks of
+/// `validate_template_shape`, plus the key must not use the reserved
+/// `ws-slave:` prefix.
 fn validate_template(t: &DeviceTemplate) -> Result<(), String> {
+    validate_template_shape(t)?;
+    if t.template_key.trim().starts_with(RESERVED_TEMPLATE_PREFIX) {
+        return Err(format!("template keys starting with '{RESERVED_TEMPLATE_PREFIX}' are reserved; choose a different key"));
+    }
+    Ok(())
+}
+
+/// Shape checks shared by catalog and inline templates: key/name present,
+/// every register well-formed (bank/type/order, via `validate_register` on a
+/// probe instance at base 0), and no two register spans overlapping
+/// (span-aware via `word_count`, same rule as `validate_no_overlap`).
+fn validate_template_shape(t: &DeviceTemplate) -> Result<(), String> {
     if t.template_key.trim().is_empty() {
         return Err("template key is required".into());
     }
     if t.name.trim().is_empty() {
         return Err("template name is required".into());
     }
-    for r in &t.registers {
-        let probe = SimRegister {
-            id: 0,
-            unit_id: 1,
-            function_code: r.bank as i64,
-            address: r.offset as i64,
-            alias: r.alias.clone(),
-            data_type: r.data_type.clone(),
-            hold_value: 0,
-            sort_order: 0,
-            device_instance_id: None,
-            value_source: r.value_source.clone(),
-            byte_order: r.byte_order.clone(),
-            source_params: r.source_params.clone(),
-            interval_ms: 1000,
-            unit: None,
-            display_format: None,
-        };
-        validate_register(&probe).map_err(|e| format!("register '{}': {e}", r.alias))?;
+    let probes = template_to_registers(t, 1, 0);
+    for (r, probe) in t.registers.iter().zip(&probes) {
+        validate_register(probe).map_err(|e| format!("register '{}': {e}", r.alias))?;
     }
+    validate_no_overlap(&[], &probes).map_err(|_| {
+        "two registers in this template overlap (a multi-word register spans the next address)".to_string()
+    })?;
     Ok(())
 }
 
@@ -1576,7 +2024,10 @@ fn validate_template(t: &DeviceTemplate) -> Result<(), String> {
 /// new custom templates are appended.
 #[tauri::command]
 pub fn simulator_list_device_templates(app: tauri::AppHandle) -> Result<Vec<DeviceTemplate>, String> {
-    let custom = read_custom_templates(&app);
+    // A damaged custom-template file must not hide the built-in devices from
+    // Add Device; the Virtual Devices view reports the error (and the file is
+    // backed up), so here we fall back to the built-ins alone.
+    let custom = read_custom_templates(&app).unwrap_or_default();
     let mut out = builtin_templates();
     for c in custom {
         if let Some(existing) = out.iter_mut().find(|t| t.template_key == c.template_key) {
@@ -1588,11 +2039,11 @@ pub fn simulator_list_device_templates(app: tauri::AppHandle) -> Result<Vec<Devi
     Ok(out)
 }
 
-/// Just the custom (user-authored) templates, for the Device Builder's library
-/// management (built-ins are read-only; customs can be edited/deleted).
+/// Just the custom (user-authored) templates, for the Virtual Devices
+/// library management (built-ins are read-only; customs can be edited/deleted).
 #[tauri::command]
 pub fn simulator_list_custom_templates(app: tauri::AppHandle) -> Result<Vec<DeviceTemplate>, String> {
-    Ok(read_custom_templates(&app))
+    read_custom_templates(&app)
 }
 
 /// Upsert a custom template (by `templateKey`) into the app-global catalog.
@@ -1604,7 +2055,7 @@ pub fn simulator_save_custom_template(app: tauri::AppHandle, template: DeviceTem
         return Err(format!("'{}' is a built-in template key; choose a different key", template.template_key));
     }
     let (name, key) = (template.name.clone(), template.template_key.clone());
-    let mut custom = read_custom_templates(&app);
+    let mut custom = read_custom_templates(&app)?;
     let existed = custom.iter().any(|t| t.template_key == key);
     if let Some(existing) = custom.iter_mut().find(|t| t.template_key == template.template_key) {
         *existing = template;
@@ -1625,7 +2076,7 @@ pub fn simulator_save_custom_template(app: tauri::AppHandle, template: DeviceTem
 /// Delete a custom template from the catalog by key.
 #[tauri::command]
 pub fn simulator_delete_custom_template(app: tauri::AppHandle, template_key: String) -> Result<(), String> {
-    let mut custom = read_custom_templates(&app);
+    let mut custom = read_custom_templates(&app)?;
     let before = custom.len();
     custom.retain(|t| t.template_key != template_key);
     if custom.len() == before {
@@ -1664,7 +2115,7 @@ pub async fn simulator_import_custom_template(app: tauri::AppHandle) -> Result<O
     if builtin_templates().iter().any(|b| b.template_key == template.template_key) {
         return Err(format!("'{}' clashes with a built-in template key; rename it before importing", template.template_key));
     }
-    let mut custom = read_custom_templates(&app);
+    let mut custom = read_custom_templates(&app)?;
     if let Some(existing) = custom.iter_mut().find(|t| t.template_key == template.template_key) {
         *existing = template.clone();
     } else {
@@ -1731,16 +2182,8 @@ pub fn simulator_device_to_template(
     let regs = db_list_registers_for_device(&conn, device_id).map_err(|e| e.to_string())?;
     let base = device.base_address;
     let registers: Vec<TemplateRegister> = regs
-        .into_iter()
-        .map(|r| TemplateRegister {
-            offset: (r.address - base).max(0) as u16,
-            bank: r.function_code as u8,
-            data_type: r.data_type,
-            byte_order: r.byte_order,
-            value_source: r.value_source,
-            source_params: r.source_params,
-            alias: r.alias,
-        })
+        .iter()
+        .map(|r| sim_register_to_template_register(r, base))
         .collect();
     Ok(DeviceTemplate {
         template_key,
@@ -1750,6 +2193,27 @@ pub fn simulator_device_to_template(
         icon,
         registers,
     })
+}
+
+/// One device register as a base-relative template register, keeping every
+/// field a template can carry (unit, display format, interval, hold value).
+pub fn sim_register_to_template_register(r: &SimRegister, base: i64) -> TemplateRegister {
+    TemplateRegister {
+        offset: (r.address - base).clamp(0, 65535) as u16,
+        bank: r.function_code as u8,
+        data_type: r.data_type.clone(),
+        byte_order: r.byte_order.clone(),
+        value_source: r.value_source.clone(),
+        source_params: r.source_params.clone(),
+        alias: r.alias.clone(),
+        unit: r.unit.clone(),
+        display_format: r.display_format.clone(),
+        scale: r.scale,
+        scale_offset: r.scale_offset,
+        decimals: r.decimals,
+        interval_ms: Some(r.interval_ms),
+        hold_value: Some(r.hold_value),
+    }
 }
 
 /// Expand a `DeviceTemplate` into concrete `SimRegister`s for a device
@@ -1766,15 +2230,18 @@ pub fn template_to_registers(t: &DeviceTemplate, unit_id: i64, base: i64) -> Vec
             address: base + r.offset as i64,
             alias: r.alias.clone(),
             data_type: r.data_type.clone(),
-            hold_value: 0,
+            hold_value: r.hold_value.unwrap_or(0),
             sort_order: 0,
             device_instance_id: None,
             value_source: r.value_source.clone(),
             byte_order: r.byte_order.clone(),
             source_params: r.source_params.clone(),
-            interval_ms: 1000,
-            unit: None,
-            display_format: None,
+            interval_ms: r.interval_ms.filter(|ms| *ms > 0).unwrap_or(1000),
+            unit: r.unit.clone(),
+            display_format: r.display_format.clone(),
+            scale: r.scale,
+            scale_offset: r.scale_offset,
+            decimals: r.decimals,
         })
         .collect()
 }
@@ -1867,7 +2334,9 @@ pub fn simulator_add_inline_device(
     base_address: i64,
 ) -> Result<i64, String> {
     let ws = validate_workspace_name(&name)?;
-    validate_template(&template)?;
+    // Inline templates are the synthetic `ws-slave:` ones, so only the shape
+    // is checked here (the reserved-prefix rule is for the shared catalog).
+    validate_template_shape(&template)?;
     let key = template.template_key.clone();
     instantiate_device(&app, &state, &ws, &template, key, device_name, unit_id, base_address)
 }
@@ -1969,6 +2438,7 @@ fn slave_row_to_route_register(
     alias: &str,
     data_type: &str,
     order: &str,
+    display_format: Option<&str>,
 ) -> TemplateRegister {
     let is_bit = fc == 1 || fc == 2;
     let source_params = serde_json::json!({
@@ -1988,6 +2458,11 @@ fn slave_row_to_route_register(
         value_source: "route".into(),
         source_params,
         alias: alias.to_string(),
+        unit: None,
+        display_format: display_format.map(str::trim).filter(|f| !f.is_empty()).map(str::to_string),
+        scale: None, scale_offset: None, decimals: None,
+        interval_ms: None,
+        hold_value: None,
     }
 }
 
@@ -2025,7 +2500,7 @@ pub fn simulator_list_slave_device_templates(
         let conn_kind = if conn_kind_raw.is_empty() { "tcp".to_string() } else { conn_kind_raw };
         let mut row_stmt = conn
             .prepare(
-                "SELECT function_code, address, alias, data_type, \"order\"
+                "SELECT function_code, address, alias, data_type, \"order\", display_format
                  FROM slave_register_rows
                  WHERE slave_id = ?1 AND function_code IN (1,2,3,4)
                  ORDER BY function_code ASC, address ASC;",
@@ -2038,7 +2513,10 @@ pub fn simulator_list_slave_device_templates(
                 let alias: String = r.get::<_, Option<String>>(2)?.unwrap_or_default();
                 let data_type: String = r.get::<_, Option<String>>(3)?.unwrap_or_else(|| "u16".into());
                 let order: String = r.get::<_, Option<String>>(4)?.unwrap_or_default();
-                Ok(slave_row_to_route_register(unit_id, &conn_kind, fc, addr, &alias, &data_type, &order))
+                let display_format: Option<String> = r.get::<_, Option<String>>(5)?;
+                Ok(slave_row_to_route_register(
+                    unit_id, &conn_kind, fc, addr, &alias, &data_type, &order, display_format.as_deref(),
+                ))
             })
             .map_err(|e| e.to_string())?
             .collect::<Result<_, _>>()
@@ -2111,6 +2589,50 @@ pub fn simulator_update_device(app: tauri::AppHandle, name: String, device: SimD
     Ok(())
 }
 
+/// Move a device (its base address and every child register) by
+/// `new_base - old_base` in the DB, atomically: one transaction, so any
+/// failure leaves the base and every register where they were. Register
+/// updates are ordered so `UNIQUE(unit_id, function_code, address)` never
+/// collides mid-way (highest address first when moving up, lowest first when
+/// moving down). Returns the updated device plus the children before and
+/// after the move (for the live banks).
+pub fn rebase_device_in_db(
+    conn: &mut Connection,
+    id: i64,
+    new_base_address: i64,
+) -> Result<(SimDevice, Vec<SimRegister>, Vec<SimRegister>), String> {
+    let mut device = db_list_devices(conn)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .find(|d| d.id == id)
+        .ok_or_else(|| format!("device {} not found", id))?;
+
+    let children = db_list_registers_for_device(conn, id).map_err(|e| e.to_string())?;
+    let shifted = rebase_children(&children, device.base_address, new_base_address)?;
+
+    // The shifted registers must not collide with anything outside this
+    // device (other devices' registers or unowned/manual registers).
+    let others = db_list_registers_excluding_device(conn, id).map_err(|e| e.to_string())?;
+    validate_no_overlap(&others, &shifted)?;
+
+    let delta = new_base_address - device.base_address;
+    let mut ordered: Vec<&SimRegister> = shifted.iter().collect();
+    if delta > 0 {
+        ordered.sort_by_key(|r| std::cmp::Reverse(r.address));
+    } else {
+        ordered.sort_by_key(|r| r.address);
+    }
+
+    device.base_address = new_base_address;
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    db_update_device(&tx, &device).map_err(|e| e.to_string())?;
+    for reg in ordered {
+        db_update_register(&tx, reg).map_err(|e| e.to_string())?;
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok((device, children, shifted))
+}
+
 #[tauri::command]
 pub fn simulator_rebase_device(
     app: tauri::AppHandle,
@@ -2123,27 +2645,8 @@ pub fn simulator_rebase_device(
     if !(0..=65535).contains(&new_base_address) {
         return Err(format!("base address {} out of range (0-65535)", new_base_address));
     }
-    let conn = open_workspace_db(&app, &ws)?;
-
-    let mut device = db_list_devices(&conn)
-        .map_err(|e| e.to_string())?
-        .into_iter()
-        .find(|d| d.id == id)
-        .ok_or_else(|| format!("device {} not found", id))?;
-
-    let children = db_list_registers_for_device(&conn, id).map_err(|e| e.to_string())?;
-    let shifted = rebase_children(&children, device.base_address, new_base_address)?;
-
-    // The shifted registers must not collide with anything outside this
-    // device (other devices' registers or unowned/manual registers).
-    let others = db_list_registers_excluding_device(&conn, id).map_err(|e| e.to_string())?;
-    validate_no_overlap(&others, &shifted)?;
-
-    device.base_address = new_base_address;
-    db_update_device(&conn, &device).map_err(|e| e.to_string())?;
-    for reg in &shifted {
-        db_update_register(&conn, reg).map_err(|e| e.to_string())?;
-    }
+    let mut conn = open_workspace_db(&app, &ws)?;
+    let (device, children, shifted) = rebase_device_in_db(&mut conn, id, new_base_address)?;
 
     // Move the registers in the live banks too: clear all old addresses first,
     // then place the shifted ones (clear-before-place is safe when spans overlap).
@@ -2170,19 +2673,45 @@ pub fn simulator_rebase_device(
 pub enum Trigger {
     /// Fires every `ms` milliseconds.
     Interval { ms: f64 },
-    /// Fires (edge-triggered) when `register op value` transitions to true.
-    Condition { unit: u8, bank: u8, address: u16, op: String, value: i64 },
+    /// Fires (edge-triggered) when the combined result of `conds` (all of /
+    /// any of, per `join`) transitions to true. Each condition compares the
+    /// register's decoded, scaled engineering value.
+    Condition { join: Join, conds: Vec<Cond> },
     /// Fires when a client writes to `(unit, bank, address)`; `address: None`
     /// matches any address in that unit/bank.
     OnWrite { unit: u8, bank: u8, address: Option<u16> },
 }
 
+/// One comparison of a `Condition` trigger: `register op value`, where the
+/// register is `(unit, bank, address)` (its START address for multi-word
+/// types) and `value`/`deadband` are in the register's engineering units.
+/// `deadband` (≥ 0) only affects `>`, `>=`, `<`, `<=`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Cond {
+    pub unit: u8,
+    pub bank: u8,
+    pub address: u16,
+    pub op: String,
+    pub value: f64,
+    pub deadband: f64,
+}
+
+/// How a `Condition` trigger combines its conditions: all of them (AND) or any
+/// of them (OR).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Join {
+    All,
+    Any,
+}
+
 /// A rule's action, parsed from an entry in the `SimRule.actions` JSON array.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
-    Set { unit: u8, bank: u8, address: u16, value: i64 },
-    Inc { unit: u8, bank: u8, address: u16, by: i64 },
-    Dec { unit: u8, bank: u8, address: u16, by: i64 },
+    /// `value`/`by` are engineering values (register raw × scale + offset); at
+    /// the default scale 1 / offset 0 they are the raw integers of old.
+    Set { unit: u8, bank: u8, address: u16, value: f64 },
+    Inc { unit: u8, bank: u8, address: u16, by: f64 },
+    Dec { unit: u8, bank: u8, address: u16, by: f64 },
     Toggle { unit: u8, bank: u8, address: u16 },
     Copy {
         src_unit: u8,
@@ -2211,7 +2740,7 @@ pub struct TimedAction {
 }
 
 /// A fully-parsed rule, ready for evaluation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RuleDef {
     pub id: i64,
     pub enabled: bool,
@@ -2220,35 +2749,47 @@ pub struct RuleDef {
     pub sort_order: i64,
 }
 
-fn json_u8(v: &serde_json::Value, key: &str, default: u8) -> u8 {
-    v.get(key).and_then(|x| x.as_u64()).map(|x| x as u8).unwrap_or(default)
+/// Read an optional `u8` field: absent/null → `Some(default)`; present and a
+/// whole number in 0..=255 → `Some(n)`; anything else (out of range,
+/// negative, non-integer) → `None` so the caller rejects it instead of
+/// truncating (unit 300 must not silently become unit 44).
+fn json_u8(v: &serde_json::Value, key: &str, default: u8) -> Option<u8> {
+    match v.get(key) {
+        None | Some(serde_json::Value::Null) => Some(default),
+        Some(x) => x.as_u64().and_then(|n| u8::try_from(n).ok()),
+    }
 }
 
-fn json_u16(v: &serde_json::Value, key: &str, default: u16) -> u16 {
-    v.get(key).and_then(|x| x.as_u64()).map(|x| x as u16).unwrap_or(default)
+/// `u16` counterpart of `json_u8` (address 70000 is rejected, not wrapped).
+fn json_u16(v: &serde_json::Value, key: &str, default: u16) -> Option<u16> {
+    match v.get(key) {
+        None | Some(serde_json::Value::Null) => Some(default),
+        Some(x) => x.as_u64().and_then(|n| u16::try_from(n).ok()),
+    }
 }
 
 fn json_i64(v: &serde_json::Value, key: &str, default: i64) -> i64 {
     v.get(key).and_then(|x| x.as_i64()).unwrap_or(default)
 }
 
-/// Parse a single action from its JSON object; unknown `type` → `None` (the
-/// caller skips it, so one bad action doesn't invalidate the whole rule).
+/// Parse a single action from its JSON object; unknown `type` or an
+/// out-of-range unit/bank/address → `None` (the caller skips it, so one bad
+/// action doesn't invalidate the whole rule).
 /// Reads optional `delayMs` (per-action delay) and `dataType`/`byteOrder`
 /// (multi-word target width), both defaulting to legacy single-word/immediate.
 fn parse_action(v: &serde_json::Value) -> Option<TimedAction> {
-    let unit = json_u8(v, "unit", 1);
-    let bank = json_u8(v, "bank", 1);
-    let address = json_u16(v, "address", 0);
+    let unit = json_u8(v, "unit", 1)?;
+    let bank = json_u8(v, "bank", 1)?;
+    let address = json_u16(v, "address", 0)?;
     let action = match v.get("type").and_then(|x| x.as_str()).unwrap_or("") {
-        "set" => Action::Set { unit, bank, address, value: json_i64(v, "value", 0) },
-        "inc" => Action::Inc { unit, bank, address, by: json_i64(v, "by", 1) },
-        "dec" => Action::Dec { unit, bank, address, by: json_i64(v, "by", 1) },
+        "set" => Action::Set { unit, bank, address, value: json_finite_f64(v, "value", 0.0) },
+        "inc" => Action::Inc { unit, bank, address, by: json_finite_f64(v, "by", 1.0) },
+        "dec" => Action::Dec { unit, bank, address, by: json_finite_f64(v, "by", 1.0) },
         "toggle" => Action::Toggle { unit, bank, address },
         "copy" => Action::Copy {
-            src_unit: json_u8(v, "srcUnit", unit),
-            src_bank: json_u8(v, "srcBank", bank),
-            src_addr: json_u16(v, "srcAddr", 0),
+            src_unit: json_u8(v, "srcUnit", unit)?,
+            src_bank: json_u8(v, "srcBank", bank)?,
+            src_addr: json_u16(v, "srcAddr", 0)?,
             unit,
             bank,
             address,
@@ -2272,10 +2813,56 @@ fn parse_action(v: &serde_json::Value) -> Option<TimedAction> {
     })
 }
 
+/// A finite JSON number at `key`, else `default` (absent, null, non-numeric,
+/// or non-finite).
+fn json_finite_f64(v: &serde_json::Value, key: &str, default: f64) -> f64 {
+    v.get(key).and_then(|x| x.as_f64()).filter(|x| x.is_finite()).unwrap_or(default)
+}
+
+/// Parse one condition object (`unit`/`bank`/`address`/`op`/`value`/
+/// `deadband`). An out-of-range unit/bank/address → `None` (rejects the rule).
+/// `value` may be any JSON number; a negative or invalid deadband becomes 0.
+fn parse_cond(v: &serde_json::Value) -> Option<Cond> {
+    Some(Cond {
+        unit: json_u8(v, "unit", 1)?,
+        bank: json_u8(v, "bank", 1)?,
+        address: json_u16(v, "address", 0)?,
+        op: v.get("op").and_then(|x| x.as_str()).unwrap_or("==").to_string(),
+        value: json_finite_f64(v, "value", 0.0),
+        deadband: json_finite_f64(v, "deadband", 0.0).max(0.0),
+    })
+}
+
+/// Parse a `condition` trigger in either shape:
+/// - legacy `{"type":"condition","unit","bank","address","op","value"}` →
+///   one condition, `Join::All`, deadband 0;
+/// - `{"type":"condition","join":"all"|"any","conditions":[{…}, …]}` (join
+///   defaults to all).
+/// Any out-of-range condition, a non-array `conditions`, or an empty list
+/// rejects the rule.
+fn parse_condition_trigger(tv: &serde_json::Value) -> Option<Trigger> {
+    match tv.get("conditions") {
+        None | Some(serde_json::Value::Null) => Some(Trigger::Condition { join: Join::All, conds: vec![parse_cond(tv)?] }),
+        Some(serde_json::Value::Array(arr)) => {
+            let conds: Vec<Cond> = arr.iter().map(parse_cond).collect::<Option<_>>()?;
+            if conds.is_empty() {
+                return None;
+            }
+            let join = match tv.get("join").and_then(|x| x.as_str()) {
+                Some("any") => Join::Any,
+                _ => Join::All,
+            };
+            Some(Trigger::Condition { join, conds })
+        }
+        Some(_) => None,
+    }
+}
+
 /// Parse a `SimRule`'s `trigger`/`actions` JSON into a `RuleDef`. Returns
 /// `None` if the rule is disabled, or its `trigger`/`actions` JSON is
-/// malformed or has an unrecognized trigger `type`. Unrecognized action
-/// types are skipped (not fatal to the rule).
+/// malformed, has an unrecognized trigger `type`, or an out-of-range trigger
+/// unit/bank/address. Unrecognized or out-of-range actions are skipped (not
+/// fatal to the rule).
 pub fn parse_rule(rule: &SimRule) -> Option<RuleDef> {
     if !rule.enabled {
         return None;
@@ -2283,19 +2870,15 @@ pub fn parse_rule(rule: &SimRule) -> Option<RuleDef> {
     let tv: serde_json::Value = serde_json::from_str(&rule.trigger).ok()?;
     let trigger = match tv.get("type").and_then(|x| x.as_str()).unwrap_or("") {
         "interval" => Trigger::Interval { ms: tv.get("ms").and_then(|x| x.as_f64()).unwrap_or(1000.0) },
-        "condition" => Trigger::Condition {
-            unit: json_u8(&tv, "unit", 1),
-            bank: json_u8(&tv, "bank", 1),
-            address: json_u16(&tv, "address", 0),
-            op: tv.get("op").and_then(|x| x.as_str()).unwrap_or("==").to_string(),
-            value: json_i64(&tv, "value", 0),
-        },
+        "condition" => parse_condition_trigger(&tv)?,
         "onWrite" => {
+            // A negative/absent address means "any address"; one past 65535
+            // is invalid (not wrapped).
             let address = match tv.get("address").and_then(|x| x.as_i64()) {
-                Some(a) if a >= 0 => Some(a as u16),
+                Some(a) if a >= 0 => Some(u16::try_from(a).ok()?),
                 _ => None,
             };
-            Trigger::OnWrite { unit: json_u8(&tv, "unit", 1), bank: json_u8(&tv, "bank", 1), address }
+            Trigger::OnWrite { unit: json_u8(&tv, "unit", 1)?, bank: json_u8(&tv, "bank", 1)?, address }
         }
         _ => return None,
     };
@@ -2322,25 +2905,24 @@ pub fn read_word(banks: &HashMap<u8, SimBanks>, unit: u8, bank: u8, addr: u16) -
 }
 
 /// Apply a rule `Action` to the in-memory banks, mutating the target
-/// word/bit. `Set`/`Toggle`/`Inc`/`Dec`/`Randomize` upsert the target
-/// (created if absent, default current value `0`); `Copy` and `Inc`/`Dec`
-/// no-op if their source isn't present (documented limitation — there is
-/// nothing sensible to increment/copy from). `Randomize` uses the
-/// deterministic `unit_random(rng_seed)` from Plan 2.
+/// word/bit. Writes go through `update_existing_words`: an action whose
+/// target unit/address isn't configured does nothing (it never creates a
+/// register). `Copy` also no-ops if its source isn't present. `Randomize` uses
+/// the deterministic `unit_random(rng_seed)`.
 pub fn apply_action(banks: &mut HashMap<u8, SimBanks>, action: &Action, rng_seed: u64) {
     match *action {
         Action::Set { unit, bank, address, value } => {
-            place_words(banks, unit, bank, address, &[value as u16]);
+            update_existing_words(banks, unit, bank, address, &[value as i64 as u16]);
         }
         Action::Inc { unit, bank, address, by } => {
             let cur = read_word(banks, unit, bank, address).unwrap_or(0);
-            let next = cur.wrapping_add(by as u16);
-            place_words(banks, unit, bank, address, &[next]);
+            let next = cur.wrapping_add(by as i64 as u16);
+            update_existing_words(banks, unit, bank, address, &[next]);
         }
         Action::Dec { unit, bank, address, by } => {
             let cur = read_word(banks, unit, bank, address).unwrap_or(0);
-            let next = cur.wrapping_sub(by as u16);
-            place_words(banks, unit, bank, address, &[next]);
+            let next = cur.wrapping_sub(by as i64 as u16);
+            update_existing_words(banks, unit, bank, address, &[next]);
         }
         Action::Toggle { unit, bank, address } => {
             let cur = read_word(banks, unit, bank, address).unwrap_or(0);
@@ -2348,18 +2930,18 @@ pub fn apply_action(banks: &mut HashMap<u8, SimBanks>, action: &Action, rng_seed
                 1 | 2 => if cur != 0 { 0 } else { 1 },
                 _ => if cur == 0 { 1 } else { 0 },
             };
-            place_words(banks, unit, bank, address, &[next]);
+            update_existing_words(banks, unit, bank, address, &[next]);
         }
         Action::Copy { src_unit, src_bank, src_addr, unit, bank, address, scale, offset } => {
             if let Some(src) = read_word(banks, src_unit, src_bank, src_addr) {
                 let next = ((src as f64) * scale + offset) as i64 as u16;
-                place_words(banks, unit, bank, address, &[next]);
+                update_existing_words(banks, unit, bank, address, &[next]);
             }
         }
         Action::Randomize { unit, bank, address, min, max } => {
             let span = (max - min + 1).max(1);
             let value = min + (unit_random(rng_seed) * span as f64) as i64;
-            place_words(banks, unit, bank, address, &[value as u16]);
+            update_existing_words(banks, unit, bank, address, &[value as u16]);
         }
     }
 }
@@ -2385,16 +2967,18 @@ fn read_typed(banks: &HashMap<u8, SimBanks>, unit: u8, bank: u8, addr: u16, data
     for i in 0..wc as u16 {
         words.push(read_word(banks, unit, bank, addr.wrapping_add(i))?);
     }
-    decode_value(data_type, byte_order, &words)
+    let v = decode_value(data_type, byte_order, &words)?;
+    // f32 → its shortest round-trip decimal so rules see 230.7, not 230.6999969.
+    Some(if data_type == "f32" { f32_shortest(v) } else { v })
 }
 
-/// Apply a `TimedAction`'s effect. For single-word/bit targets (`data_type`
+/// Legacy path (target without register metadata). For single-word/bit targets (`data_type`
 /// resolving to 1 word — the default) this delegates to `apply_action`, keeping
 /// legacy behavior byte-for-byte. For multi-word targets it computes the numeric
 /// result, encodes it across the register's words with `data_type`/`byte_order`,
 /// and places them. `delay_ms` is handled by the caller (the tick scheduler),
 /// not here.
-pub fn apply_timed_action(banks: &mut HashMap<u8, SimBanks>, ta: &TimedAction, rng_seed: u64) {
+fn apply_timed_action_stored(banks: &mut HashMap<u8, SimBanks>, ta: &TimedAction, rng_seed: u64) {
     if word_count(&ta.data_type) <= 1 {
         apply_action(banks, &ta.action, rng_seed);
         return;
@@ -2404,9 +2988,9 @@ pub fn apply_timed_action(banks: &mut HashMap<u8, SimBanks>, ta: &TimedAction, r
     let (unit, bank, address) = action_target(&ta.action);
     // Multi-word only applies to word banks (holding/input); bit banks are 1-word.
     let result: f64 = match &ta.action {
-        Action::Set { value, .. } => *value as f64,
-        Action::Inc { by, .. } => read_typed(banks, unit, bank, address, dt, bo).unwrap_or(0.0) + *by as f64,
-        Action::Dec { by, .. } => read_typed(banks, unit, bank, address, dt, bo).unwrap_or(0.0) - *by as f64,
+        Action::Set { value, .. } => *value,
+        Action::Inc { by, .. } => read_typed(banks, unit, bank, address, dt, bo).unwrap_or(0.0) + *by,
+        Action::Dec { by, .. } => read_typed(banks, unit, bank, address, dt, bo).unwrap_or(0.0) - *by,
         Action::Randomize { min, max, .. } => {
             let span = (max - min + 1).max(1);
             (min + (unit_random(rng_seed) * span as f64) as i64) as f64
@@ -2422,30 +3006,127 @@ pub fn apply_timed_action(banks: &mut HashMap<u8, SimBanks>, ta: &TimedAction, r
         Action::Toggle { .. } => { apply_action(banks, &ta.action, rng_seed); return; }
     };
     if let Ok(words) = encode_value(dt, bo, result) {
-        place_words(banks, unit, bank, address, &words);
+        update_existing_words(banks, unit, bank, address, &words);
+    }
+}
+
+/// Apply a `TimedAction`'s effect. `Set`/`Inc`/`Dec` values and `Copy`'s
+/// source are engineering values: when the target register has metadata the
+/// result is converted back with `raw_from_eng` and encoded with the target's
+/// OWN type/byte order (multi-word aware), then written existing-only. A bit
+/// target turns on for any non-zero value. At scale 1 / offset 0 on a
+/// single-word target `Set`/`Inc`/`Dec` take the legacy raw path (same
+/// wrapping as before). A target with no metadata, and `Toggle`/`Randomize`,
+/// behave as before using the action's stored `data_type`/`byte_order`.
+/// `delay_ms` is handled by the caller (the tick scheduler), not here.
+pub fn apply_timed_action(banks: &mut HashMap<u8, SimBanks>, meta: &RegMetaMap, ta: &TimedAction, rng_seed: u64) {
+    let (unit, bank, address) = action_target(&ta.action);
+    let is_copy = matches!(ta.action, Action::Copy { .. });
+    let eng_action = matches!(ta.action, Action::Set { .. } | Action::Inc { .. } | Action::Dec { .. } | Action::Copy { .. });
+    if !eng_action {
+        return apply_timed_action_stored(banks, ta, rng_seed);
+    }
+    // The engineering result of the action, or None to do nothing.
+    let result = |banks: &HashMap<u8, SimBanks>| -> Option<f64> {
+        match &ta.action {
+            Action::Set { value, .. } => Some(*value),
+            Action::Inc { by, .. } => Some(read_eng(banks, meta, unit, bank, address).unwrap_or(0.0) + *by),
+            Action::Dec { by, .. } => Some(read_eng(banks, meta, unit, bank, address).unwrap_or(0.0) - *by),
+            Action::Copy { src_unit, src_bank, src_addr, scale, offset, .. } => {
+                read_eng(banks, meta, *src_unit, *src_bank, *src_addr).map(|v| v * scale + offset)
+            }
+            _ => None,
+        }
+    };
+    match bank {
+        1 | 2 => {
+            if let Some(v) = result(banks) {
+                update_existing_words(banks, unit, bank, address, &[u16::from(v.is_finite() && v != 0.0)]);
+            }
+        }
+        3 | 4 => match meta.get(&(unit, bank, address)) {
+            Some(m) => {
+                if !is_copy && m.scale == 1.0 && m.offset == 0.0 && word_count(&m.data_type) == 1 {
+                    return apply_action(banks, &ta.action, rng_seed);
+                }
+                let Some(eng) = result(banks) else { return };
+                let raw = raw_from_eng(eng, m.scale, m.offset, &m.data_type);
+                if let Ok(words) = encode_value(&m.data_type, &m.byte_order, raw) {
+                    update_existing_words(banks, unit, bank, address, &words);
+                }
+            }
+            None => apply_timed_action_stored(banks, ta, rng_seed),
+        },
+        _ => {}
     }
 }
 
 /// Per-rule runtime state carried across ticks, keyed by `RuleDef.id`.
+///
+/// For `Condition` triggers: `last_condition` is the previous combined
+/// (all/any) result, used for edge-firing; `last_value` is the previous
+/// rounded engineering value, used by single-condition `changed`;
+/// `cond_armed[i]` is true while condition `i` is latched true — with a
+/// deadband it then stays true until the value moves back past
+/// `value ∓ deadband`.
 #[derive(Debug, Clone, Default)]
 pub struct RuleState {
     pub next_due: f64,
     pub last_condition: bool,
-    pub last_value: Option<i64>,
+    pub last_value: Option<f64>,
+    pub cond_armed: Vec<bool>,
 }
 
-/// Evaluate a `Condition` trigger's comparison operator. `changed` compares
-/// `cur` against the rule's previously-seen value rather than the trigger's
-/// configured `value`.
-fn compare(cur: i64, op: &str, value: i64, last_value: Option<i64>) -> bool {
+/// A register's current engineering value. Bit banks (1=coil, 2=discrete
+/// input) read as `0`/`1` (present bit required). Word banks (3=holding,
+/// 4=input) need the register's metadata (keyed by its start address): the
+/// full span is decoded with its data type/byte order, then scaled with
+/// `eng_from_raw`. A hold `bool` on a word bank reads its word as-is. No meta
+/// entry, or any word of the span absent → `None`.
+pub fn read_eng(banks: &HashMap<u8, SimBanks>, meta: &RegMetaMap, unit: u8, bank: u8, addr: u16) -> Option<f64> {
+    match bank {
+        1 | 2 => read_word(banks, unit, bank, addr).map(f64::from),
+        3 | 4 => {
+            let m = meta.get(&(unit, bank, addr))?;
+            let raw = if m.data_type == "bool" {
+                f64::from(read_word(banks, unit, bank, addr)?)
+            } else {
+                read_typed(banks, unit, bank, addr, &m.data_type, &m.byte_order)?
+            };
+            Some(eng_from_raw(raw, m.scale, m.offset))
+        }
+        _ => None,
+    }
+}
+
+/// Decimals a condition compares at: the register's comparison decimals (see
+/// `build_reg_meta`: never coarser than one raw step) for
+/// word banks, 0 for bits (and for a register without metadata, which reads
+/// as not met anyway).
+fn cond_decimals(meta: &RegMetaMap, c: &Cond) -> u32 {
+    match c.bank {
+        3 | 4 => meta.get(&(c.unit, c.bank, c.address)).map(|m| m.decimals).unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// Evaluate one level comparison. Both sides are rounded to the register's
+/// `decimals` first (so `== 23.5` matches a 0.1-scaled register reading
+/// 23.5). While the condition is latched (`armed`), `deadband` widens the
+/// threshold: `>`/`>=` hold until the value drops below `value − deadband`,
+/// `<`/`<=` until it rises above `value + deadband`. Deadband 0 is the plain
+/// comparison. `changed` and unknown operators are not levels → `false`.
+fn compare(eng: f64, op: &str, value: f64, deadband: f64, armed: bool, decimals: u32) -> bool {
+    let cur = round_to(eng, decimals);
+    let hold = if armed { deadband } else { 0.0 };
+    let at = |x: f64| round_to(x, decimals);
     match op {
-        "==" => cur == value,
-        "!=" => cur != value,
-        "<" => cur < value,
-        ">" => cur > value,
-        ">=" => cur >= value,
-        "<=" => cur <= value,
-        "changed" => Some(cur) != last_value,
+        "==" => cur == at(value),
+        "!=" => cur != at(value),
+        ">" => cur > at(value - hold),
+        ">=" => cur >= at(value - hold),
+        "<" => cur < at(value + hold),
+        "<=" => cur <= at(value + hold),
         _ => false,
     }
 }
@@ -2455,17 +3136,23 @@ fn compare(cur: i64, op: &str, value: i64, last_value: Option<i64>) -> bool {
 /// rules pre-sorted by `sort_order`). Rules with no existing `RuleState` get a
 /// default one inserted (Interval `next_due: 0.0` fires at t=0).
 ///
-/// - `Interval`: fires when `elapsed_ms >= next_due`, then reschedules
-///   `next_due = elapsed_ms + ms`.
-/// - `Condition`: edge-fired — reads the current word/bit, compares it, and
-///   fires only on the false→true transition; `last_condition`/`last_value`
-///   are updated every call (fired or not).
+/// - `Interval`: fires when `elapsed_ms >= next_due`, then reschedules on the
+///   `next_due + ms` grid (no drift; resyncs via `advance_due` when far behind).
+/// - `Condition`: each condition reads its register's engineering value via
+///   `read_eng` (current type/byte order/scale from `meta`) and compares it
+///   (`compare`, with deadband latching); the results combine by `join`, and
+///   the rule fires only on the combined false→true transition. A missing
+///   register (or one without metadata, or a NaN float) is "not met". A single
+///   `changed` condition instead fires on every change of the rounded value
+///   (not on the first observation); `changed` inside a multi-condition rule
+///   is never met.
 /// - `OnWrite`: fires if any drained write matches `unit`/`bank`, and either
 ///   `address` is `None` (match-any) or equals the write's address.
 pub fn eval_rules(
     rules: &[RuleDef],
     states: &mut HashMap<i64, RuleState>,
     banks: &HashMap<u8, SimBanks>,
+    meta: &RegMetaMap,
     elapsed_ms: f64,
     writes: &[(u8, u8, u16)],
 ) -> Vec<(i64, TimedAction)> {
@@ -2475,26 +3162,54 @@ pub fn eval_rules(
         let fired = match &r.trigger {
             Trigger::Interval { ms } => {
                 if elapsed_ms >= state.next_due {
-                    state.next_due = elapsed_ms + ms;
+                    state.next_due = advance_due(state.next_due, *ms, elapsed_ms);
                     true
                 } else {
                     false
                 }
             }
-            Trigger::Condition { unit, bank, address, op, value } => {
-                let cur = read_word(banks, *unit, *bank, *address).unwrap_or(0) as i64;
-                let c = compare(cur, op, *value, state.last_value);
-                let fired = if op == "changed" {
+            Trigger::Condition { join, conds } => {
+                if state.cond_armed.len() != conds.len() {
+                    state.cond_armed = vec![false; conds.len()];
+                }
+                let eng_of = |c: &Cond| read_eng(banks, meta, c.unit, c.bank, c.address).filter(|v| !v.is_nan());
+                if conds.len() == 1 && conds[0].op == "changed" {
                     // `changed` is itself a transition, not a level to be
                     // edge-gated: fire on every real change (but not on the
-                    // very first observation, when there's no prior value).
-                    state.last_value.is_some() && Some(cur) != state.last_value
+                    // very first observation, when there's no prior value). A
+                    // missing register resets the history so a later
+                    // appearance is a first observation.
+                    let c = &conds[0];
+                    match eng_of(c) {
+                        None => {
+                            state.last_condition = false;
+                            state.last_value = None;
+                            false
+                        }
+                        Some(eng) => {
+                            let cur = round_to(eng, cond_decimals(meta, c));
+                            let fired = matches!(state.last_value, Some(prev) if prev != cur);
+                            state.last_condition = fired;
+                            state.last_value = Some(cur);
+                            fired
+                        }
+                    }
                 } else {
-                    c && !state.last_condition
-                };
-                state.last_condition = c;
-                state.last_value = Some(cur);
-                fired
+                    for (i, c) in conds.iter().enumerate() {
+                        let met = match eng_of(c) {
+                            Some(eng) => compare(eng, &c.op, c.value, c.deadband, state.cond_armed[i], cond_decimals(meta, c)),
+                            None => false,
+                        };
+                        state.cond_armed[i] = met;
+                    }
+                    let combined = match join {
+                        Join::All => state.cond_armed.iter().all(|&m| m),
+                        Join::Any => state.cond_armed.iter().any(|&m| m),
+                    };
+                    let fired = combined && !state.last_condition;
+                    state.last_condition = combined;
+                    fired
+                }
             }
             Trigger::OnWrite { unit, bank, address } => writes
                 .iter()
@@ -2527,7 +3242,7 @@ pub fn registers_to_banks(regs: &[SimRegister]) -> HashMap<u8, SimBanks> {
         let addr = reg.address as u16;
         if let Some(d) = parse_dynamic(reg) {
             // device/generator: place the t=0 value
-            let val = dyn_value(&d, 0.0);
+            let val = dyn_raw_value(&d, 0.0);
             match encode_value(&d.data_type, &d.byte_order, val) {
                 Ok(words) => place_words(&mut out, unit, bank, addr, &words),
                 Err(e) => log::warn!(
@@ -2588,6 +3303,9 @@ pub struct SimSnapshotRow {
 #[serde(rename_all = "camelCase")]
 pub struct SimValuesEvent {
     workspace: String,
+    /// `true`: `rows` is every register (replace the frontend's table);
+    /// `false`: only rows that changed since the previous event.
+    full: bool,
     rows: Vec<SimSnapshotRow>,
 }
 
@@ -2620,15 +3338,56 @@ fn rows_from_banks(
     rows
 }
 
-/// Snapshot the live banks (behind the shared `RwLock`) into rows for the
-/// `simulator_values` event, attaching route source statuses. Both locks are
-/// dropped before returning.
-fn snapshot_rows(banks: &Banks, statuses: &StatusMap) -> Vec<SimSnapshotRow> {
-    let Ok(guard) = banks.read() else { return Vec::new() };
-    match statuses.lock() {
-        Ok(s) => rows_from_banks(&guard, &s),
-        Err(_) => rows_from_banks(&guard, &HashMap::new()),
+/// What was last sent for a register: (value word, value bit, source status).
+type SentValue = (Option<u16>, Option<bool>, Option<&'static str>);
+
+/// Diff the live banks against `last_sent` for the next `simulator_values`
+/// event. Returns `(full, rows)`: `full` when `force_full` or a previously
+/// sent register no longer exists (rows = everything), else only new/changed
+/// rows. `last_sent` is replaced by the compared state. `None` when the banks
+/// lock is poisoned (nothing compared, `last_sent` untouched); a poisoned
+/// statuses lock is recovered. Both locks are dropped before returning.
+fn delta_rows(
+    banks: &Banks,
+    statuses: &StatusMap,
+    last_sent: &mut HashMap<RegKey, SentValue>,
+    force_full: bool,
+) -> Option<(bool, Vec<SimSnapshotRow>)> {
+    let guard = banks.read().ok()?;
+    // A poisoned statuses map still holds usable data; don't suppress events.
+    let st = statuses.lock().unwrap_or_else(|e| e.into_inner());
+    let mut current: HashMap<RegKey, SentValue> = HashMap::with_capacity(last_sent.len());
+    for (&unit, b) in guard.iter() {
+        for (&a, &v) in &b.coils {
+            current.insert((unit, 1, a), (None, Some(v), st.get(&(unit, 1, a)).copied()));
+        }
+        for (&a, &v) in &b.discrete_inputs {
+            current.insert((unit, 2, a), (None, Some(v), st.get(&(unit, 2, a)).copied()));
+        }
+        for (&a, &v) in &b.holding {
+            current.insert((unit, 3, a), (Some(v), None, st.get(&(unit, 3, a)).copied()));
+        }
+        for (&a, &v) in &b.input {
+            current.insert((unit, 4, a), (Some(v), None, st.get(&(unit, 4, a)).copied()));
+        }
     }
+    drop(st);
+    drop(guard);
+    let full = force_full || last_sent.keys().any(|k| !current.contains_key(k));
+    let rows = current
+        .iter()
+        .filter(|(k, v)| full || last_sent.get(*k) != Some(*v))
+        .map(|(&(unit_id, function_code, address), &(value_word, value_bit, status))| SimSnapshotRow {
+            unit_id,
+            function_code,
+            address,
+            value_word,
+            value_bit,
+            source_status: status.map(|s| s.to_string()),
+        })
+        .collect();
+    *last_sent = current;
+    Some((full, rows))
 }
 
 fn validate_config(cfg: &SimConfig) -> Result<(), String> {
@@ -2637,6 +3396,9 @@ fn validate_config(cfg: &SimConfig) -> Result<(), String> {
     }
     if cfg.host != "0.0.0.0" && cfg.host != "127.0.0.1" {
         return Err(format!("host must be 0.0.0.0 or 127.0.0.1, got {}", cfg.host));
+    }
+    if !(10..=60000).contains(&cfg.tick_ms) {
+        return Err(format!("tick interval {} ms out of range (10-60000)", cfg.tick_ms));
     }
     Ok(())
 }
@@ -2650,6 +3412,16 @@ fn validate_register(reg: &SimRegister) -> Result<(), String> {
     }
     if !(0..=65535).contains(&reg.address) {
         return Err(format!("address {} out of range (0-65535)", reg.address));
+    }
+    if let Some(sc) = reg.scale {
+        if !sc.is_finite() || sc == 0.0 {
+            return Err("scale must be a non-zero number".into());
+        }
+    }
+    if let Some(off) = reg.scale_offset {
+        if !off.is_finite() {
+            return Err("scale offset must be a finite number".into());
+        }
     }
     if !matches!(
         reg.data_type.as_str(),
@@ -2889,6 +3661,9 @@ fn apply_to_running(state: &tauri::State<'_, SimulatorState>, ws: &str, reg: &Si
         let bank = reg.function_code as u8;
         let unit = reg.unit_id as u8;
         let addr = reg.address as u16;
+        // Drop the old live entry first so an in-flight route read for it is
+        // discarded rather than landing on top of this change.
+        engine.forget_dynamic(unit, bank, addr);
         if remove {
             // Covers both hold (1 word) and dynamic (multi-word) registers.
             engine.clear_span(unit, bank, addr, word_count(&reg.data_type) as u16);
@@ -2906,7 +3681,7 @@ fn apply_to_running(state: &tauri::State<'_, SimulatorState>, ws: &str, reg: &Si
             // there's no illegal-address gap before the next tick.
             // `refresh_running_config` updates the tick's live list so it then
             // animates without a Stop/Start.
-            if let Ok(words) = encode_value(&d.data_type, &d.byte_order, dyn_value(&d, 0.0)) {
+            if let Ok(words) = encode_value(&d.data_type, &d.byte_order, dyn_raw_value(&d, 0.0)) {
                 engine.apply_words(unit, bank, addr, &words);
             }
         }
@@ -2927,22 +3702,38 @@ fn refresh_running_config(
     if !engine.is_running() {
         return;
     }
-    if let Ok(regs) = db_list_registers(conn) {
+    let regs = db_list_registers(conn).ok();
+    let rules = db_list_rules(conn).ok();
+    apply_live_config(engine, regs.as_deref(), rules.as_deref(), |slave_unit, kind| {
+        crate::modbus::lookup_slave_id_and_address_offset(app, ws, slave_unit, slave_table_kind(kind)).1
+    });
+}
+
+/// Push a register list and/or rule list (each `None` = left as is, e.g. its
+/// DB read failed) to an engine's live config: the generator/route list (with
+/// each route's source address shifted by `route_offset(slave_unit,
+/// connection_kind)`, mirroring Start), the register metadata rule conditions
+/// decode with, and the parsed rules. The hot-apply half of
+/// `refresh_running_config`, split out so the engine harness can drive it.
+fn apply_live_config(
+    engine: &SimEngine,
+    regs: Option<&[SimRegister]>,
+    rules: Option<&[SimRule]>,
+    route_offset: impl Fn(i64, &str) -> i64,
+) {
+    if let Some(regs) = regs {
         let mut dynamics: Vec<DynReg> = regs.iter().filter_map(parse_dynamic).collect();
-        // Resolve each route register's on-wire source address, mirroring Start.
         for d in dynamics.iter_mut() {
             if let DynKind::Route { slave_unit, connection_kind, src_addr, .. } = &mut d.kind {
-                let (_id, offset) = crate::modbus::lookup_slave_id_and_address_offset(
-                    app, ws, *slave_unit as i64, connection_kind,
-                );
+                let offset = route_offset(*slave_unit as i64, connection_kind);
                 *src_addr = (*src_addr as i64 + offset).clamp(0, 65535) as u16;
             }
         }
         engine.set_dynamics(dynamics);
+        engine.set_register_meta(build_reg_meta(regs));
     }
-    if let Ok(rules_raw) = db_list_rules(conn) {
-        let rules: Vec<RuleDef> = rules_raw.iter().filter_map(parse_rule).collect();
-        engine.set_rules(rules);
+    if let Some(rules_raw) = rules {
+        engine.set_rules(rules_raw.iter().filter_map(parse_rule).collect());
     }
 }
 
@@ -2967,17 +3758,17 @@ pub async fn simulator_start(
         .collect();
     rules.sort_by_key(|r| r.sort_order);
 
-    // Resolve each route register's on-wire source address once at start:
-    // user-facing source address + the source slave's configured
-    // address_offset, the same mapping manual reads use.
-    // Note: the source slave's address_offset is captured once here, at Start.
-    // Editing that slave's offset while the simulator is running has no effect
-    // until the next Start; the live connection itself, though, IS re-resolved
-    // on every tick.
+    // Resolve each route register's on-wire source address: user-facing
+    // source address + the source slave's configured address_offset, the same
+    // mapping manual reads use. Resolved here at Start and again by
+    // `refresh_running_config` whenever a simulator register/device/rule edit
+    // refreshes the live list; editing only the slave's offset takes effect on
+    // the next Start or simulator edit. The client session itself is looked up
+    // on every route read.
     for d in dynamics.iter_mut() {
         if let DynKind::Route { slave_unit, connection_kind, src_addr, .. } = &mut d.kind {
             let (_id, offset) = crate::modbus::lookup_slave_id_and_address_offset(
-                &app, &ws, *slave_unit as i64, connection_kind,
+                &app, &ws, *slave_unit as i64, slave_table_kind(connection_kind),
             );
             *src_addr = (*src_addr as i64 + offset).clamp(0, 65535) as u16;
         }
@@ -3017,6 +3808,8 @@ pub async fn simulator_start(
         let mut map = state.0.lock().unwrap();
         map.remove(&ws).unwrap_or_default()
     };
+    // Before `start`, so the first tick's rule conditions already decode with it.
+    engine.set_register_meta(build_reg_meta(&regs));
     let result = engine.start(
         app.clone(),
         ws.clone(),
@@ -3145,17 +3938,22 @@ fn build_profile(conn: &Connection) -> rusqlite::Result<SimProfile> {
     })
 }
 
-/// Replace the DB's simulator setup with `profile`: validate every register,
-/// clear the existing config/devices/registers/rules, then repopulate with
-/// fresh IDs, remapping each register's `device_instance_id` to the device's
-/// new ID so device grouping survives the round-trip.
-fn apply_profile(conn: &Connection, profile: &SimProfile) -> Result<(), String> {
+/// Replace the DB's simulator setup with `profile`: validate the config and
+/// every register, clear the existing config/devices/registers/rules, then
+/// repopulate with fresh IDs, remapping each register's `device_instance_id`
+/// to the device's new ID so device grouping survives the round-trip. The
+/// clear + repopulate is one transaction: any error leaves the workspace
+/// exactly as it was.
+fn apply_profile(conn: &mut Connection, profile: &SimProfile) -> Result<(), String> {
+    validate_config(&profile.config)?;
     for reg in &profile.registers {
         validate_register(reg)?;
     }
     // Reject a profile whose registers overlap each other (multi-word spans
     // included) before we destroy the current setup — same guard add/update use.
     validate_no_overlap(&[], &profile.registers)?;
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    let conn: &Connection = &tx;
     for r in db_list_registers(conn).map_err(|e| e.to_string())? {
         db_delete_register(conn, r.id).map_err(|e| e.to_string())?;
     }
@@ -3195,7 +3993,7 @@ fn apply_profile(conn: &Connection, profile: &SimProfile) -> Result<(), String> 
         nrule.id = 0;
         db_insert_rule(conn, &nrule).map_err(|e| e.to_string())?;
     }
-    Ok(())
+    tx.commit().map_err(|e| e.to_string())
 }
 
 /// Export the whole workspace simulator setup to a JSON file. Opens a native
@@ -3233,7 +4031,7 @@ pub async fn simulator_import_profile(
     name: String,
 ) -> Result<bool, String> {
     let ws = validate_workspace_name(&name)?;
-    {
+    let refuse_if_running = || -> Result<(), String> {
         let map = state.0.lock().unwrap();
         if map.get(&ws).map(|e| e.is_running()).unwrap_or(false) {
             crate::logs::log_workspace_event(
@@ -3242,7 +4040,9 @@ pub async fn simulator_import_profile(
             );
             return Err("Stop the simulator before importing a profile.".into());
         }
-    }
+        Ok(())
+    };
+    refuse_if_running()?;
     let Some(file) = app
         .dialog()
         .file()
@@ -3255,8 +4055,11 @@ pub async fn simulator_import_profile(
     let json = std::fs::read_to_string(&path).map_err(|e| format!("failed to read file: {e}"))?;
     let profile: SimProfile =
         serde_json::from_str(&json).map_err(|e| format!("invalid profile JSON: {e}"))?;
-    let conn = open_workspace_db(&app, &ws)?;
-    apply_profile(&conn, &profile)?;
+    // The dialog can stay open for a long time: the simulator may have been
+    // started meanwhile, so check again right before touching the DB.
+    refuse_if_running()?;
+    let mut conn = open_workspace_db(&app, &ws)?;
+    apply_profile(&mut conn, &profile)?;
     crate::logs::log_workspace_event(
         &app,
         &ws,
@@ -3282,6 +4085,18 @@ pub fn simulator_snapshot(state: tauri::State<'_, SimulatorState>, name: String)
     Ok(rows)
 }
 
+#[tauri::command]
+pub fn simulator_request_full(state: tauri::State<'_, SimulatorState>, name: String) -> Result<(), String> {
+    let ws = validate_workspace_name(&name)?;
+    let map = state.0.lock().unwrap();
+    if let Some(engine) = map.get(&ws) {
+        if engine.is_running() {
+            engine.request_full();
+        }
+    }
+    Ok(())
+}
+
 /// Read `qty` raw words starting at `start` from a live client session, over
 /// function code `fc` (1=coils, 2=discrete inputs, 3=holding, 4=input),
 /// addressed to `unit`. Reused by route-from-slave (Plan 3) so a routed
@@ -3296,37 +4111,34 @@ pub async fn route_read_words(
     qty: u16,
     timeout_ms: u64,
 ) -> Result<Vec<u16>, String> {
-    use tokio::time::timeout;
-    let mut ctx = session.lock().await;
-    ctx.set_slave(tokio_modbus::prelude::Slave(unit));
+    if !(1..=4).contains(&fc) {
+        return Err(format!("unsupported route function code {fc}"));
+    }
     let dur = Duration::from_millis(timeout_ms.max(50));
-    let words = match fc {
-        3 => timeout(dur, ctx.read_holding_registers(start, qty)).await,
-        4 => timeout(dur, ctx.read_input_registers(start, qty)).await,
-        1 | 2 => {
-            let res = if fc == 1 {
-                timeout(dur, ctx.read_coils(start, qty)).await
-            } else {
-                timeout(dur, ctx.read_discrete_inputs(start, qty)).await
-            };
-            let bits = res
-                .map_err(|_| format!("route read timed out after {timeout_ms} ms"))?
-                .map_err(|e| format!("route read transport error: {e}"))?
-                .map_err(|e| format!("route read modbus exception: {e}"))?;
-            return Ok(bits.into_iter().map(|b| if b { 1u16 } else { 0u16 }).collect());
+    // The session-lock wait is inside the timeout: a session held by a hung
+    // read elsewhere makes this read time out too instead of waiting forever.
+    let read = async move {
+        let transport = |e: tokio_modbus::Error| format!("route read transport error: {e}");
+        let exception = |e: ExceptionCode| format!("route read modbus exception: {e}");
+        let bits_to_words = |bits: Vec<bool>| bits.into_iter().map(u16::from).collect::<Vec<u16>>();
+        let mut ctx = session.lock().await;
+        ctx.set_slave(tokio_modbus::prelude::Slave(unit));
+        match fc {
+            1 => ctx.read_coils(start, qty).await.map_err(transport)?.map(bits_to_words).map_err(exception),
+            2 => ctx.read_discrete_inputs(start, qty).await.map_err(transport)?.map(bits_to_words).map_err(exception),
+            3 => ctx.read_holding_registers(start, qty).await.map_err(transport)?.map_err(exception),
+            _ => ctx.read_input_registers(start, qty).await.map_err(transport)?.map_err(exception),
         }
-        other => return Err(format!("unsupported route function code {other}")),
     };
-    let out = words
+    tokio::time::timeout(dur, read)
+        .await
         .map_err(|_| format!("route read timed out after {timeout_ms} ms"))?
-        .map_err(|e| format!("route read transport error: {e}"))?
-        .map_err(|e| format!("route read modbus exception: {e}"))?;
-    Ok(out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sim_scaling::{effective_decimals, RegMeta};
 
     /// No-op `ValuesSink` for tests: `SimEngine::start` requires a sink, but
     /// most tests only care about server/tick bank behavior, not the emitted
@@ -3341,6 +4153,133 @@ mod tests {
         for &(a, v) in holding { b.holding.insert(a, v); }
         for &(a, v) in coils { b.coils.insert(a, v); }
         b
+    }
+
+    #[test]
+    fn unknown_unit_replies_gateway_target() {
+        let mut map = HashMap::new();
+        map.insert(1u8, banks_with(&[(0, 5)], &[]));
+        let service = SimService {
+            banks: Arc::new(RwLock::new(map)),
+            clients: Arc::new(AtomicUsize::new(0)),
+            writes: Arc::new(Mutex::new(Vec::new())),
+        };
+        // No bank for unit 99: gateway "target device failed to respond".
+        assert_eq!(
+            service.handle(99, Request::ReadHoldingRegisters(0, 1)),
+            Err(ExceptionCode::GatewayTargetDevice)
+        );
+        // A known unit still answers a missing register with IllegalDataAddress.
+        assert_eq!(
+            service.handle(1, Request::ReadHoldingRegisters(50, 1)),
+            Err(ExceptionCode::IllegalDataAddress)
+        );
+    }
+
+    fn service_with(map: HashMap<u8, SimBanks>) -> SimService {
+        SimService {
+            banks: Arc::new(RwLock::new(map)),
+            clients: Arc::new(AtomicUsize::new(0)),
+            writes: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    #[test]
+    fn modbus_reads_share_the_banks_lock() {
+        let mut map = HashMap::new();
+        map.insert(1u8, banks_with(&[(0, 7)], &[]));
+        let s = service_with(map);
+        let guard = s.banks.read().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let s2 = s.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(s2.handle(1, Request::ReadHoldingRegisters(0, 1)));
+        });
+        let got = rx.recv_timeout(Duration::from_secs(2)).expect("read must not wait for a write lock");
+        assert_eq!(got, Ok(Response::ReadHoldingRegisters(vec![7])));
+        drop(guard);
+        assert_eq!(
+            s.handle(1, Request::WriteSingleRegister(0, 9)),
+            Ok(Response::WriteSingleRegister(0, 9))
+        );
+    }
+
+    #[test]
+    fn request_quantity_is_validated() {
+        // Unit 1 with holding/input/coils/discretes 0..=199 so a too-large
+        // request would otherwise "succeed" with an oversized frame.
+        let mut b = SimBanks::default();
+        for a in 0..200u16 {
+            b.holding.insert(a, 0);
+            b.input.insert(a, 0);
+            b.coils.insert(a, false);
+            b.discrete_inputs.insert(a, false);
+        }
+        b.holding.insert(65535, 0);
+        b.coils.insert(65535, false);
+        let mut map = HashMap::new();
+        map.insert(1u8, b);
+        let s = service_with(map);
+        let bad_value = Err(ExceptionCode::IllegalDataValue);
+        // FC3/FC4: 1..=125
+        assert_eq!(s.handle(1, Request::ReadHoldingRegisters(0, 0)), bad_value);
+        assert_eq!(s.handle(1, Request::ReadHoldingRegisters(0, 126)), bad_value);
+        assert_eq!(s.handle(1, Request::ReadInputRegisters(0, 0)), bad_value);
+        assert_eq!(s.handle(1, Request::ReadInputRegisters(0, 200)), bad_value);
+        assert!(s.handle(1, Request::ReadHoldingRegisters(0, 125)).is_ok());
+        // FC1/FC2: 1..=2000
+        assert_eq!(s.handle(1, Request::ReadCoils(0, 0)), bad_value);
+        assert_eq!(s.handle(1, Request::ReadCoils(0, 2001)), bad_value);
+        assert_eq!(s.handle(1, Request::ReadDiscreteInputs(0, 0)), bad_value);
+        assert_eq!(s.handle(1, Request::ReadDiscreteInputs(0, 2001)), bad_value);
+        // FC15: 1..=1968, FC16: 1..=123
+        assert_eq!(s.handle(1, Request::WriteMultipleCoils(0, vec![].into())), bad_value);
+        assert_eq!(s.handle(1, Request::WriteMultipleCoils(0, vec![false; 1969].into())), bad_value);
+        assert_eq!(s.handle(1, Request::WriteMultipleRegisters(0, vec![].into())), bad_value);
+        assert_eq!(s.handle(1, Request::WriteMultipleRegisters(0, vec![0; 124].into())), bad_value);
+        assert!(s.handle(1, Request::WriteMultipleRegisters(0, vec![0; 123].into())).is_ok());
+        // address + quantity past the 65536-address space → IllegalDataAddress
+        let bad_addr = Err(ExceptionCode::IllegalDataAddress);
+        assert_eq!(s.handle(1, Request::ReadHoldingRegisters(65535, 2)), bad_addr);
+        assert_eq!(s.handle(1, Request::ReadCoils(65535, 2)), bad_addr);
+        assert_eq!(s.handle(1, Request::WriteMultipleRegisters(65535, vec![1, 2].into())), bad_addr);
+        assert!(s.handle(1, Request::ReadHoldingRegisters(65535, 1)).is_ok());
+    }
+
+    #[test]
+    fn multi_writes_are_atomic() {
+        // holding 0,1 exist, 2 does not: a 3-register write must fail and
+        // leave 0 and 1 untouched (no partial write).
+        let mut map = HashMap::new();
+        map.insert(1u8, banks_with(&[(0, 7), (1, 8)], &[(0, false), (1, false)]));
+        let s = service_with(map);
+        assert_eq!(
+            s.handle(1, Request::WriteMultipleRegisters(0, vec![1, 2, 3].into())),
+            Err(ExceptionCode::IllegalDataAddress)
+        );
+        assert_eq!(
+            s.handle(1, Request::WriteMultipleCoils(0, vec![true, true, true].into())),
+            Err(ExceptionCode::IllegalDataAddress)
+        );
+        let g = s.banks.read().unwrap();
+        let b = g.get(&1).unwrap();
+        assert_eq!(b.holding.get(&0), Some(&7));
+        assert_eq!(b.holding.get(&1), Some(&8));
+        assert_eq!(b.coils.get(&0), Some(&false));
+        assert_eq!(b.coils.get(&1), Some(&false));
+        drop(g);
+        assert!(s.writes.lock().unwrap().is_empty(), "a rejected write records no write event");
+    }
+
+    #[test]
+    fn multi_writes_record_every_written_address() {
+        let mut map = HashMap::new();
+        map.insert(1u8, banks_with(&[(10, 0), (11, 0), (12, 0)], &[(0, false), (1, false)]));
+        let s = service_with(map);
+        s.handle(1, Request::WriteMultipleRegisters(10, vec![1, 2, 3].into())).unwrap();
+        s.handle(1, Request::WriteMultipleCoils(0, vec![true, true].into())).unwrap();
+        let w = s.writes.lock().unwrap().clone();
+        assert_eq!(w, vec![(1, 3, 10), (1, 3, 11), (1, 3, 12), (1, 1, 0), (1, 1, 1)]);
     }
 
     #[test]
@@ -3533,7 +4472,7 @@ mod tests {
             data_type: "u16".into(), hold_value: 0, sort_order: 0, device_instance_id: None,
             value_source: "device".into(), byte_order: "ABCD".into(),
             source_params: "{\"preset\":\"temperature\"}".into(), interval_ms: 1000,
-            unit: None, display_format: None,
+            unit: None, display_format: None, scale: None, scale_offset: None, decimals: None,
         };
         // Insert + link the device registers the way the device-add path does.
         for addr in [0, 1] {
@@ -3552,9 +4491,9 @@ mod tests {
         let profile = build_profile(&c).unwrap();
         let json = serde_json::to_string(&profile).unwrap();
 
-        let c2 = mem_db();
+        let mut c2 = mem_db();
         let parsed: SimProfile = serde_json::from_str(&json).unwrap();
-        apply_profile(&c2, &parsed).unwrap();
+        apply_profile(&mut c2, &parsed).unwrap();
 
         let devs = db_list_devices(&c2).unwrap();
         assert_eq!(devs.len(), 1);
@@ -3577,6 +4516,7 @@ mod tests {
             registers: vec![TemplateRegister {
                 offset: 0, bank: 4, data_type: "f32".into(), byte_order: "CDAB".into(),
                 value_source: "device".into(), source_params: "{\"preset\":\"analog\"}".into(), alias: "V".into(),
+                unit: None, display_format: None, scale: None, scale_offset: None, decimals: None, interval_ms: None, hold_value: None,
             }],
         };
         assert!(validate_template(&good).is_ok());
@@ -3605,7 +4545,7 @@ mod tests {
 
     #[test]
     fn apply_profile_rejects_invalid_register() {
-        let c = mem_db();
+        let mut c = mem_db();
         let bad = SimProfile {
             version: 1,
             config: db_get_config(&c).unwrap(),
@@ -3614,11 +4554,11 @@ mod tests {
                 id: 0, unit_id: 1, function_code: 3, address: 0, alias: "".into(),
                 data_type: "u128".into(), hold_value: 0, sort_order: 0, device_instance_id: None,
                 value_source: "generator".into(), byte_order: "ABCD".into(), source_params: "{}".into(),
-                interval_ms: 1000, unit: None, display_format: None,
+                interval_ms: 1000, unit: None, display_format: None, scale: None, scale_offset: None, decimals: None,
             }],
             rules: Vec::new(),
         };
-        assert!(apply_profile(&c, &bad).is_err());
+        assert!(apply_profile(&mut c, &bad).is_err());
     }
 
     #[test]
@@ -3629,7 +4569,7 @@ mod tests {
             alias: "Device addr".into(), data_type: "u16".into(), hold_value: 3, sort_order: 0,
             device_instance_id: None,
             value_source: "hold".into(), byte_order: "ABCD".into(), source_params: "{}".into(), interval_ms: 1000,
-            unit: None, display_format: None,
+            unit: None, display_format: None, scale: None, scale_offset: None, decimals: None,
         }).unwrap();
         let mut rows = db_list_registers(&c).unwrap();
         assert_eq!(rows.len(), 1);
@@ -3652,7 +4592,7 @@ mod tests {
             value_source: "device".into(), byte_order: "CDAB".into(),
             source_params: "{\"preset\":\"temperature\",\"min\":20,\"max\":30}".into(),
             interval_ms: 500, sort_order: 0, device_instance_id: None,
-            unit: None, display_format: None,
+            unit: None, display_format: None, scale: None, scale_offset: None, decimals: None,
         }).unwrap();
         let rows = db_list_registers(&c).unwrap();
         let r = rows.iter().find(|r| r.id == id).unwrap();
@@ -3690,7 +4630,7 @@ mod tests {
             sort_order: 0,
         };
         let d = parse_rule(&r).unwrap();
-        assert!(matches!(d.trigger, Trigger::Condition { value: 100, .. }));
+        assert!(matches!(&d.trigger, Trigger::Condition { join: Join::All, conds } if conds.len() == 1 && conds[0].value == 100.0));
         assert_eq!(d.actions.len(), 2);
         // disabled → None
         let off = SimRule { enabled: false, ..r.clone() };
@@ -3714,47 +4654,49 @@ mod tests {
         let rules = vec![rule(1, Trigger::Interval { ms: 100.0 }, vec![Action::Toggle{unit:1,bank:1,address:0}])];
         let mut st = HashMap::new();
         let b = HashMap::new();
-        assert_eq!(eval_rules(&rules, &mut st, &b, 0.0, &[]).len(), 1);   // due at t=0
-        assert_eq!(eval_rules(&rules, &mut st, &b, 50.0, &[]).len(), 0);  // not yet
-        assert_eq!(eval_rules(&rules, &mut st, &b, 100.0, &[]).len(), 1); // next period
+        assert_eq!(eval_rules(&rules, &mut st, &b, &RegMetaMap::new(), 0.0, &[]).len(), 1);   // due at t=0
+        assert_eq!(eval_rules(&rules, &mut st, &b, &RegMetaMap::new(), 50.0, &[]).len(), 0);  // not yet
+        assert_eq!(eval_rules(&rules, &mut st, &b, &RegMetaMap::new(), 100.0, &[]).len(), 1); // next period
     }
     #[test]
     fn condition_is_edge_fired() {
-        let rules = vec![rule(1, Trigger::Condition{unit:1,bank:3,address:0,op:">=".into(),value:100}, vec![Action::Set{unit:1,bank:1,address:0,value:1}])];
+        let rules = vec![rule(1, Trigger::Condition{join:Join::All,conds:vec![cnd(1,3,0,">=",100.0,0.0)]}, vec![Action::Set{unit:1,bank:1,address:0,value:1.0}])];
         let mut st = HashMap::new();
+        let meta = cmeta(&[(1,3,0,"u16",1.0)]);
         let below = banks1(&[(1,3,0,50)]);
         let above = banks1(&[(1,3,0,150)]);
-        assert_eq!(eval_rules(&rules, &mut st, &below, 0.0, &[]).len(), 0);   // false
-        assert_eq!(eval_rules(&rules, &mut st, &above, 10.0, &[]).len(), 1);  // false→true edge
-        assert_eq!(eval_rules(&rules, &mut st, &above, 20.0, &[]).len(), 0);  // stays true, no re-fire
+        assert_eq!(eval_rules(&rules, &mut st, &below, &meta, 0.0, &[]).len(), 0);   // false
+        assert_eq!(eval_rules(&rules, &mut st, &above, &meta, 10.0, &[]).len(), 1);  // false→true edge
+        assert_eq!(eval_rules(&rules, &mut st, &above, &meta, 20.0, &[]).len(), 0);  // stays true, no re-fire
     }
     #[test]
     fn changed_fires_on_each_change() {
-        let rules = vec![rule(1, Trigger::Condition{unit:1,bank:3,address:0,op:"changed".into(),value:0}, vec![Action::Inc{unit:1,bank:3,address:1,by:1}])];
+        let rules = vec![rule(1, Trigger::Condition{join:Join::All,conds:vec![cnd(1,3,0,"changed",0.0,0.0)]}, vec![Action::Inc{unit:1,bank:3,address:1,by:1.0}])];
         let mut st = HashMap::new();
+        let meta = cmeta(&[(1,3,0,"u16",1.0)]);
         let v10 = banks1(&[(1,3,0,10)]);
         let v20 = banks1(&[(1,3,0,20)]);
         let v30 = banks1(&[(1,3,0,30)]);
-        assert_eq!(eval_rules(&rules, &mut st, &v10, 0.0, &[]).len(), 0);  // first observation, no prior
-        assert_eq!(eval_rules(&rules, &mut st, &v20, 10.0, &[]).len(), 1); // 10 -> 20: fires
-        assert_eq!(eval_rules(&rules, &mut st, &v20, 20.0, &[]).len(), 0); // unchanged: no fire
-        assert_eq!(eval_rules(&rules, &mut st, &v30, 30.0, &[]).len(), 1); // 20 -> 30: fires
+        assert_eq!(eval_rules(&rules, &mut st, &v10, &meta, 0.0, &[]).len(), 0);  // first observation, no prior
+        assert_eq!(eval_rules(&rules, &mut st, &v20, &meta, 10.0, &[]).len(), 1); // 10 -> 20: fires
+        assert_eq!(eval_rules(&rules, &mut st, &v20, &meta, 20.0, &[]).len(), 0); // unchanged: no fire
+        assert_eq!(eval_rules(&rules, &mut st, &v30, &meta, 30.0, &[]).len(), 1); // 20 -> 30: fires
     }
     #[test]
     fn on_write_matches_drained_write() {
-        let rules = vec![rule(1, Trigger::OnWrite{unit:1,bank:3,address:Some(5)}, vec![Action::Inc{unit:1,bank:3,address:6,by:1}])];
+        let rules = vec![rule(1, Trigger::OnWrite{unit:1,bank:3,address:Some(5)}, vec![Action::Inc{unit:1,bank:3,address:6,by:1.0}])];
         let mut st = HashMap::new();
         let b = HashMap::new();
-        assert_eq!(eval_rules(&rules, &mut st, &b, 0.0, &[(1,3,5)]).len(), 1);
-        assert_eq!(eval_rules(&rules, &mut st, &b, 0.0, &[(1,3,9)]).len(), 0);
+        assert_eq!(eval_rules(&rules, &mut st, &b, &RegMetaMap::new(), 0.0, &[(1,3,5)]).len(), 1);
+        assert_eq!(eval_rules(&rules, &mut st, &b, &RegMetaMap::new(), 0.0, &[(1,3,9)]).len(), 0);
     }
 
     #[test]
     fn action_set_inc_toggle() {
         let mut b = banks1(&[(1, 3, 0, 10), (1, 1, 0, 0)]);
-        apply_action(&mut b, &Action::Set { unit: 1, bank: 3, address: 0, value: 42 }, 0);
+        apply_action(&mut b, &Action::Set { unit: 1, bank: 3, address: 0, value: 42.0 }, 0);
         assert_eq!(read_word(&b, 1, 3, 0), Some(42));
-        apply_action(&mut b, &Action::Inc { unit: 1, bank: 3, address: 0, by: 8 }, 0);
+        apply_action(&mut b, &Action::Inc { unit: 1, bank: 3, address: 0, by: 8.0 }, 0);
         assert_eq!(read_word(&b, 1, 3, 0), Some(50));
         apply_action(&mut b, &Action::Toggle { unit: 1, bank: 1, address: 0 }, 0);
         assert_eq!(read_word(&b, 1, 1, 0), Some(1));
@@ -3772,19 +4714,20 @@ mod tests {
     #[test]
     fn action_inc_wraps() {
         let mut b = banks1(&[(1, 3, 0, 0xFFFF)]);
-        apply_action(&mut b, &Action::Inc { unit: 1, bank: 3, address: 0, by: 2 }, 0);
+        apply_action(&mut b, &Action::Inc { unit: 1, bank: 3, address: 0, by: 2.0 }, 0);
         assert_eq!(read_word(&b, 1, 3, 0), Some(1)); // wraps
     }
 
     #[test]
     fn timed_action_sets_multi_word_register() {
         // A `set` targeting an f32 holding register writes 2 words (ABCD).
-        let mut b = HashMap::new();
+        // The register must be configured (seeded) — actions never create.
+        let mut b = banks1(&[(1, 3, 10, 0), (1, 3, 11, 0)]);
         let one = TimedAction {
-            action: Action::Set { unit: 1, bank: 3, address: 10, value: 1 },
+            action: Action::Set { unit: 1, bank: 3, address: 10, value: 1.0 },
             delay_ms: 0.0, data_type: "f32".into(), byte_order: "ABCD".into(),
         };
-        apply_timed_action(&mut b, &one, 0);
+        apply_timed_action(&mut b, &RegMetaMap::new(), &one, 0);
         // f32(1.0) = 0x3F80_0000 → words [0x3F80, 0x0000]
         assert_eq!(read_word(&b, 1, 3, 10), Some(0x3F80));
         assert_eq!(read_word(&b, 1, 3, 11), Some(0x0000));
@@ -3793,11 +4736,11 @@ mod tests {
     #[test]
     fn timed_action_inc_reads_and_writes_multi_word() {
         // Seed an f32 register = 10.0, inc by 5 → 15.0.
-        let mut b = HashMap::new();
-        let seed = TimedAction { action: Action::Set { unit: 1, bank: 3, address: 0, value: 10 }, delay_ms: 0.0, data_type: "f32".into(), byte_order: "ABCD".into() };
-        apply_timed_action(&mut b, &seed, 0);
-        let inc = TimedAction { action: Action::Inc { unit: 1, bank: 3, address: 0, by: 5 }, ..seed.clone() };
-        apply_timed_action(&mut b, &inc, 0);
+        let mut b = banks1(&[(1, 3, 0, 0), (1, 3, 1, 0)]);
+        let seed = TimedAction { action: Action::Set { unit: 1, bank: 3, address: 0, value: 10.0 }, delay_ms: 0.0, data_type: "f32".into(), byte_order: "ABCD".into() };
+        apply_timed_action(&mut b, &RegMetaMap::new(), &seed, 0);
+        let inc = TimedAction { action: Action::Inc { unit: 1, bank: 3, address: 0, by: 5.0 }, ..seed.clone() };
+        apply_timed_action(&mut b, &RegMetaMap::new(), &inc, 0);
         let got = read_typed(&b, 1, 3, 0, "f32", "ABCD").unwrap();
         assert!((got - 15.0).abs() < 1e-6, "got {got}");
     }
@@ -3807,8 +4750,8 @@ mod tests {
         // Default u16 timed action == apply_action (no multi-word path).
         let mut a = banks1(&[(1, 3, 0, 10)]);
         let mut b = banks1(&[(1, 3, 0, 10)]);
-        let ta = TimedAction { action: Action::Inc { unit: 1, bank: 3, address: 0, by: 8 }, delay_ms: 0.0, data_type: "u16".into(), byte_order: "ABCD".into() };
-        apply_timed_action(&mut a, &ta, 0);
+        let ta = TimedAction { action: Action::Inc { unit: 1, bank: 3, address: 0, by: 8.0 }, delay_ms: 0.0, data_type: "u16".into(), byte_order: "ABCD".into() };
+        apply_timed_action(&mut a, &RegMetaMap::new(), &ta, 0);
         apply_action(&mut b, &ta.action, 0);
         assert_eq!(read_word(&a, 1, 3, 0), read_word(&b, 1, 3, 0));
     }
@@ -3832,9 +4775,9 @@ mod tests {
     #[test]
     fn builds_banks_grouped_by_unit_and_function() {
         let regs = vec![
-            SimRegister { id: 1, unit_id: 1, function_code: 3, address: 257, alias: "".into(), data_type: "u16".into(), hold_value: 3, sort_order: 0, device_instance_id: None, value_source: "hold".into(), byte_order: "ABCD".into(), source_params: "{}".into(), interval_ms: 1000, unit: None, display_format: None },
-            SimRegister { id: 2, unit_id: 1, function_code: 4, address: 1, alias: "".into(), data_type: "u16".into(), hold_value: 250, sort_order: 0, device_instance_id: None, value_source: "hold".into(), byte_order: "ABCD".into(), source_params: "{}".into(), interval_ms: 1000, unit: None, display_format: None },
-            SimRegister { id: 3, unit_id: 2, function_code: 1, address: 0, alias: "".into(), data_type: "bool".into(), hold_value: 1, sort_order: 0, device_instance_id: None, value_source: "hold".into(), byte_order: "ABCD".into(), source_params: "{}".into(), interval_ms: 1000, unit: None, display_format: None },
+            SimRegister { id: 1, unit_id: 1, function_code: 3, address: 257, alias: "".into(), data_type: "u16".into(), hold_value: 3, sort_order: 0, device_instance_id: None, value_source: "hold".into(), byte_order: "ABCD".into(), source_params: "{}".into(), interval_ms: 1000, unit: None, display_format: None, scale: None, scale_offset: None, decimals: None },
+            SimRegister { id: 2, unit_id: 1, function_code: 4, address: 1, alias: "".into(), data_type: "u16".into(), hold_value: 250, sort_order: 0, device_instance_id: None, value_source: "hold".into(), byte_order: "ABCD".into(), source_params: "{}".into(), interval_ms: 1000, unit: None, display_format: None, scale: None, scale_offset: None, decimals: None },
+            SimRegister { id: 3, unit_id: 2, function_code: 1, address: 0, alias: "".into(), data_type: "bool".into(), hold_value: 1, sort_order: 0, device_instance_id: None, value_source: "hold".into(), byte_order: "ABCD".into(), source_params: "{}".into(), interval_ms: 1000, unit: None, display_format: None, scale: None, scale_offset: None, decimals: None },
         ];
         let banks = registers_to_banks(&regs);
         assert_eq!(banks.get(&1).unwrap().holding.get(&257), Some(&3));
@@ -3845,7 +4788,7 @@ mod tests {
     #[test]
     fn i16_negative_stored_as_twos_complement_word() {
         let regs = vec![
-            SimRegister { id: 1, unit_id: 1, function_code: 3, address: 0, alias: "".into(), data_type: "i16".into(), hold_value: -1, sort_order: 0, device_instance_id: None, value_source: "hold".into(), byte_order: "ABCD".into(), source_params: "{}".into(), interval_ms: 1000, unit: None, display_format: None },
+            SimRegister { id: 1, unit_id: 1, function_code: 3, address: 0, alias: "".into(), data_type: "i16".into(), hold_value: -1, sort_order: 0, device_instance_id: None, value_source: "hold".into(), byte_order: "ABCD".into(), source_params: "{}".into(), interval_ms: 1000, unit: None, display_format: None, scale: None, scale_offset: None, decimals: None },
         ];
         let banks = registers_to_banks(&regs);
         assert_eq!(banks.get(&1).unwrap().holding.get(&0), Some(&0xFFFF));
@@ -4050,7 +4993,7 @@ mod tests {
             hold_value: 0, value_source: "generator".into(), byte_order: "ABCD".into(),
             source_params: "{\"kind\":\"sine\",\"min\":0,\"max\":100,\"periodMs\":1000}".into(),
             interval_ms: 100, sort_order: 0, device_instance_id: None,
-            unit: None, display_format: None,
+            unit: None, display_format: None, scale: None, scale_offset: None, decimals: None,
         };
         let d = parse_dynamic(&gen).unwrap();
         assert_eq!(d.address, 0);
@@ -4067,7 +5010,7 @@ mod tests {
             hold_value: 0, value_source: "route".into(), byte_order: "ABCD".into(),
             source_params: "{\"slaveUnitId\":7,\"connectionKind\":\"tcp\",\"functionCode\":4,\"address\":1}".into(),
             interval_ms: 500, sort_order: 0, device_instance_id: None,
-            unit: None, display_format: None,
+            unit: None, display_format: None, scale: None, scale_offset: None, decimals: None,
         };
         let d = parse_dynamic(&reg).unwrap();
         match d.kind {
@@ -4093,7 +5036,7 @@ mod tests {
             hold_value: 0, value_source: "route".into(), byte_order: "ABCD".into(),
             source_params: "{\"slaveUnitId\":7,\"functionCode\":3,\"address\":1,\"scale\":0.1,\"offset\":-40,\"srcByteOrder\":\"BADC\"}".into(),
             interval_ms: 500, sort_order: 0, device_instance_id: None,
-            unit: None, display_format: None,
+            unit: None, display_format: None, scale: None, scale_offset: None, decimals: None,
         };
         match parse_dynamic(&reg).unwrap().kind {
             DynKind::Route { scale, offset, src_byte_order, .. } => {
@@ -4111,7 +5054,7 @@ mod tests {
         let d = DynReg {
             unit: 1, bank: 3, address: 0, data_type: "u16".into(), byte_order: "ABCD".into(),
             kind: DynKind::Route { slave_unit: 1, connection_kind: "tcp".into(), src_fc: 3, src_addr: 0, count: 1, scale: 0.1, offset: -40.0, src_byte_order: "ABCD".into() },
-            interval_ms: 1000.0,
+            interval_ms: 1000.0, scale: 1.0, scale_offset: 0.0,
         };
         assert_eq!(transform_route_words(&d, &[700], 0.1, -40.0, "ABCD"), vec![30]);
         // Identity transform mirrors verbatim.
@@ -4128,7 +5071,7 @@ mod tests {
             hold_value: 0, value_source: "generator".into(), byte_order: "ABCD".into(),
             source_params: "{\"kind\":\"ramp\",\"min\":0,\"max\":10,\"periodMs\":1000}".into(),
             interval_ms: 100, sort_order: 0, device_instance_id: None,
-            unit: None, display_format: None,
+            unit: None, display_format: None, scale: None, scale_offset: None, decimals: None,
         };
         let banks = registers_to_banks(&[reg]);
         let h = &banks.get(&1).unwrap().holding;
@@ -4141,7 +5084,7 @@ mod tests {
             id: 0, unit_id: 1, function_code: 3, address: 0, alias: "".into(), data_type: "u32".into(),
             hold_value: 0, value_source: "generator".into(), byte_order: "CDAB".into(),
             source_params: "{}".into(), interval_ms: 100, sort_order: 0, device_instance_id: None,
-            unit: None, display_format: None,
+            unit: None, display_format: None, scale: None, scale_offset: None, decimals: None,
         };
         assert!(validate_register(&ok).is_ok());
         // 4-word types are now supported (u64/i64/f64), including their orders.
@@ -4161,7 +5104,7 @@ mod tests {
             id: 0, unit_id: 1, function_code: 1, address: 0, alias: "".into(), data_type: "bool".into(),
             hold_value: 0, value_source: "generator".into(), byte_order: "ABCD".into(),
             source_params: "{}".into(), interval_ms: 100, sort_order: 0, device_instance_id: None,
-            unit: None, display_format: None,
+            unit: None, display_format: None, scale: None, scale_offset: None, decimals: None,
         };
         assert!(validate_register(&base).is_err());
         let device = SimRegister { value_source: "device".into(), ..base.clone() };
@@ -4178,7 +5121,7 @@ mod tests {
             hold_value: 0, value_source: "generator".into(), byte_order: "ABCD".into(),
             source_params: "{\"kind\":\"ramp\",\"min\":0,\"max\":100,\"periodMs\":1000}".into(),
             interval_ms: 50, sort_order: 0, device_instance_id: None,
-            unit: None, display_format: None,
+            unit: None, display_format: None, scale: None, scale_offset: None, decimals: None,
         };
         let banks = registers_to_banks(&[reg.clone()]);
         let dynamics: Vec<DynReg> = [reg].iter().filter_map(parse_dynamic).collect();
@@ -4202,7 +5145,7 @@ mod tests {
             data_type: "u16".into(), hold_value: 0, value_source: "generator".into(),
             byte_order: "ABCD".into(),
             source_params: "{\"kind\":\"random\",\"min\":0,\"max\":60000}".into(),
-            interval_ms: 20, sort_order: 0, device_instance_id: None, unit: None, display_format: None,
+            interval_ms: 20, sort_order: 0, device_instance_id: None, unit: None, display_format: None, scale: None, scale_offset: None, decimals: None,
         };
         let (r0, r1) = (mk(0), mk(1));
         let banks = registers_to_banks(&[r0.clone(), r1.clone()]);
@@ -4239,9 +5182,14 @@ mod tests {
             hold_value: 0, value_source: "generator".into(), byte_order: "ABCD".into(),
             source_params: "{\"kind\":\"ramp\",\"min\":0,\"max\":100,\"periodMs\":500}".into(),
             interval_ms: 50, sort_order: 0, device_instance_id: None,
-            unit: None, display_format: None,
+            unit: None, display_format: None, scale: None, scale_offset: None, decimals: None,
         };
-        engine.set_dynamics([reg].iter().filter_map(parse_dynamic).collect());
+        // Mirror `simulator_add_register` → `apply_to_running`: seed the
+        // register's t=0 words (the only path that creates addresses), then
+        // hand the tick its new live list.
+        let d = parse_dynamic(&reg).unwrap();
+        engine.apply_words(1, 4, 0, &encode_value(&d.data_type, &d.byte_order, dyn_raw_value(&d, 0.0)).unwrap());
+        engine.set_dynamics(vec![d]);
 
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         let first = client.read_input_registers(0, 2).await.unwrap().unwrap();
@@ -4258,7 +5206,7 @@ mod tests {
             id: 1, unit_id: 1, function_code: 3, address: 0, alias: "".into(), data_type: "u16".into(),
             hold_value: 0, value_source: "hold".into(), byte_order: "ABCD".into(),
             source_params: "{}".into(), interval_ms: 1000, sort_order: 0, device_instance_id: None,
-            unit: None, display_format: None,
+            unit: None, display_format: None, scale: None, scale_offset: None, decimals: None,
         };
         let banks = registers_to_banks(&[reg]);
         let mut engine = SimEngine::new();
@@ -4299,7 +5247,7 @@ mod tests {
             hold_value: 0, value_source: "generator".into(), byte_order: "ABCD".into(),
             source_params: "{\"kind\":\"ramp\",\"min\":0,\"max\":100,\"periodMs\":1000}".into(),
             interval_ms: 50, sort_order: 0, device_instance_id: None,
-            unit: None, display_format: None,
+            unit: None, display_format: None, scale: None, scale_offset: None, decimals: None,
         };
         let banks = registers_to_banks(&[reg.clone()]);
         let dynamics: Vec<DynReg> = [reg].iter().filter_map(parse_dynamic).collect();
@@ -4322,6 +5270,126 @@ mod tests {
             recorded.iter().any(|e| e.workspace == "ws" && !e.rows.is_empty()),
             "expected an event for workspace 'ws' with non-empty rows"
         );
+    }
+
+    fn vhold(id: i64, addr: i64) -> SimRegister {
+        SimRegister {
+            id, unit_id: 1, function_code: 3, address: addr, alias: "".into(), data_type: "u16".into(),
+            hold_value: 7, value_source: "hold".into(), byte_order: "ABCD".into(),
+            source_params: "{}".into(), interval_ms: 100, sort_order: 0, device_instance_id: None,
+            unit: None, display_format: None, scale: None, scale_offset: None, decimals: None,
+        }
+    }
+
+    fn vsine(id: i64, addr: i64) -> SimRegister {
+        SimRegister {
+            value_source: "generator".into(),
+            source_params: "{\"kind\":\"sine\",\"min\":0,\"max\":1000,\"periodMs\":1000}".into(),
+            interval_ms: 100,
+            ..vhold(id, addr)
+        }
+    }
+
+    async fn start_recording(regs: &[SimRegister]) -> (SimEngine, std::sync::Arc<std::sync::Mutex<Vec<SimValuesEvent>>>) {
+        let banks = registers_to_banks(regs);
+        let dynamics: Vec<DynReg> = regs.iter().filter_map(parse_dynamic).collect();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut engine = SimEngine::new();
+        engine.start(RecordingSink(events.clone()), "ws".into(), "127.0.0.1", 0, 20, banks, dynamics, Default::default(), Default::default(), Vec::new()).await.unwrap();
+        (engine, events)
+    }
+
+    fn ms(n: u64) -> tokio::time::Sleep {
+        tokio::time::sleep(std::time::Duration::from_millis(n))
+    }
+
+    fn addrs(e: &SimValuesEvent) -> Vec<u16> {
+        let mut a: Vec<u16> = e.rows.iter().map(|r| r.address).collect();
+        a.sort();
+        a
+    }
+
+    #[tokio::test]
+    async fn values_first_emit_is_full() {
+        let (mut engine, events) = start_recording(&[vhold(1, 0), vsine(2, 1)]).await;
+        ms(300).await;
+        engine.stop().await;
+        let rec = events.lock().unwrap();
+        assert!(rec[0].full);
+        assert_eq!(addrs(&rec[0]), vec![0, 1]);
+    }
+
+    #[tokio::test]
+    async fn values_unchanged_registers_are_not_resent() {
+        let (mut engine, events) = start_recording(&[vhold(1, 0)]).await;
+        ms(200).await;
+        let n = events.lock().unwrap().len();
+        assert_eq!(n, 1);
+        ms(350).await;
+        engine.stop().await;
+        assert_eq!(events.lock().unwrap().len(), 1, "no further events for an idle hold register");
+    }
+
+    #[tokio::test]
+    async fn values_delta_carries_only_changed_rows() {
+        let (mut engine, events) = start_recording(&[vhold(1, 0), vsine(2, 1)]).await;
+        ms(700).await;
+        engine.stop().await;
+        let rec = events.lock().unwrap();
+        let delta = rec.iter().skip(1).find(|e| !e.full).expect("a delta event");
+        assert_eq!(addrs(delta), vec![1]);
+    }
+
+    #[tokio::test]
+    async fn values_status_only_change_emits_delta() {
+        // A route register with no session reports "missing" and never changes
+        // value; its interval is long so route_loop doesn't rewrite the status.
+        let route = SimRegister {
+            value_source: "route".into(),
+            source_params: "{\"slaveUnitId\":1,\"connectionKind\":\"tcp\",\"functionCode\":3,\"address\":0}".into(),
+            interval_ms: 3_600_000,
+            ..vhold(1, 0)
+        };
+        let (mut engine, events) = start_recording(&[route]).await;
+        ms(400).await;
+        assert_eq!(events.lock().unwrap().len(), 1);
+        engine.statuses.lock().unwrap().insert((1, 3, 0), "stale");
+        ms(450).await;
+        engine.stop().await;
+        let rec = events.lock().unwrap();
+        assert_eq!(rec.len(), 2);
+        assert!(!rec[1].full);
+        assert_eq!(addrs(&rec[1]), vec![0]);
+        assert_eq!(rec[1].rows[0].source_status.as_deref(), Some("stale"));
+        assert_eq!(rec[1].rows[0].value_word, rec[0].rows[0].value_word, "value unchanged");
+    }
+
+    #[tokio::test]
+    async fn values_removed_register_forces_full() {
+        let (mut engine, events) = start_recording(&[vhold(1, 0), vhold(2, 1)]).await;
+        ms(200).await;
+        assert_eq!(events.lock().unwrap().len(), 1);
+        engine.clear_span(1, 3, 1, 1);
+        ms(250).await;
+        engine.stop().await;
+        let rec = events.lock().unwrap();
+        assert_eq!(rec.len(), 2);
+        assert!(rec[1].full);
+        assert_eq!(addrs(&rec[1]), vec![0]);
+    }
+
+    #[tokio::test]
+    async fn values_request_full_resends_everything() {
+        let (mut engine, events) = start_recording(&[vhold(1, 0), vhold(2, 1)]).await;
+        ms(250).await;
+        assert_eq!(events.lock().unwrap().len(), 1);
+        engine.request_full();
+        ms(250).await;
+        engine.stop().await;
+        let rec = events.lock().unwrap();
+        assert_eq!(rec.len(), 2);
+        assert!(rec[1].full);
+        assert_eq!(addrs(&rec[1]), vec![0, 1]);
     }
 
     #[tokio::test]
@@ -4398,9 +5466,14 @@ mod tests {
         let route = DynReg {
             unit: 1, bank: 3, address: 0, data_type: "u16".into(), byte_order: "ABCD".into(), interval_ms: 50.0,
             kind: DynKind::Route { slave_unit: 7, connection_kind: "tcp".into(), src_fc: 3, src_addr: 0, count: 1, scale: 1.0, offset: 0.0, src_byte_order: "ABCD".into() },
+            scale: 1.0, scale_offset: 0.0,
         };
+        // Start seeds every configured register (route ones at 0), as
+        // `registers_to_banks` does; the route only ever updates it.
+        let mut bbanks = HashMap::new();
+        place_words(&mut bbanks, 1, 3, 0, &[0]);
         let mut b = SimEngine::new();
-        let binfo = b.start(NoopSink, "ws".into(), "127.0.0.1", 0, 100, HashMap::new(), vec![route], tcp_map, rtu_map, Vec::new()).await.unwrap();
+        let binfo = b.start(NoopSink, "ws".into(), "127.0.0.1", 0, 100, bbanks, vec![route], tcp_map, rtu_map, Vec::new()).await.unwrap();
         let baddr: std::net::SocketAddr = binfo.bound.parse().unwrap();
 
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -4420,10 +5493,11 @@ mod tests {
         place_words(&mut banks, 1, 1, 0, &[0]);
         let rules = vec![RuleDef {
             id: 1, enabled: true, sort_order: 0,
-            trigger: Trigger::Condition { unit: 1, bank: 3, address: 0, op: ">=".into(), value: 100 },
-            actions: vec![timed(Action::Set { unit: 1, bank: 1, address: 0, value: 1 })],
+            trigger: Trigger::Condition { join: Join::All, conds: vec![cnd(1, 3, 0, ">=", 100.0, 0.0)] },
+            actions: vec![timed(Action::Set { unit: 1, bank: 1, address: 0, value: 1.0 })],
         }];
         let mut engine = SimEngine::new();
+        engine.set_register_meta(cmeta(&[(1, 3, 0, "u16", 1.0)]));
         // match the REAL start signature; rules is the new trailing arg
         let info = engine.start(NoopSink, "ws".into(), "127.0.0.1", 0, 100, banks, Vec::new(), Default::default(), Default::default(), rules).await.unwrap();
         let addr: std::net::SocketAddr = info.bound.parse().unwrap();
@@ -4446,7 +5520,7 @@ mod tests {
             data_type: "u16".into(), hold_value: 0, value_source: "device".into(),
             byte_order: "ABCD".into(), source_params: "{}".into(), interval_ms: 1000, sort_order: 0,
             device_instance_id: None,
-            unit: None, display_format: None,
+            unit: None, display_format: None, scale: None, scale_offset: None, decimals: None,
         }).unwrap();
         // link it (device_instance_id) — set directly
         c.execute("UPDATE sim_registers SET device_instance_id = ?1", [id]).unwrap();
@@ -4469,7 +5543,7 @@ mod tests {
             data_type: "u16".into(), hold_value: 0, value_source: "device".into(),
             byte_order: "ABCD".into(), source_params: "{}".into(), interval_ms: 1000, sort_order: 0,
             device_instance_id: None,
-            unit: None, display_format: None,
+            unit: None, display_format: None, scale: None, scale_offset: None, decimals: None,
         }).unwrap();
         c.execute("UPDATE sim_registers SET device_instance_id = ?1", [device_id]).unwrap();
 
@@ -4481,7 +5555,7 @@ mod tests {
     #[test]
     fn slave_row_maps_to_route_register() {
         // Holding register on unit 3 over serial → route reg mirroring it.
-        let r = slave_row_to_route_register(3, "serial", 3, 40, "Temperature", "u16", "");
+        let r = slave_row_to_route_register(3, "serial", 3, 40, "Temperature", "u16", "", None);
         assert_eq!(r.bank, 3);
         assert_eq!(r.offset, 40);
         assert_eq!(r.data_type, "u16");
@@ -4495,19 +5569,19 @@ mod tests {
         assert_eq!(p["address"], 40);
         assert_eq!(p["scale"], 1.0);
         assert_eq!(p["offset"], 0.0);
-        // The synthetic template must survive catalog validation (so inline add works).
+        // The synthetic template must survive inline-add validation.
         let t = DeviceTemplate {
             template_key: "ws-slave:1".into(), name: "SHT20".into(), category: "Workspace".into(),
             description: "".into(), icon: "🔗".into(), registers: vec![r],
         };
-        assert!(validate_template(&t).is_ok());
+        assert!(validate_template_shape(&t).is_ok());
     }
 
     #[test]
     fn slave_bit_row_maps_to_u16_and_preserves_order_for_words() {
         // Coil/discrete → u16/ABCD (0/1) regardless of stored type/order:
         // `bool` is reserved for Hold, so a route bit bank must use u16.
-        let bit = slave_row_to_route_register(1, "tcp", 1, 5, "Run", "u16", "DCBA");
+        let bit = slave_row_to_route_register(1, "tcp", 1, 5, "Run", "u16", "DCBA", None);
         assert_eq!(bit.data_type, "u16");
         assert_eq!(bit.byte_order, "ABCD");
         assert_eq!(bit.value_source, "route");
@@ -4517,9 +5591,9 @@ mod tests {
             template_key: "ws-slave:9".into(), name: "Relay".into(), category: "Workspace".into(),
             description: "".into(), icon: "🔗".into(), registers: vec![bit],
         };
-        assert!(validate_template(&t).is_ok());
+        assert!(validate_template_shape(&t).is_ok());
         // Multi-word holding preserves a real byte order.
-        let word = slave_row_to_route_register(1, "tcp", 3, 100, "Power", "f32", "CDAB");
+        let word = slave_row_to_route_register(1, "tcp", 3, 100, "Power", "f32", "CDAB", None);
         assert_eq!(word.data_type, "f32");
         assert_eq!(word.byte_order, "CDAB");
     }
@@ -4559,8 +5633,8 @@ mod tests {
 
     #[test]
     fn overlap_is_rejected() {
-        let existing = vec![SimRegister { id:1, unit_id:1, function_code:3, address:5, alias:"".into(), data_type:"u16".into(), hold_value:0, value_source:"hold".into(), byte_order:"ABCD".into(), source_params:"{}".into(), interval_ms:1000, sort_order:0, device_instance_id: None, unit: None, display_format: None }];
-        let new = vec![SimRegister { id:0, unit_id:1, function_code:3, address:5, alias:"".into(), data_type:"u16".into(), hold_value:0, value_source:"hold".into(), byte_order:"ABCD".into(), source_params:"{}".into(), interval_ms:1000, sort_order:0, device_instance_id: None, unit: None, display_format: None }];
+        let existing = vec![SimRegister { id:1, unit_id:1, function_code:3, address:5, alias:"".into(), data_type:"u16".into(), hold_value:0, value_source:"hold".into(), byte_order:"ABCD".into(), source_params:"{}".into(), interval_ms:1000, sort_order:0, device_instance_id: None, unit: None, display_format: None, scale: None, scale_offset: None, decimals: None }];
+        let new = vec![SimRegister { id:0, unit_id:1, function_code:3, address:5, alias:"".into(), data_type:"u16".into(), hold_value:0, value_source:"hold".into(), byte_order:"ABCD".into(), source_params:"{}".into(), interval_ms:1000, sort_order:0, device_instance_id: None, unit: None, display_format: None, scale: None, scale_offset: None, decimals: None }];
         assert!(validate_no_overlap(&existing, &new).is_err());
         let free = vec![SimRegister { address:6, ..new[0].clone() }];
         assert!(validate_no_overlap(&existing, &free).is_ok());
@@ -4568,7 +5642,7 @@ mod tests {
 
     #[test]
     fn multi_word_register_past_max_address_is_rejected() {
-        let base = SimRegister { id:0, unit_id:1, function_code:3, address:65534, alias:"".into(), data_type:"u16".into(), hold_value:0, value_source:"generator".into(), byte_order:"ABCD".into(), source_params:"{}".into(), interval_ms:1000, sort_order:0, device_instance_id: None, unit: None, display_format: None };
+        let base = SimRegister { id:0, unit_id:1, function_code:3, address:65534, alias:"".into(), data_type:"u16".into(), hold_value:0, value_source:"generator".into(), byte_order:"ABCD".into(), source_params:"{}".into(), interval_ms:1000, sort_order:0, device_instance_id: None, unit: None, display_format: None, scale: None, scale_offset: None, decimals: None };
         // f64 at 65534 spans 65534..65537 → exceeds 65535, must be rejected.
         let f64_over = SimRegister { data_type:"f64".into(), ..base.clone() };
         assert!(validate_register(&f64_over).is_err());
@@ -4582,9 +5656,9 @@ mod tests {
 
     #[test]
     fn multi_word_overlap_is_detected() {
-        let existing = vec![SimRegister { id:1, unit_id:1, function_code:3, address:101, alias:"".into(), data_type:"u16".into(), hold_value:0, value_source:"hold".into(), byte_order:"ABCD".into(), source_params:"{}".into(), interval_ms:1000, sort_order:0, device_instance_id: None, unit: None, display_format: None }];
+        let existing = vec![SimRegister { id:1, unit_id:1, function_code:3, address:101, alias:"".into(), data_type:"u16".into(), hold_value:0, value_source:"hold".into(), byte_order:"ABCD".into(), source_params:"{}".into(), interval_ms:1000, sort_order:0, device_instance_id: None, unit: None, display_format: None, scale: None, scale_offset: None, decimals: None }];
         // f32 at address 100 spans 100-101, colliding with the existing register at 101.
-        let overlapping = vec![SimRegister { id:0, unit_id:1, function_code:3, address:100, alias:"".into(), data_type:"f32".into(), hold_value:0, value_source:"hold".into(), byte_order:"ABCD".into(), source_params:"{}".into(), interval_ms:1000, sort_order:0, device_instance_id: None, unit: None, display_format: None }];
+        let overlapping = vec![SimRegister { id:0, unit_id:1, function_code:3, address:100, alias:"".into(), data_type:"f32".into(), hold_value:0, value_source:"hold".into(), byte_order:"ABCD".into(), source_params:"{}".into(), interval_ms:1000, sort_order:0, device_instance_id: None, unit: None, display_format: None, scale: None, scale_offset: None, decimals: None }];
         assert!(validate_no_overlap(&existing, &overlapping).is_err());
 
         // f32 at address 102 spans 102-103, which is free.
@@ -4596,8 +5670,8 @@ mod tests {
     fn rebase_shifts_child_addresses() {
         // pure helper: given child regs + old base + new base, produce shifted regs; error on out-of-range
         let children = vec![
-            SimRegister { id:1, unit_id:1, function_code:4, address:100, alias:"".into(), data_type:"u16".into(), hold_value:0, value_source:"device".into(), byte_order:"ABCD".into(), source_params:"{}".into(), interval_ms:1000, sort_order:0, device_instance_id: None, unit: None, display_format: None },
-            SimRegister { id:2, unit_id:1, function_code:4, address:101, alias:"".into(), data_type:"u16".into(), hold_value:0, value_source:"device".into(), byte_order:"ABCD".into(), source_params:"{}".into(), interval_ms:1000, sort_order:0, device_instance_id: None, unit: None, display_format: None },
+            SimRegister { id:1, unit_id:1, function_code:4, address:100, alias:"".into(), data_type:"u16".into(), hold_value:0, value_source:"device".into(), byte_order:"ABCD".into(), source_params:"{}".into(), interval_ms:1000, sort_order:0, device_instance_id: None, unit: None, display_format: None, scale: None, scale_offset: None, decimals: None },
+            SimRegister { id:2, unit_id:1, function_code:4, address:101, alias:"".into(), data_type:"u16".into(), hold_value:0, value_source:"device".into(), byte_order:"ABCD".into(), source_params:"{}".into(), interval_ms:1000, sort_order:0, device_instance_id: None, unit: None, display_format: None, scale: None, scale_offset: None, decimals: None },
         ];
         let shifted = rebase_children(&children, 100, 200).unwrap();
         assert_eq!(shifted[0].address, 200);
@@ -4617,7 +5691,7 @@ mod tests {
             data_type: "u16".into(), hold_value: 0, value_source: "device".into(),
             byte_order: "ABCD".into(), source_params: "{}".into(), interval_ms: 1000, sort_order: 0,
             device_instance_id: None,
-            unit: None, display_format: None,
+            unit: None, display_format: None, scale: None, scale_offset: None, decimals: None,
         }).unwrap();
         c.execute("UPDATE sim_registers SET device_instance_id = ?1 WHERE id = ?2", [device_id, reg_id]).unwrap();
 
@@ -4627,7 +5701,7 @@ mod tests {
             data_type: "u16".into(), hold_value: 0, value_source: "hold".into(),
             byte_order: "ABCD".into(), source_params: "{}".into(), interval_ms: 1000, sort_order: 0,
             device_instance_id: None,
-            unit: None, display_format: None,
+            unit: None, display_format: None, scale: None, scale_offset: None, decimals: None,
         }).unwrap();
 
         let device = db_list_devices(&c).unwrap().into_iter().find(|d| d.id == device_id).unwrap();
@@ -4650,6 +5724,7 @@ mod tests {
             data_type: "u16".into(), hold_value: 0, sort_order: 0, device_instance_id: None,
             value_source: "hold".into(), byte_order: "ABCD".into(), source_params: "{}".into(),
             interval_ms: 1000, unit: Some("°C".into()), display_format: Some("dec2".into()),
+            scale: None, scale_offset: None, decimals: None,
         };
         let id = db_insert_register(&c, &reg).unwrap();
         let got = db_list_registers(&c).unwrap().into_iter().find(|r| r.id == id).unwrap();
@@ -4660,5 +5735,1288 @@ mod tests {
         db_update_register(&c, &reg).unwrap();
         let got2 = db_list_registers(&c).unwrap().into_iter().find(|r| r.id == id).unwrap();
         assert_eq!(got2.unit.as_deref(), Some("kPa"));
+    }
+
+    #[test]
+    fn rule_actions_never_create_registers() {
+        // Unit 1 exists with holding[0] only. Actions on a missing address,
+        // a missing unit, or a multi-word target with a missing tail must not
+        // create anything.
+        let mut b = banks1(&[(1, 3, 0, 5)]);
+        apply_action(&mut b, &Action::Set { unit: 1, bank: 3, address: 9, value: 1.0 }, 0);
+        apply_action(&mut b, &Action::Toggle { unit: 1, bank: 1, address: 2 }, 0);
+        apply_action(&mut b, &Action::Inc { unit: 1, bank: 3, address: 9, by: 1.0 }, 0);
+        apply_action(&mut b, &Action::Randomize { unit: 1, bank: 4, address: 0, min: 0, max: 9 }, 0);
+        apply_action(&mut b, &Action::Copy { src_unit: 1, src_bank: 3, src_addr: 0, unit: 1, bank: 3, address: 7, scale: 1.0, offset: 0.0 }, 0);
+        apply_action(&mut b, &Action::Set { unit: 9, bank: 3, address: 0, value: 1.0 }, 0);
+        let multi = TimedAction {
+            action: Action::Set { unit: 1, bank: 3, address: 20, value: 1.0 },
+            delay_ms: 0.0, data_type: "f32".into(), byte_order: "ABCD".into(),
+        };
+        apply_timed_action(&mut b, &RegMetaMap::new(), &multi, 0);
+        assert!(!b.contains_key(&9), "no new unit created");
+        let u1 = b.get(&1).unwrap();
+        assert_eq!(u1.holding.len(), 1, "no new holding address: {:?}", u1.holding);
+        assert_eq!(u1.holding.get(&0), Some(&5), "configured register untouched");
+        assert!(u1.coils.is_empty() && u1.input.is_empty());
+        // The configured register itself is still writable.
+        apply_action(&mut b, &Action::Set { unit: 1, bank: 3, address: 0, value: 42.0 }, 0);
+        assert_eq!(read_word(&b, 1, 3, 0), Some(42));
+    }
+
+    #[test]
+    fn condition_on_missing_register_is_not_met() {
+        // `holding[5] == 0` on a register that doesn't exist must not read as
+        // 0 and fire; it is simply "not met".
+        let rules = vec![rule(1, Trigger::Condition { join: Join::All, conds: vec![cnd(1, 3, 5, "==", 0.0, 0.0)] }, vec![Action::Set { unit: 1, bank: 3, address: 0, value: 1.0 }])];
+        let meta = cmeta(&[(1, 3, 5, "u16", 1.0)]);
+        let mut st = HashMap::new();
+        let b = banks1(&[(1, 3, 0, 0)]);
+        assert!(eval_rules(&rules, &mut st, &b, &meta, 0.0, &[]).is_empty());
+        assert!(eval_rules(&rules, &mut st, &b, &meta, 10.0, &[]).is_empty());
+        let empty = HashMap::new();
+        assert!(eval_rules(&rules, &mut st, &empty, &meta, 20.0, &[]).is_empty());
+        // The word is present but the register has no metadata: still not met.
+        let present = banks1(&[(1, 3, 5, 0)]);
+        assert!(eval_rules(&rules, &mut st, &present, &RegMetaMap::new(), 25.0, &[]).is_empty());
+        // Once the register exists (words + metadata) and the condition holds, it fires.
+        assert_eq!(eval_rules(&rules, &mut st, &present, &meta, 30.0, &[]).len(), 1);
+        // A multi-word register with half its span missing is not met either.
+        let rules = vec![cond_rule(2, Join::All, vec![cnd(1, 4, 0, ">=", 0.0, 0.0)])];
+        let half = banks1(&[(1, 4, 0, 0)]);
+        assert!(eval_rules(&rules, &mut st, &half, &cmeta(&[(1, 4, 0, "f32", 1.0)]), 40.0, &[]).is_empty());
+        // A missing register on one side of an Any join doesn't block the other.
+        let rules = vec![cond_rule(3, Join::Any, vec![cnd(1, 3, 9, "==", 0.0, 0.0), cnd(1, 3, 5, "==", 0.0, 0.0)])];
+        assert_eq!(eval_rules(&rules, &mut st, &present, &meta, 50.0, &[]).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn tick_does_not_resurrect_a_cleared_register() {
+        // A generator is live in the tick list; the register is then removed
+        // from the banks (delete/move) before the tick list is refreshed. An
+        // in-flight tick must not re-create ("ghost") the address.
+        let reg = SimRegister {
+            id: 1, unit_id: 1, function_code: 4, address: 0, alias: "".into(), data_type: "f32".into(),
+            hold_value: 0, value_source: "generator".into(), byte_order: "ABCD".into(),
+            source_params: "{\"kind\":\"ramp\",\"min\":0,\"max\":100,\"periodMs\":1000}".into(),
+            interval_ms: 20, sort_order: 0, device_instance_id: None, unit: None, display_format: None, scale: None, scale_offset: None, decimals: None,
+        };
+        let banks = registers_to_banks(&[reg.clone()]);
+        let dynamics: Vec<DynReg> = [reg].iter().filter_map(parse_dynamic).collect();
+        let mut engine = SimEngine::new();
+        engine.start(NoopSink, "ws".into(), "127.0.0.1", 0, 20, banks, dynamics, Default::default(), Default::default(), Vec::new()).await.unwrap();
+        engine.clear_span(1, 4, 0, 2);
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let snap = engine.snapshot();
+        let input = snap.get(&1).map(|b| b.input.clone()).unwrap_or_default();
+        engine.stop().await;
+        assert!(input.is_empty(), "cleared register was resurrected by the tick: {input:?}");
+    }
+
+    #[test]
+    fn interval_rule_has_no_cumulative_drift() {
+        let rules = vec![rule(1, Trigger::Interval { ms: 100.0 }, vec![Action::Toggle { unit: 1, bank: 1, address: 0 }])];
+        let mut st = HashMap::new();
+        let b = HashMap::new();
+        assert_eq!(eval_rules(&rules, &mut st, &b, &RegMetaMap::new(), 0.0, &[]).len(), 1);   // t=0 → next 100
+        assert_eq!(eval_rules(&rules, &mut st, &b, &RegMetaMap::new(), 150.0, &[]).len(), 1); // late fire → next 200 (not 250)
+        assert_eq!(eval_rules(&rules, &mut st, &b, &RegMetaMap::new(), 210.0, &[]).len(), 1); // on the 200 grid
+        // Far behind (> one period): fire once, then resync — no burst.
+        assert_eq!(eval_rules(&rules, &mut st, &b, &RegMetaMap::new(), 650.0, &[]).len(), 1);
+        assert_eq!(eval_rules(&rules, &mut st, &b, &RegMetaMap::new(), 660.0, &[]).len(), 0, "no catch-up burst");
+        assert_eq!(eval_rules(&rules, &mut st, &b, &RegMetaMap::new(), 750.0, &[]).len(), 1, "resynced to elapsed + period");
+    }
+
+    #[test]
+    fn advance_due_keeps_grid_and_resyncs_when_far_behind() {
+        assert_eq!(advance_due(100.0, 100.0, 130.0), 200.0);
+        assert_eq!(advance_due(100.0, 100.0, 199.0), 200.0);
+        assert_eq!(advance_due(100.0, 100.0, 450.0), 550.0);
+    }
+
+    #[test]
+    fn prune_next_due_drops_removed_and_retimed_registers() {
+        let mk = |addr: u16, interval: f64| DynReg {
+            unit: 1, bank: 3, address: addr, data_type: "u16".into(), byte_order: "ABCD".into(),
+            kind: DynKind::Generator { kind: "sine".into(), params: GenParams { min: 0.0, max: 1.0, period_ms: 1000.0 }, seed: 0 },
+            interval_ms: interval, scale: 1.0, scale_offset: 0.0,
+        };
+        let mut due: HashMap<(u8, u8, u16), Due> = HashMap::new();
+        due.insert((1, 3, 0), Due { at: 500.0, period: 100.0 }); // unchanged → kept
+        due.insert((1, 3, 1), Due { at: 500.0, period: 100.0 }); // interval changed → reset
+        due.insert((1, 3, 2), Due { at: 500.0, period: 100.0 }); // removed → pruned
+        prune_next_due(&mut due, &[mk(0, 100.0), mk(1, 250.0)]);
+        assert_eq!(due.len(), 1);
+        assert!(due.contains_key(&(1, 3, 0)));
+    }
+
+    #[test]
+    fn reconcile_rules_resets_state_only_for_changed_rules() {
+        let keep = rule(1, Trigger::Interval { ms: 100.0 }, vec![Action::Toggle { unit: 1, bank: 1, address: 0 }]);
+        let change = rule(2, Trigger::Interval { ms: 100.0 }, vec![Action::Toggle { unit: 1, bank: 1, address: 1 }]);
+        let remove = rule(3, Trigger::Interval { ms: 100.0 }, vec![Action::Toggle { unit: 1, bank: 1, address: 2 }]);
+        let disable = rule(4, Trigger::Interval { ms: 100.0 }, vec![Action::Toggle { unit: 1, bank: 1, address: 3 }]);
+        let prev = vec![keep.clone(), change.clone(), remove.clone(), disable.clone()];
+        let changed = RuleDef { trigger: Trigger::Interval { ms: 500.0 }, ..change.clone() };
+        let disabled = RuleDef { enabled: false, ..disable.clone() };
+        let next = vec![keep.clone(), changed, disabled];
+        let mut states: HashMap<i64, RuleState> = HashMap::new();
+        let mut pending: Vec<PendingAction> = Vec::new();
+        for id in 1..=4 {
+            states.insert(id, RuleState { next_due: 900.0, last_condition: true, last_value: Some(1.0), cond_armed: vec![true] });
+            pending.push(PendingAction { due: 1000.0, rule_id: id, action: keep.actions[0].clone(), seed: 0 });
+        }
+        reconcile_rules(&prev, &next, &mut states, &mut pending);
+        assert_eq!(states.keys().copied().collect::<Vec<_>>(), vec![1], "only the unchanged rule keeps its state");
+        assert_eq!(states[&1].next_due, 900.0);
+        assert_eq!(pending.iter().map(|p| p.rule_id).collect::<Vec<_>>(), vec![1], "queued actions of removed/changed/disabled rules dropped");
+    }
+
+    #[tokio::test]
+    async fn deleted_rules_queued_action_never_fires() {
+        // holding[0]=0; a rule fires at t=0 with a 300ms-delayed set-to-42.
+        // The rule is removed before the action is due: it must not fire.
+        let mut banks = HashMap::new();
+        place_words(&mut banks, 1, 3, 0, &[0]);
+        let ta = TimedAction { delay_ms: 300.0, ..timed(Action::Set { unit: 1, bank: 3, address: 0, value: 42.0 }) };
+        let r = RuleDef { id: 7, enabled: true, sort_order: 0, trigger: Trigger::Interval { ms: 60000.0 }, actions: vec![ta] };
+        let mut engine = SimEngine::new();
+        engine.start(NoopSink, "ws".into(), "127.0.0.1", 0, 20, banks, Vec::new(), Default::default(), Default::default(), vec![r]).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        engine.set_rules(Vec::new());
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        let v = engine.snapshot().get(&1).and_then(|b| b.holding.get(&0).copied());
+        engine.stop().await;
+        assert_eq!(v, Some(0), "a deleted rule's queued action fired");
+    }
+
+    /// A TCP endpoint that accepts connections and never answers, so a
+    /// Modbus read against it hangs until its timeout.
+    async fn black_hole() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let h = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((s, _)) = l.accept().await { held.push(s); }
+        });
+        (addr, h)
+    }
+
+    #[tokio::test]
+    async fn route_read_lock_wait_is_inside_the_timeout() {
+        let (addr, hole) = black_hole().await;
+        let ctx = tokio_modbus::client::tcp::connect(addr).await.unwrap();
+        let session = std::sync::Arc::new(tokio::sync::Mutex::new(ctx));
+        // Someone else holds the session (e.g. a hung read): the route read
+        // must give up after its own timeout, not wait for the lock forever.
+        let _held = session.clone().lock_owned().await;
+        let res = tokio::time::timeout(
+            std::time::Duration::from_millis(1500),
+            route_read_words(session.clone(), 1, 3, 0, 1, 100),
+        ).await;
+        hole.abort();
+        assert!(matches!(res, Ok(Err(_))), "route read waited on the session lock past its timeout");
+    }
+
+    #[tokio::test]
+    async fn slow_route_read_does_not_freeze_generators() {
+        use crate::modbus::SessionMap;
+        let (addr, hole) = black_hole().await;
+        let tcp_map: SessionMap = Default::default();
+        {
+            let ctx = tokio_modbus::client::tcp::connect(addr).await.unwrap();
+            tcp_map.lock().unwrap().insert("ws".to_string(), std::sync::Arc::new(tokio::sync::Mutex::new(ctx)));
+        }
+        let gen = SimRegister {
+            id: 1, unit_id: 1, function_code: 4, address: 0, alias: "".into(), data_type: "f32".into(),
+            hold_value: 0, value_source: "generator".into(), byte_order: "ABCD".into(),
+            source_params: "{\"kind\":\"ramp\",\"min\":0,\"max\":100,\"periodMs\":1000}".into(),
+            interval_ms: 20, sort_order: 0, device_instance_id: None, unit: None, display_format: None, scale: None, scale_offset: None, decimals: None,
+        };
+        let route_reg = SimRegister {
+            id: 2, address: 10, data_type: "u16".into(), value_source: "route".into(),
+            source_params: "{\"slaveUnitId\":1,\"connectionKind\":\"tcp\",\"functionCode\":3,\"address\":0}".into(),
+            ..gen.clone()
+        };
+        let regs = [gen, route_reg];
+        let banks = registers_to_banks(&regs);
+        let dynamics: Vec<DynReg> = regs.iter().filter_map(parse_dynamic).collect();
+        let mut engine = SimEngine::new();
+        engine.start(NoopSink, "ws".into(), "127.0.0.1", 0, 20, banks, dynamics, tcp_map, Default::default(), Vec::new()).await.unwrap();
+        let read = |e: &SimEngine| {
+            let s = e.snapshot();
+            let b = s.get(&1).unwrap();
+            (b.input.get(&0).copied(), b.input.get(&1).copied())
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let a = read(&engine);
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let b = read(&engine);
+        // The route read can never complete; once it times out it is "stale".
+        let mut status = None;
+        for _ in 0..40 {
+            status = engine.statuses().get(&(1, 4, 10)).copied();
+            if status.is_some() { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        engine.stop().await;
+        hole.abort();
+        assert_ne!(a, b, "generator froze while a route read was pending");
+        assert_eq!(status, Some("stale"));
+    }
+
+    #[tokio::test]
+    async fn route_with_rtu_kind_reads_the_rtu_session() {
+        use crate::modbus::SessionMap;
+        // Source device on unit 7 holding[0]=4321, reachable through the RTU
+        // session map; the route says connectionKind "rtu" (not "serial").
+        let mut a = SimEngine::new();
+        let mut abanks = HashMap::new();
+        place_words(&mut abanks, 7, 3, 0, &[4321]);
+        let ainfo = a.start(NoopSink, "src".into(), "127.0.0.1", 0, 100, abanks, Vec::new(), Default::default(), Default::default(), Vec::new()).await.unwrap();
+        let aaddr: std::net::SocketAddr = ainfo.bound.parse().unwrap();
+        let rtu_map: SessionMap = Default::default();
+        {
+            let ctx = tokio_modbus::client::tcp::connect(aaddr).await.unwrap();
+            rtu_map.lock().unwrap().insert("ws".to_string(), std::sync::Arc::new(tokio::sync::Mutex::new(ctx)));
+        }
+        let route = DynReg {
+            unit: 1, bank: 3, address: 0, data_type: "u16".into(), byte_order: "ABCD".into(), interval_ms: 50.0,
+            kind: DynKind::Route { slave_unit: 7, connection_kind: "rtu".into(), src_fc: 3, src_addr: 0, count: 1, scale: 1.0, offset: 0.0, src_byte_order: "ABCD".into() },
+            scale: 1.0, scale_offset: 0.0,
+        };
+        let mut bbanks = HashMap::new();
+        place_words(&mut bbanks, 1, 3, 0, &[0]);
+        let mut b = SimEngine::new();
+        b.start(NoopSink, "ws".into(), "127.0.0.1", 0, 50, bbanks, vec![route], Default::default(), rtu_map, Vec::new()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let got = b.snapshot().get(&1).and_then(|x| x.holding.get(&0).copied());
+        let status = b.statuses().get(&(1, 3, 0)).copied();
+        b.stop().await;
+        a.stop().await;
+        assert_eq!(got, Some(4321));
+        assert_eq!(status, Some("ok"));
+        assert_eq!(slave_table_kind("rtu"), "serial");
+        assert_eq!(slave_table_kind("tcp"), "tcp");
+    }
+
+    /// A device at `base` owning u16 input registers at `addrs` (linked the
+    /// way the device-add path links them). Returns the device id.
+    fn device_with_registers(c: &Connection, base: i64, addrs: &[i64]) -> i64 {
+        let dev = db_insert_device(c, &SimDevice {
+            id: 0, template_key: "temp".into(), name: "D".into(), unit_id: 1, base_address: base, sort_order: 0,
+        }).unwrap();
+        for &a in addrs {
+            let rid = db_insert_register(c, &SimRegister {
+                id: 0, unit_id: 1, function_code: 4, address: a, alias: format!("r{a}"),
+                data_type: "u16".into(), hold_value: 0, value_source: "hold".into(),
+                byte_order: "ABCD".into(), source_params: "{}".into(), interval_ms: 1000, sort_order: 0,
+                device_instance_id: None, unit: None, display_format: None, scale: None, scale_offset: None, decimals: None,
+            }).unwrap();
+            c.execute("UPDATE sim_registers SET device_instance_id = ?1 WHERE id = ?2", [dev, rid]).unwrap();
+        }
+        dev
+    }
+
+    fn addresses(c: &Connection) -> Vec<i64> {
+        db_list_registers(c).unwrap().into_iter().map(|r| r.address).collect()
+    }
+
+    #[test]
+    fn device_rebase_by_one_does_not_collide_mid_way() {
+        let mut c = mem_db();
+        let dev = device_with_registers(&c, 100, &[100, 101]);
+        rebase_device_in_db(&mut c, dev, 101).unwrap();
+        assert_eq!(addresses(&c), vec![101, 102]);
+        rebase_device_in_db(&mut c, dev, 99).unwrap();
+        assert_eq!(addresses(&c), vec![99, 100]);
+        assert_eq!(db_list_devices(&c).unwrap()[0].base_address, 99);
+    }
+
+    #[test]
+    fn failed_device_rebase_leaves_base_and_registers_unchanged() {
+        let mut c = mem_db();
+        let dev = device_with_registers(&c, 100, &[100, 101]);
+        // Make the SECOND register move fail (after the device base and the
+        // first register were already written) to prove it's all-or-nothing.
+        c.execute_batch(
+            "CREATE TRIGGER fail_move BEFORE UPDATE OF address ON sim_registers
+             WHEN NEW.address = 110 BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+        ).unwrap();
+        assert!(rebase_device_in_db(&mut c, dev, 110).is_err());
+        assert_eq!(db_list_devices(&c).unwrap()[0].base_address, 100, "device base rolled back");
+        assert_eq!(addresses(&c), vec![100, 101], "registers rolled back");
+    }
+
+    fn hold_reg(addr: i64) -> SimRegister {
+        SimRegister {
+            id: 0, unit_id: 1, function_code: 3, address: addr, alias: "".into(), data_type: "u16".into(),
+            hold_value: 0, sort_order: 0, device_instance_id: None, value_source: "hold".into(),
+            byte_order: "ABCD".into(), source_params: "{}".into(), interval_ms: 1000, unit: None, display_format: None, scale: None, scale_offset: None, decimals: None,
+        }
+    }
+
+    #[test]
+    fn failed_profile_import_leaves_workspace_unchanged() {
+        let mut c = mem_db();
+        db_insert_register(&c, &hold_reg(5)).unwrap();
+        db_set_config(&c, &SimConfig { enabled: false, host: "0.0.0.0".into(), port: 1502, tick_ms: 100 }).unwrap();
+        // Fail late in the import (inserting the rule, after the clear and
+        // the register inserts).
+        c.execute_batch(
+            "CREATE TRIGGER fail_rule BEFORE INSERT ON sim_rules BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+        ).unwrap();
+        let profile = SimProfile {
+            version: 1,
+            config: SimConfig { enabled: false, host: "0.0.0.0".into(), port: 2502, tick_ms: 100 },
+            devices: Vec::new(),
+            registers: vec![hold_reg(7)],
+            rules: vec![SimRule {
+                id: 0, name: "r".into(), enabled: true,
+                trigger: "{\"type\":\"interval\",\"ms\":1000}".into(), actions: "[]".into(), sort_order: 0,
+            }],
+        };
+        assert!(apply_profile(&mut c, &profile).is_err());
+        assert_eq!(addresses(&c), vec![5], "registers untouched");
+        assert_eq!(db_get_config(&c).unwrap().port, 1502, "config untouched");
+    }
+
+    #[test]
+    fn profile_import_validates_config() {
+        let mut c = mem_db();
+        db_insert_register(&c, &hold_reg(5)).unwrap();
+        for config in [
+            SimConfig { enabled: false, host: "0.0.0.0".into(), port: 0, tick_ms: 100 },
+            SimConfig { enabled: false, host: "10.0.0.1".into(), port: 502, tick_ms: 100 },
+            SimConfig { enabled: false, host: "0.0.0.0".into(), port: 502, tick_ms: 5 },
+        ] {
+            let profile = SimProfile { version: 1, config, devices: Vec::new(), registers: Vec::new(), rules: Vec::new() };
+            assert!(apply_profile(&mut c, &profile).is_err());
+        }
+        assert_eq!(addresses(&c), vec![5], "rejected profile changed nothing");
+    }
+
+    #[test]
+    fn config_tick_ms_is_range_checked() {
+        let cfg = |tick_ms| SimConfig { enabled: false, host: "0.0.0.0".into(), port: 502, tick_ms };
+        assert!(validate_config(&cfg(9)).is_err());
+        assert!(validate_config(&cfg(60001)).is_err());
+        assert!(validate_config(&cfg(0)).is_err());
+        assert!(validate_config(&cfg(10)).is_ok());
+        assert!(validate_config(&cfg(60000)).is_ok());
+    }
+
+    #[test]
+    fn preset_without_period_uses_slow_default() {
+        let reg = SimRegister {
+            id: 1, unit_id: 1, function_code: 4, address: 0, alias: "".into(), data_type: "u16".into(),
+            hold_value: 0, value_source: "device".into(), byte_order: "ABCD".into(),
+            source_params: "{\"preset\":\"temperature\",\"min\":20,\"max\":30}".into(),
+            interval_ms: 1000, sort_order: 0, device_instance_id: None, unit: None, display_format: None, scale: None, scale_offset: None, decimals: None,
+        };
+        let d = parse_dynamic(&reg).unwrap();
+        let DynKind::Preset { params, seed, .. } = &d.kind else { panic!("expected Preset") };
+        let slow = PresetParams { period_ms: 60000.0, ..*params };
+        for t in [0.0, 1234.0, 5000.0, 30000.0] {
+            assert_eq!(dyn_value(&d, t), preset_value("temperature", &slow, t, *seed), "at t={t}");
+        }
+        // A generator without periodMs keeps its 1000 ms default.
+        let gen = SimRegister { value_source: "generator".into(), source_params: "{\"kind\":\"ramp\"}".into(), ..reg };
+        let DynKind::Generator { params, .. } = parse_dynamic(&gen).unwrap().kind else { panic!("expected Generator") };
+        assert_eq!(params.period_ms, 1000.0);
+    }
+
+    #[test]
+    fn out_of_range_unit_or_address_is_rejected_not_truncated() {
+        // unit 300 must not become 44; address 70000 must not wrap.
+        let v: serde_json::Value = serde_json::from_str(r#"{"type":"set","unit":300,"bank":3,"address":0,"value":1}"#).unwrap();
+        assert!(parse_action(&v).is_none());
+        let v: serde_json::Value = serde_json::from_str(r#"{"type":"set","unit":1,"bank":3,"address":70000,"value":1}"#).unwrap();
+        assert!(parse_action(&v).is_none());
+        let v: serde_json::Value = serde_json::from_str(r#"{"type":"copy","unit":1,"bank":3,"address":0,"srcUnit":256}"#).unwrap();
+        assert!(parse_action(&v).is_none());
+        let trig = |t: &str| SimRule { id: 1, name: "".into(), enabled: true, trigger: t.into(), actions: "[]".into(), sort_order: 0 };
+        assert!(parse_rule(&trig(r#"{"type":"condition","unit":300,"bank":3,"address":0,"op":"==","value":1}"#)).is_none());
+        assert!(parse_rule(&trig(r#"{"type":"onWrite","unit":999,"bank":3}"#)).is_none());
+        // In-range values and omitted keys still parse.
+        assert!(parse_rule(&trig(r#"{"type":"condition","unit":255,"bank":3,"address":65535,"op":"==","value":1}"#)).is_some());
+        let v: serde_json::Value = serde_json::from_str(r#"{"type":"toggle"}"#).unwrap();
+        assert_eq!(parse_action(&v).unwrap().action, Action::Toggle { unit: 1, bank: 1, address: 0 });
+    }
+
+    #[test]
+    fn integer_encoding_saturates() {
+        assert_eq!(encode_value("u16", "ABCD", 70000.0).unwrap(), vec![0xFFFF]);
+        assert_eq!(encode_value("u16", "ABCD", -5.0).unwrap(), vec![0x0000]);
+        assert_eq!(encode_value("i16", "ABCD", 40000.0).unwrap(), vec![0x7FFF]);
+        assert_eq!(encode_value("i16", "ABCD", -40000.0).unwrap(), vec![0x8000]);
+        assert_eq!(encode_value("u32", "ABCD", -1.0).unwrap(), vec![0x0000, 0x0000]);
+        assert_eq!(encode_value("u32", "ABCD", 5e9).unwrap(), vec![0xFFFF, 0xFFFF]);
+        assert_eq!(encode_value("i32", "ABCD", 3e9).unwrap(), vec![0x7FFF, 0xFFFF]);
+        assert_eq!(encode_value("i32", "ABCD", -3e9).unwrap(), vec![0x8000, 0x0000]);
+    }
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("mw-sim-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn backups_in(dir: &std::path::Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".bak"))
+            .collect();
+        v.sort();
+        v
+    }
+
+    fn sample_template(key: &str) -> DeviceTemplate {
+        DeviceTemplate {
+            template_key: key.into(), name: "X".into(), category: "Custom".into(),
+            description: "".into(), icon: "📟".into(),
+            registers: vec![treg(0, 3, "u16", "ABCD", "hold", "{}", "A")],
+        }
+    }
+
+    #[test]
+    fn missing_template_file_is_an_empty_catalog() {
+        let dir = temp_dir("missing");
+        let path = dir.join("custom_device_templates.json");
+        assert!(read_templates_file(&path).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupt_template_file_is_backed_up_and_reported() {
+        let dir = temp_dir("corrupt");
+        let path = dir.join("custom_device_templates.json");
+        std::fs::write(&path, "[{ not json").unwrap();
+        let err = read_templates_file(&path).unwrap_err();
+        assert!(err.contains("custom_device_templates.json.bak"), "error names the backup: {err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[{ not json", "original left in place");
+        assert_eq!(std::fs::read_to_string(dir.join("custom_device_templates.json.bak")).unwrap(), "[{ not json");
+        // Reading the same corrupt file again doesn't pile up backups.
+        assert!(read_templates_file(&path).is_err());
+        assert_eq!(backups_in(&dir), vec!["custom_device_templates.json.bak".to_string()]);
+        // A different corrupt file never overwrites the existing .bak.
+        std::fs::write(&path, "{{ also broken").unwrap();
+        assert!(read_templates_file(&path).is_err());
+        let baks = backups_in(&dir);
+        assert_eq!(baks.len(), 2, "{baks:?}");
+        assert_eq!(std::fs::read_to_string(dir.join("custom_device_templates.json.bak")).unwrap(), "[{ not json");
+        let stamped = baks.iter().find(|n| *n != "custom_device_templates.json.bak").unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join(stamped)).unwrap(), "{{ also broken");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn template_file_writes_are_atomic_replacements() {
+        let dir = temp_dir("write");
+        let path = dir.join("custom_device_templates.json");
+        write_templates_file(&path, &[sample_template("a")]).unwrap();
+        write_templates_file(&path, &[sample_template("a"), sample_template("b")]).unwrap();
+        let back = read_templates_file(&path).unwrap();
+        assert_eq!(back.iter().map(|t| t.template_key.as_str()).collect::<Vec<_>>(), vec!["a", "b"]);
+        let names: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(names, vec!["custom_device_templates.json".to_string()], "no temp file left behind");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn template_validation_rejects_overlaps_and_reserved_keys() {
+        // f32 at offset 0 spans 0-1: a u16 at offset 1 in the same bank overlaps.
+        let overlapping = DeviceTemplate {
+            registers: vec![
+                treg(0, 3, "f32", "ABCD", "generator", "{}", "A"),
+                treg(1, 3, "u16", "ABCD", "hold", "{}", "B"),
+            ],
+            ..sample_template("custom_overlap")
+        };
+        assert!(validate_template(&overlapping).is_err());
+        // Same offset in a different bank is fine.
+        let other_bank = DeviceTemplate {
+            registers: vec![
+                treg(0, 3, "f32", "ABCD", "generator", "{}", "A"),
+                treg(1, 4, "u16", "ABCD", "hold", "{}", "B"),
+            ],
+            ..sample_template("custom_ok")
+        };
+        assert!(validate_template(&other_bank).is_ok());
+        // `ws-slave:` keys are reserved for the synthetic workspace templates.
+        let reserved = sample_template("ws-slave:3");
+        assert!(validate_template(&reserved).is_err());
+        assert!(validate_template_shape(&reserved).is_ok(), "inline add still accepts its own synthetic keys");
+    }
+
+    #[test]
+    fn register_playground_coils_have_aliases() {
+        let pg = builtin_templates().into_iter().find(|t| t.template_key == "register_playground").unwrap();
+        let coils: Vec<&str> = pg.registers.iter().filter(|r| r.bank == 1).map(|r| r.alias.as_str()).collect();
+        assert_eq!(coils, vec!["Coil 0", "Coil 1", "Coil 2", "Coil 3"]);
+        for t in builtin_templates() {
+            for r in &t.registers {
+                assert!(!r.alias.trim().is_empty(), "{} has a register without an alias", t.template_key);
+            }
+        }
+    }
+
+    #[test]
+    fn template_round_trip_keeps_unit_format_interval_and_hold_value() {
+        let original = SimRegister {
+            id: 9, unit_id: 2, function_code: 3, address: 105, alias: "Setpoint".into(),
+            data_type: "i16".into(), hold_value: -7, sort_order: 0, device_instance_id: Some(4),
+            value_source: "hold".into(), byte_order: "BADC".into(), source_params: "{}".into(),
+            interval_ms: 250, unit: Some("°C".into()), display_format: Some("dec2".into()),
+            scale: None, scale_offset: None, decimals: None,
+        };
+        let tr = sim_register_to_template_register(&original, 100);
+        assert_eq!(tr.offset, 5);
+        // Serialized names are the camelCase ones the frontend uses.
+        let json = serde_json::to_value(&tr).unwrap();
+        assert_eq!(json["unit"], "°C");
+        assert_eq!(json["displayFormat"], "dec2");
+        assert_eq!(json["intervalMs"], 250);
+        assert_eq!(json["holdValue"], -7);
+        let t = DeviceTemplate { registers: vec![tr], ..sample_template("custom_rt") };
+        let back = &template_to_registers(&t, 2, 100)[0];
+        assert_eq!(back.address, original.address);
+        assert_eq!(back.unit, original.unit);
+        assert_eq!(back.display_format, original.display_format);
+        assert_eq!(back.interval_ms, original.interval_ms);
+        assert_eq!(back.hold_value, original.hold_value);
+        assert_eq!(back.byte_order, original.byte_order);
+        // Old templates without the fields keep today's defaults.
+        let old: TemplateRegister = serde_json::from_str(r#"{"offset":0,"bank":3}"#).unwrap();
+        let t = DeviceTemplate { registers: vec![old], ..sample_template("custom_old") };
+        let r = &template_to_registers(&t, 1, 0)[0];
+        assert_eq!((r.interval_ms, r.hold_value, r.unit.clone(), r.display_format.clone()), (1000, 0, None, None));
+    }
+
+    #[test]
+    fn slave_route_register_carries_display_format() {
+        let r = slave_row_to_route_register(1, "tcp", 3, 10, "Temp", "u16", "", Some("hex"));
+        assert_eq!(r.display_format.as_deref(), Some("hex"));
+        let r = slave_row_to_route_register(1, "tcp", 3, 10, "Temp", "u16", "", Some("  "));
+        assert_eq!(r.display_format, None);
+        let r = slave_row_to_route_register(1, "tcp", 3, 10, "Temp", "u16", "", None);
+        assert_eq!(r.display_format, None);
+    }
+
+    #[test]
+    fn update_existing_words_is_all_or_nothing_for_a_span() {
+        // An f32 (2-word) write onto a single configured u16 register must not
+        // write the high word alone (M2).
+        let mut b = banks1(&[(1, 3, 5, 7)]);
+        update_existing_words(&mut b, 1, 3, 5, &[0x4148, 0x0000]);
+        assert_eq!(b[&1].holding.get(&5), Some(&7));
+        assert!(b[&1].holding.get(&6).is_none());
+        // A fully configured span is written.
+        place_words(&mut b, 1, 3, 6, &[0]);
+        update_existing_words(&mut b, 1, 3, 5, &[0x4148, 0x0001]);
+        assert_eq!((b[&1].holding[&5], b[&1].holding[&6]), (0x4148, 0x0001));
+        // A span that would run past 65535 writes nothing either.
+        place_words(&mut b, 1, 3, 65535, &[3]);
+        update_existing_words(&mut b, 1, 3, 65535, &[1, 2]);
+        assert_eq!(b[&1].holding[&65535], 3);
+    }
+
+    #[test]
+    fn multi_word_rule_action_onto_a_single_word_register_writes_nothing() {
+        let mut b = banks1(&[(1, 3, 5, 7)]);
+        let ta = TimedAction {
+            action: Action::Set { unit: 1, bank: 3, address: 5, value: 12.0 },
+            delay_ms: 0.0, data_type: "f32".into(), byte_order: "ABCD".into(),
+        };
+        apply_timed_action(&mut b, &RegMetaMap::new(), &ta, 0);
+        assert_eq!(b[&1].holding.get(&5), Some(&7), "partial f32 write landed on a u16 register");
+    }
+
+    fn route_dyn(address: u16, src_addr: u16) -> DynReg {
+        DynReg {
+            unit: 1, bank: 4, address, data_type: "u16".into(), byte_order: "ABCD".into(), interval_ms: 20.0,
+            kind: DynKind::Route { slave_unit: 7, connection_kind: "tcp".into(), src_fc: 3, src_addr, count: 1, scale: 1.0, offset: 0.0, src_byte_order: "ABCD".into() },
+            scale: 1.0, scale_offset: 0.0,
+        }
+    }
+
+    #[test]
+    fn route_still_current_requires_the_exact_route() {
+        let d = route_dyn(10, 0);
+        assert!(route_still_current(&[d.clone()], &d));
+        // Register removed / turned into a hold register (no dynamic entry).
+        assert!(!route_still_current(&[], &d));
+        // Same key, different route params.
+        assert!(!route_still_current(&[route_dyn(10, 5)], &d));
+        // Same route params, different register.
+        assert!(!route_still_current(&[route_dyn(11, 0)], &d));
+    }
+
+    #[test]
+    fn forget_dynamic_drops_only_that_register() {
+        let engine = SimEngine::new();
+        engine.set_dynamics(vec![route_dyn(10, 0), route_dyn(11, 0)]);
+        engine.forget_dynamic(1, 4, 10);
+        let left: Vec<u16> = engine.dynamics.lock().unwrap().iter().map(|d| d.address).collect();
+        assert_eq!(left, vec![11]);
+    }
+
+    #[tokio::test]
+    async fn route_read_finishing_after_an_edit_is_discarded() {
+        use crate::modbus::SessionMap;
+        // SOURCE: unit 7 holding[0] = 1234.
+        let mut a = SimEngine::new();
+        let mut abanks = HashMap::new();
+        place_words(&mut abanks, 7, 3, 0, &[1234]);
+        let ainfo = a.start(NoopSink, "src".into(), "127.0.0.1", 0, 100, abanks, Vec::new(), Default::default(), Default::default(), Vec::new()).await.unwrap();
+        let aaddr: std::net::SocketAddr = ainfo.bound.parse().unwrap();
+        let tcp_map: SessionMap = Default::default();
+        let ctx = tokio_modbus::client::tcp::connect(aaddr).await.unwrap();
+        let session = std::sync::Arc::new(tokio::sync::Mutex::new(ctx));
+        tcp_map.lock().unwrap().insert("ws".to_string(), session.clone());
+        // Hold the session so the first route read is in flight (waiting).
+        let held = session.clone().lock_owned().await;
+
+        let mut bbanks = HashMap::new();
+        place_words(&mut bbanks, 1, 4, 10, &[0]);
+        let mut b = SimEngine::new();
+        b.start(NoopSink, "ws".into(), "127.0.0.1", 0, 20, bbanks, vec![route_dyn(10, 0)], tcp_map, Default::default(), Vec::new()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // Edit mid-read: the register becomes a hold register with value 42,
+        // in the order the edit commands use (live list first, then banks).
+        b.forget_dynamic(1, 4, 10);
+        b.apply_register_change(1, 4, 10, Some(42), None);
+        drop(held);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let v = b.snapshot().get(&1).and_then(|u| u.input.get(&10).copied());
+        b.stop().await;
+        a.stop().await;
+        assert_eq!(v, Some(42), "stale route read overwrote the edited register");
+    }
+
+    fn scaled_reg(addr: i64, dev: Option<i64>) -> SimRegister {
+        SimRegister {
+            id: 0, unit_id: 1, function_code: 3, address: addr, alias: "T".into(),
+            data_type: "i16".into(), hold_value: 5, sort_order: 0, device_instance_id: dev,
+            value_source: "hold".into(), byte_order: "ABCD".into(), source_params: "{}".into(),
+            interval_ms: 1000, unit: Some("°C".into()), display_format: None,
+            scale: Some(0.1), scale_offset: Some(-40.0), decimals: Some(1),
+        }
+    }
+
+    #[test]
+    fn register_scaling_fields_round_trip_through_db_profile_and_template() {
+        let c = mem_db();
+        let dev_id = db_insert_device(&c, &SimDevice {
+            id: 0, template_key: "t".into(), name: "D".into(), unit_id: 1, base_address: 0, sort_order: 0,
+        }).unwrap();
+        let id = db_insert_register(&c, &scaled_reg(0, None)).unwrap();
+        c.execute("UPDATE sim_registers SET device_instance_id = ?1 WHERE id = ?2", rusqlite::params![dev_id, id]).unwrap();
+        let check = |r: &SimRegister| {
+            assert_eq!(r.scale, Some(0.1));
+            assert_eq!(r.scale_offset, Some(-40.0));
+            assert_eq!(r.decimals, Some(1));
+            assert_eq!(r.unit.as_deref(), Some("°C"));
+        };
+        check(&db_list_registers(&c).unwrap()[0]);
+        check(&db_list_registers_for_device(&c, dev_id).unwrap()[0]);
+        check(&db_list_registers_excluding_device(&c, dev_id + 99).unwrap()[0]);
+        assert!(db_list_registers_excluding_device(&c, dev_id).unwrap().is_empty());
+
+        // update path
+        let mut r = db_list_registers(&c).unwrap().remove(0);
+        r.scale = Some(0.5); r.scale_offset = None; r.decimals = None;
+        db_update_register(&c, &r).unwrap();
+        let r2 = db_list_registers(&c).unwrap().remove(0);
+        assert_eq!((r2.scale, r2.scale_offset, r2.decimals), (Some(0.5), None, None));
+        db_update_register(&c, &SimRegister { scale: Some(0.1), scale_offset: Some(-40.0), decimals: Some(1), ..r2 }).unwrap();
+
+        // profile export -> apply to a fresh DB
+        let profile = build_profile(&c).unwrap();
+        let json = serde_json::to_string(&profile).unwrap();
+        let parsed: SimProfile = serde_json::from_str(&json).unwrap();
+        let mut c2 = mem_db();
+        apply_profile(&mut c2, &parsed).unwrap();
+        check(&db_list_registers(&c2).unwrap()[0]);
+
+        // template path
+        let reg = db_list_registers(&c).unwrap().remove(0);
+        let treg = sim_register_to_template_register(&reg, 0);
+        assert_eq!((treg.scale, treg.scale_offset, treg.decimals), (Some(0.1), Some(-40.0), Some(1)));
+        let tjson = serde_json::to_string(&treg).unwrap();
+        assert!(tjson.contains("\"scaleOffset\"") && tjson.contains("\"decimals\""));
+        let treg: TemplateRegister = serde_json::from_str(&tjson).unwrap();
+        let tpl = DeviceTemplate {
+            template_key: "k".into(), name: "n".into(), category: "c".into(),
+            description: String::new(), icon: String::new(), registers: vec![treg],
+        };
+        check(&template_to_registers(&tpl, 1, 0)[0]);
+    }
+
+    #[test]
+    fn legacy_json_without_scaling_fields_deserializes_to_none() {
+        let r: SimRegister = serde_json::from_str(r#"{"unitId":1,"functionCode":3,"address":0}"#).unwrap();
+        assert_eq!((r.scale, r.scale_offset, r.decimals), (None, None, None));
+        let t: TemplateRegister = serde_json::from_str(r#"{"offset":0,"bank":3}"#).unwrap();
+        assert_eq!((t.scale, t.scale_offset, t.decimals), (None, None, None));
+        let out = serde_json::to_string(&t).unwrap();
+        assert!(!out.contains("scale") && !out.contains("decimals"));
+    }
+
+    #[test]
+    fn validate_register_rejects_zero_scale() {
+        let ok = scaled_reg(0, None);
+        assert!(validate_register(&ok).is_ok());
+        let err = validate_register(&SimRegister { scale: Some(0.0), ..ok.clone() }).unwrap_err();
+        assert!(err.contains("scale"));
+        assert!(validate_register(&SimRegister { scale: None, scale_offset: None, ..ok }).is_ok());
+    }
+
+    // ── engineering units: generators and presets ────────────────────────
+
+    fn gen_reg(data_type: &str, value_source: &str, params: &str, scale: Option<f64>, scale_offset: Option<f64>) -> SimRegister {
+        SimRegister {
+            id: 1, unit_id: 1, function_code: 4, address: 0, alias: "".into(), data_type: data_type.into(),
+            hold_value: 0, value_source: value_source.into(), byte_order: "ABCD".into(),
+            source_params: params.into(), interval_ms: 100, sort_order: 0, device_instance_id: None,
+            unit: None, display_format: None, scale, scale_offset, decimals: None,
+        }
+    }
+
+    fn raw_words(reg: &SimRegister, t: f64) -> Vec<u16> {
+        let d = parse_dynamic(reg).unwrap();
+        encode_value(&d.data_type, &d.byte_order, dyn_raw_value(&d, t)).unwrap()
+    }
+
+    #[test]
+    fn generators_with_default_scaling_are_unchanged() {
+        let gens = ["sine", "ramp", "decrement", "step", "random", "toggle"];
+        let presets = ["temperature", "humidity", "vibration", "discrete", "counter", "analog"];
+        for dt in ["u16", "i16", "u32", "f32"] {
+            let mut cases: Vec<SimRegister> = Vec::new();
+            for g in gens {
+                let p = format!("{{\"kind\":\"{g}\",\"min\":0,\"max\":50,\"periodMs\":1000}}");
+                cases.push(gen_reg(dt, "generator", &p, None, None));
+            }
+            for pr in presets {
+                let p = format!("{{\"preset\":\"{pr}\",\"min\":20,\"max\":30}}");
+                cases.push(gen_reg(dt, "device", &p, None, None));
+            }
+            for reg in cases {
+                let d = parse_dynamic(&reg).unwrap();
+                for t in [0.0, 137.0, 250.0, 999.0, 1500.0, 7777.0, 30000.0] {
+                    let before = encode_value(&d.data_type, &d.byte_order, dyn_value(&d, t)).unwrap();
+                    assert_eq!(raw_words(&reg, t), before, "{dt} {} at t={t}", reg.source_params);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sine_in_engineering_units_maps_to_raw_range() {
+        let reg = gen_reg("u16", "generator", "{\"kind\":\"sine\",\"min\":20,\"max\":30,\"periodMs\":1000}", Some(0.1), None);
+        let (mut lo, mut hi) = (u16::MAX, 0u16);
+        for t in 0..1000 {
+            let w = raw_words(&reg, t as f64)[0];
+            assert!((200..=300).contains(&w), "raw {w} out of range at t={t}");
+            lo = lo.min(w);
+            hi = hi.max(w);
+        }
+        assert!(hi >= 299, "max {hi}");
+        assert!(lo <= 201, "min {lo}");
+    }
+
+    #[test]
+    fn step_counts_one_engineering_unit_per_period() {
+        let reg = gen_reg("u16", "generator", "{\"kind\":\"step\",\"min\":20,\"max\":30,\"periodMs\":1000}", Some(0.1), None);
+        assert_eq!(raw_words(&reg, 0.0), vec![200]);
+        assert_eq!(raw_words(&reg, 1000.0), vec![210]);
+        assert_eq!(raw_words(&reg, 2000.0), vec![220]);
+    }
+
+    #[test]
+    fn f32_generator_with_scale_is_not_rounded() {
+        let reg = gen_reg("f32", "generator", "{\"kind\":\"ramp\",\"min\":0,\"max\":10,\"periodMs\":1000}", Some(0.5), None);
+        let at = |t: f64| decode_value("f32", "ABCD", &raw_words(&reg, t)).unwrap();
+        assert_eq!(at(250.0), 5.0); // eng 2.5
+        assert_eq!(at(275.0), 5.5); // eng 2.75
+    }
+
+    #[test]
+    fn scale_offset_flows_into_generators() {
+        // eng = raw * 0.5 - 40 → raw = (eng + 40) / 0.5; eng 0 → 80.
+        let reg = gen_reg("u16", "generator", "{\"kind\":\"ramp\",\"min\":0,\"max\":10,\"periodMs\":1000}", Some(0.5), Some(-40.0));
+        assert_eq!(raw_words(&reg, 0.0), vec![80]);
+        assert_eq!(raw_words(&reg, 500.0), vec![90]);
+    }
+
+    #[test]
+    fn upgrade_from_db_without_scale_columns_keeps_values() {
+        let dir = temp_dir("upgrade-scale");
+        let db = dir.join("workspace.db");
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sim_devices (id INTEGER PRIMARY KEY AUTOINCREMENT, template_key TEXT, name TEXT NOT NULL,
+                    unit_id INTEGER NOT NULL, base_address INTEGER, params TEXT, enabled INTEGER NOT NULL DEFAULT 1,
+                    sort_order INTEGER NOT NULL DEFAULT 0);
+                 CREATE TABLE sim_registers (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    device_instance_id INTEGER REFERENCES sim_devices(id) ON DELETE CASCADE,
+                    unit_id INTEGER NOT NULL, function_code INTEGER NOT NULL, address INTEGER NOT NULL,
+                    alias TEXT NOT NULL DEFAULT '', data_type TEXT NOT NULL DEFAULT 'u16', byte_order TEXT,
+                    display_format TEXT, unit TEXT,
+                    value_source TEXT NOT NULL DEFAULT 'hold', source_params TEXT, interval_ms INTEGER,
+                    hold_value INTEGER NOT NULL DEFAULT 0, sort_order INTEGER NOT NULL DEFAULT 0,
+                    UNIQUE(unit_id, function_code, address));
+                 INSERT INTO sim_registers (unit_id, function_code, address, data_type, byte_order, value_source, source_params, interval_ms)
+                    VALUES (1, 4, 0, 'u16', 'ABCD', 'generator', '{\"kind\":\"ramp\",\"min\":0,\"max\":100,\"periodMs\":1000}', 100);",
+            ).unwrap();
+        }
+        crate::db::ensure_workspace_db(&dir, "workspace.db").unwrap();
+        let conn = Connection::open(&db).unwrap();
+        for col in ["scale", "scale_offset", "decimals"] {
+            let n: i64 = conn
+                .query_row("SELECT COUNT(*) FROM pragma_table_info('sim_registers') WHERE name = ?1", [col], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n, 1, "column {col} added");
+        }
+        let regs = db_list_registers(&conn).unwrap();
+        assert_eq!(regs.len(), 1);
+        assert_eq!((regs[0].scale, regs[0].scale_offset, regs[0].decimals), (None, None, None));
+        let d = parse_dynamic(&regs[0]).unwrap();
+        assert_eq!((d.scale, d.scale_offset), (1.0, 0.0));
+        for t in [0.0, 250.0, 500.0, 999.0] {
+            let before = encode_value("u16", "ABCD", dyn_value(&d, t)).unwrap();
+            assert_eq!(raw_words(&regs[0], t), before, "t={t}");
+        }
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── engineering units: typed, scaled rule conditions ─────────────────
+
+    fn cmeta(entries: &[(u8, u8, u16, &str, f64)]) -> RegMetaMap {
+        let mut m = RegMetaMap::new();
+        for &(u, b, a, dt, scale) in entries {
+            m.insert((u, b, a), RegMeta {
+                data_type: dt.into(),
+                byte_order: "ABCD".into(),
+                scale,
+                offset: 0.0,
+                decimals: effective_decimals(None, scale, 0.0, dt),
+            });
+        }
+        m
+    }
+
+    fn cnd(unit: u8, bank: u8, address: u16, op: &str, value: f64, deadband: f64) -> Cond {
+        Cond { unit, bank, address, op: op.into(), value, deadband }
+    }
+
+    fn cond_rule(id: i64, join: Join, conds: Vec<Cond>) -> RuleDef {
+        rule(id, Trigger::Condition { join, conds }, vec![Action::Inc { unit: 1, bank: 3, address: 99, by: 1.0 }])
+    }
+
+    fn sim_rule(trigger: &str) -> SimRule {
+        SimRule {
+            id: 1, name: "r".into(), enabled: true, trigger: trigger.into(),
+            actions: "[{\"type\":\"inc\",\"unit\":1,\"bank\":3,\"address\":99,\"by\":1}]".into(),
+            sort_order: 0,
+        }
+    }
+
+    #[test]
+    fn legacy_condition_json_parses_and_fires_as_before() {
+        let r = parse_rule(&sim_rule(
+            "{\"type\":\"condition\",\"unit\":1,\"bank\":3,\"address\":0,\"op\":\">=\",\"value\":350}",
+        ))
+        .unwrap();
+        assert_eq!(r.trigger, Trigger::Condition { join: Join::All, conds: vec![cnd(1, 3, 0, ">=", 350.0, 0.0)] });
+        let rules = vec![r];
+        let meta = cmeta(&[(1, 3, 0, "u16", 1.0)]);
+        let mut st = HashMap::new();
+        assert_eq!(eval_rules(&rules, &mut st, &banks1(&[(1, 3, 0, 349)]), &meta, 0.0, &[]).len(), 0);
+        assert_eq!(eval_rules(&rules, &mut st, &banks1(&[(1, 3, 0, 350)]), &meta, 10.0, &[]).len(), 1);
+        assert_eq!(eval_rules(&rules, &mut st, &banks1(&[(1, 3, 0, 351)]), &meta, 20.0, &[]).len(), 0);
+    }
+
+    #[test]
+    fn new_condition_shape_parses_and_rejects_out_of_range() {
+        let r = parse_rule(&sim_rule(
+            "{\"type\":\"condition\",\"join\":\"any\",\"conditions\":[\
+               {\"unit\":2,\"bank\":4,\"address\":7,\"op\":\">=\",\"value\":35.5,\"deadband\":1.5},\
+               {\"unit\":1,\"bank\":1,\"address\":3,\"op\":\"==\",\"value\":1}]}",
+        ))
+        .unwrap();
+        assert_eq!(
+            r.trigger,
+            Trigger::Condition {
+                join: Join::Any,
+                conds: vec![cnd(2, 4, 7, ">=", 35.5, 1.5), cnd(1, 1, 3, "==", 1.0, 0.0)],
+            }
+        );
+        // Join defaults to All; a negative deadband is clamped to 0.
+        let r = parse_rule(&sim_rule(
+            "{\"type\":\"condition\",\"conditions\":[{\"unit\":1,\"bank\":3,\"address\":0,\"op\":\"<\",\"value\":-2.5,\"deadband\":-3}]}",
+        ))
+        .unwrap();
+        assert_eq!(r.trigger, Trigger::Condition { join: Join::All, conds: vec![cnd(1, 3, 0, "<", -2.5, 0.0)] });
+        // Out-of-range unit/address anywhere rejects the rule (legacy and new shapes).
+        assert!(parse_rule(&sim_rule("{\"type\":\"condition\",\"unit\":300,\"bank\":3,\"address\":0,\"op\":\"==\",\"value\":1}")).is_none());
+        assert!(parse_rule(&sim_rule(
+            "{\"type\":\"condition\",\"join\":\"all\",\"conditions\":[\
+               {\"unit\":1,\"bank\":3,\"address\":0,\"op\":\"==\",\"value\":1},\
+               {\"unit\":1,\"bank\":3,\"address\":70000,\"op\":\"==\",\"value\":1}]}",
+        ))
+        .is_none());
+        // An empty condition list can never be met → rejected.
+        assert!(parse_rule(&sim_rule("{\"type\":\"condition\",\"join\":\"all\",\"conditions\":[]}")).is_none());
+    }
+
+    #[test]
+    fn i16_condition_sees_negative_values() {
+        let rules = vec![cond_rule(1, Join::All, vec![cnd(1, 3, 0, "<", 0.0, 0.0)])];
+        let b = banks1(&[(1, 3, 0, 0xFFFF)]);
+        let mut st = HashMap::new();
+        assert_eq!(eval_rules(&rules, &mut st, &b, &cmeta(&[(1, 3, 0, "i16", 1.0)]), 0.0, &[]).len(), 1);
+        // The same word on a u16 register is 65535, not negative.
+        let mut st = HashMap::new();
+        assert_eq!(eval_rules(&rules, &mut st, &b, &cmeta(&[(1, 3, 0, "u16", 1.0)]), 0.0, &[]).len(), 0);
+    }
+
+    #[test]
+    fn f32_and_u32_conditions_decode_full_register() {
+        let mut b = HashMap::new();
+        place_words(&mut b, 1, 4, 0, &encode_value("f32", "ABCD", 35.5).unwrap());
+        place_words(&mut b, 1, 4, 10, &encode_value("u32", "ABCD", 70000.0).unwrap());
+        let meta = cmeta(&[(1, 4, 0, "f32", 1.0), (1, 4, 10, "u32", 1.0)]);
+        let rules = vec![
+            cond_rule(1, Join::All, vec![cnd(1, 4, 0, ">=", 35.0, 0.0)]),
+            cond_rule(2, Join::All, vec![cnd(1, 4, 10, ">", 65535.0, 0.0)]),
+        ];
+        let mut st = HashMap::new();
+        let fired: Vec<i64> = eval_rules(&rules, &mut st, &b, &meta, 0.0, &[]).into_iter().map(|(id, _)| id).collect();
+        assert_eq!(fired, vec![1, 2]);
+        assert_eq!(read_eng(&b, &meta, 1, 4, 0), Some(35.5));
+        assert_eq!(read_eng(&b, &meta, 1, 4, 10), Some(70000.0));
+    }
+
+    #[test]
+    fn coarse_explicit_decimals_do_not_round_thresholds() {
+        let regs = [SimRegister {
+            id: 1, unit_id: 1, function_code: 3, address: 0, alias: String::new(), data_type: "u16".into(),
+            hold_value: 0, sort_order: 0, device_instance_id: None, value_source: "hold".into(),
+            byte_order: "ABCD".into(), source_params: "{}".into(), interval_ms: 1000, unit: None,
+            display_format: None, scale: Some(0.1), scale_offset: None, decimals: Some(0),
+        }];
+        let meta = build_reg_meta(&regs);
+        let rules = vec![cond_rule(1, Join::All, vec![cnd(1, 3, 0, ">", 35.5, 0.0)])];
+        let mut st = HashMap::new();
+        assert_eq!(eval_rules(&rules, &mut st, &banks1(&[(1, 3, 0, 355)]), &meta, 0.0, &[]).len(), 0, "35.5 is not > 35.5");
+        assert_eq!(eval_rules(&rules, &mut st, &banks1(&[(1, 3, 0, 356)]), &meta, 10.0, &[]).len(), 1, "35.6 > 35.5");
+    }
+
+    #[test]
+    fn f32_explicit_decimals_round_comparisons() {
+        let regs = [SimRegister {
+            id: 1, unit_id: 1, function_code: 3, address: 0, alias: String::new(), data_type: "f32".into(),
+            hold_value: 0, sort_order: 0, device_instance_id: None, value_source: "generator".into(),
+            byte_order: "ABCD".into(), source_params: "{}".into(), interval_ms: 1000, unit: None,
+            display_format: None, scale: None, scale_offset: None, decimals: Some(2),
+        }];
+        let meta = build_reg_meta(&regs);
+        let mut b = HashMap::new();
+        place_words(&mut b, 1, 3, 0, &encode_value("f32", "ABCD", 35.456).unwrap());
+        let rules = vec![cond_rule(1, Join::All, vec![cnd(1, 3, 0, "==", 35.46, 0.0)])];
+        let mut st = HashMap::new();
+        assert_eq!(eval_rules(&rules, &mut st, &b, &meta, 0.0, &[]).len(), 1, "35.456 == 35.46 at 2 decimals");
+    }
+
+    #[test]
+    fn scaled_equality_uses_register_decimals() {
+        let meta = cmeta(&[(1, 3, 0, "u16", 0.1)]);
+        let rules = vec![cond_rule(1, Join::All, vec![cnd(1, 3, 0, "==", 23.5, 0.0)])];
+        let mut st = HashMap::new();
+        assert_eq!(eval_rules(&rules, &mut st, &banks1(&[(1, 3, 0, 234)]), &meta, 0.0, &[]).len(), 0);
+        assert_eq!(eval_rules(&rules, &mut st, &banks1(&[(1, 3, 0, 235)]), &meta, 10.0, &[]).len(), 1);
+        assert_eq!(eval_rules(&rules, &mut st, &banks1(&[(1, 3, 0, 236)]), &meta, 20.0, &[]).len(), 0);
+    }
+
+    #[test]
+    fn deadband_holds_until_value_moves_back() {
+        let meta = cmeta(&[(1, 3, 0, "u16", 0.1)]);
+        let rules = vec![cond_rule(1, Join::All, vec![cnd(1, 3, 0, ">=", 35.0, 1.0)])];
+        let mut st = HashMap::new();
+        let mut step = |raw: u16, t: f64| eval_rules(&rules, &mut st, &banks1(&[(1, 3, 0, raw)]), &meta, t, &[]).len();
+        assert_eq!(step(340, 0.0), 0, "34.0: below threshold");
+        assert_eq!(step(350, 10.0), 1, "35.0: fires");
+        assert_eq!(step(345, 20.0), 0, "34.5: inside the deadband, still true");
+        assert_eq!(step(352, 30.0), 0, "35.2: still true, no re-fire");
+        assert_eq!(step(340, 40.0), 0, "34.0: exactly threshold - deadband, still true");
+        assert_eq!(step(339, 50.0), 0, "33.9: released");
+        assert_eq!(step(350, 60.0), 1, "35.0 again: fires again");
+
+        // `<=` mirrors it: holds until above value + deadband.
+        let rules = vec![cond_rule(1, Join::All, vec![cnd(1, 3, 0, "<=", 10.0, 2.0)])];
+        let mut st = HashMap::new();
+        let mut step = |raw: u16, t: f64| eval_rules(&rules, &mut st, &banks1(&[(1, 3, 0, raw)]), &meta, t, &[]).len();
+        assert_eq!(step(100, 0.0), 1, "10.0: fires");
+        assert_eq!(step(115, 10.0), 0, "11.5: held");
+        assert_eq!(step(125, 20.0), 0, "12.5: released");
+        assert_eq!(step(110, 30.0), 0, "11.0: not re-armed yet (above 10)");
+        assert_eq!(step(100, 40.0), 1, "10.0: fires again");
+    }
+
+    #[test]
+    fn zero_deadband_matches_plain_comparison() {
+        // `>` with deadband 0 must not latch at the threshold (today's behaviour).
+        let meta = cmeta(&[(1, 3, 0, "u16", 1.0)]);
+        let rules = vec![cond_rule(1, Join::All, vec![cnd(1, 3, 0, ">", 100.0, 0.0)])];
+        let mut st = HashMap::new();
+        let mut step = |raw: u16, t: f64| eval_rules(&rules, &mut st, &banks1(&[(1, 3, 0, raw)]), &meta, t, &[]).len();
+        assert_eq!(step(101, 0.0), 1);
+        assert_eq!(step(100, 10.0), 0);
+        assert_eq!(step(101, 20.0), 1, "100 was false, so 101 is a new edge");
+    }
+
+    #[test]
+    fn all_and_any_joins() {
+        let meta = cmeta(&[(1, 3, 0, "u16", 1.0), (1, 3, 1, "u16", 1.0)]);
+        let both = |join| vec![cond_rule(1, join, vec![cnd(1, 3, 0, ">=", 10.0, 0.0), cnd(1, 3, 1, ">=", 10.0, 0.0)])];
+        let neither = banks1(&[(1, 3, 0, 0), (1, 3, 1, 0)]);
+        let first = banks1(&[(1, 3, 0, 10), (1, 3, 1, 0)]);
+        let all = banks1(&[(1, 3, 0, 10), (1, 3, 1, 10)]);
+
+        let rules = both(Join::All);
+        let mut st = HashMap::new();
+        assert_eq!(eval_rules(&rules, &mut st, &neither, &meta, 0.0, &[]).len(), 0);
+        assert_eq!(eval_rules(&rules, &mut st, &first, &meta, 10.0, &[]).len(), 0, "All: one of two is not enough");
+        assert_eq!(eval_rules(&rules, &mut st, &all, &meta, 20.0, &[]).len(), 1, "All: both true fires");
+        assert_eq!(eval_rules(&rules, &mut st, &all, &meta, 30.0, &[]).len(), 0, "edge only");
+
+        let rules = both(Join::Any);
+        let mut st = HashMap::new();
+        assert_eq!(eval_rules(&rules, &mut st, &neither, &meta, 0.0, &[]).len(), 0);
+        assert_eq!(eval_rules(&rules, &mut st, &first, &meta, 10.0, &[]).len(), 1, "Any: first true fires");
+        assert_eq!(eval_rules(&rules, &mut st, &all, &meta, 20.0, &[]).len(), 0, "Any: second also true, no re-fire");
+    }
+
+    #[test]
+    fn changed_in_multi_condition_rule_is_not_met() {
+        let r = parse_rule(&sim_rule(
+            "{\"type\":\"condition\",\"join\":\"any\",\"conditions\":[\
+               {\"unit\":1,\"bank\":3,\"address\":0,\"op\":\"changed\",\"value\":0},\
+               {\"unit\":1,\"bank\":3,\"address\":1,\"op\":\"==\",\"value\":999}]}",
+        ))
+        .expect("a multi-condition rule containing `changed` still parses");
+        let rules = vec![r];
+        let meta = cmeta(&[(1, 3, 0, "u16", 1.0), (1, 3, 1, "u16", 1.0)]);
+        let mut st = HashMap::new();
+        for (t, v) in [(0.0, 1u16), (10.0, 2), (20.0, 3), (30.0, 4)] {
+            let b = banks1(&[(1, 3, 0, v), (1, 3, 1, 0)]);
+            assert!(eval_rules(&rules, &mut st, &b, &meta, t, &[]).is_empty(), "changed must not fire inside a multi-condition rule (t={t})");
+        }
+        // The other condition still works.
+        let b = banks1(&[(1, 3, 0, 4), (1, 3, 1, 999)]);
+        assert_eq!(eval_rules(&rules, &mut st, &b, &meta, 40.0, &[]).len(), 1);
+    }
+
+    #[test]
+    fn changed_compares_rounded_engineering_value() {
+        // Single-condition `changed` fires on each change of the rounded value.
+        let meta = cmeta(&[(1, 3, 0, "u16", 0.1)]);
+        let rules = vec![cond_rule(1, Join::All, vec![cnd(1, 3, 0, "changed", 0.0, 0.0)])];
+        let mut st = HashMap::new();
+        assert_eq!(eval_rules(&rules, &mut st, &banks1(&[(1, 3, 0, 10)]), &meta, 0.0, &[]).len(), 0, "first observation");
+        assert_eq!(eval_rules(&rules, &mut st, &banks1(&[(1, 3, 0, 11)]), &meta, 10.0, &[]).len(), 1);
+        assert_eq!(eval_rules(&rules, &mut st, &banks1(&[(1, 3, 0, 11)]), &meta, 20.0, &[]).len(), 0);
+    }
+
+    fn tact(action: Action, dt: &str) -> TimedAction {
+        TimedAction { action, delay_ms: 0.0, data_type: dt.into(), byte_order: "ABCD".into() }
+    }
+
+    #[test]
+    fn set_action_writes_engineering_value() {
+        let mut b = banks1(&[(1, 3, 0, 0)]);
+        let meta = cmeta(&[(1, 3, 0, "u16", 0.1)]);
+        apply_timed_action(&mut b, &meta, &timed(Action::Set { unit: 1, bank: 3, address: 0, value: 25.57 }), 0);
+        assert_eq!(read_word(&b, 1, 3, 0), Some(256));
+    }
+
+    #[test]
+    fn inc_dec_in_engineering_units() {
+        let mut b = banks1(&[(1, 3, 0, 200)]);
+        let meta = cmeta(&[(1, 3, 0, "u16", 0.1)]);
+        apply_timed_action(&mut b, &meta, &timed(Action::Inc { unit: 1, bank: 3, address: 0, by: 0.5 }), 0);
+        assert_eq!(read_word(&b, 1, 3, 0), Some(205));
+        apply_timed_action(&mut b, &meta, &timed(Action::Dec { unit: 1, bank: 3, address: 0, by: 1.0 }), 0);
+        assert_eq!(read_word(&b, 1, 3, 0), Some(195));
+    }
+
+    #[test]
+    fn set_on_f32_target_writes_both_words() {
+        let mut b = banks1(&[(1, 3, 4, 0), (1, 3, 5, 0)]);
+        let meta = cmeta(&[(1, 3, 4, "f32", 1.0)]);
+        // The stored dataType (u16 default) is ignored when the meta is known.
+        apply_timed_action(&mut b, &meta, &timed(Action::Set { unit: 1, bank: 3, address: 4, value: 12.75 }), 0);
+        assert_eq!(read_typed(&b, 1, 3, 4, "f32", "ABCD"), Some(12.75));
+    }
+
+    #[test]
+    fn copy_copies_engineering_value() {
+        let mut b = banks1(&[(1, 3, 0, 235), (1, 3, 1, 0)]);
+        let meta = cmeta(&[(1, 3, 0, "u16", 0.1), (1, 3, 1, "i16", 0.01)]);
+        let copy = Action::Copy { src_unit: 1, src_bank: 3, src_addr: 0, unit: 1, bank: 3, address: 1, scale: 1.0, offset: 0.0 };
+        apply_timed_action(&mut b, &meta, &timed(copy), 0);
+        assert_eq!(read_word(&b, 1, 3, 1), Some(2350));
+        // Extra scale/offset apply to the engineering value: 23.5*2+1 = 48 → 4800.
+        let copy2 = Action::Copy { src_unit: 1, src_bank: 3, src_addr: 0, unit: 1, bank: 3, address: 1, scale: 2.0, offset: 1.0 };
+        apply_timed_action(&mut b, &meta, &timed(copy2), 0);
+        assert_eq!(read_word(&b, 1, 3, 1), Some(4800));
+    }
+
+    #[test]
+    fn bit_targets_non_zero_is_on() {
+        let mut b = banks1(&[(1, 1, 0, 0)]);
+        apply_timed_action(&mut b, &RegMetaMap::new(), &timed(Action::Set { unit: 1, bank: 1, address: 0, value: 0.5 }), 0);
+        assert_eq!(read_word(&b, 1, 1, 0), Some(1));
+        apply_timed_action(&mut b, &RegMetaMap::new(), &timed(Action::Set { unit: 1, bank: 1, address: 0, value: 0.0 }), 0);
+        assert_eq!(read_word(&b, 1, 1, 0), Some(0));
+    }
+
+    #[test]
+    fn legacy_integer_actions_unchanged() {
+        let meta = cmeta(&[(1, 3, 0, "u16", 1.0)]);
+        let mut with = banks1(&[(1, 3, 0, 10)]);
+        let mut without = banks1(&[(1, 3, 0, 10)]);
+        for a in [
+            Action::Set { unit: 1, bank: 3, address: 0, value: 42.0 },
+            Action::Inc { unit: 1, bank: 3, address: 0, by: 8.0 },
+            Action::Dec { unit: 1, bank: 3, address: 0, by: 60.0 },
+        ] {
+            apply_timed_action(&mut with, &meta, &timed(a.clone()), 0);
+            apply_timed_action(&mut without, &RegMetaMap::new(), &timed(a), 0);
+            assert_eq!(read_word(&with, 1, 3, 0), read_word(&without, 1, 3, 0));
+        }
+        assert_eq!(read_word(&with, 1, 3, 0), Some(65526), "u16 wraps exactly as before");
+    }
+
+    #[test]
+    fn action_without_target_meta_uses_stored_type() {
+        let mut b = banks1(&[(1, 3, 0, 0), (1, 3, 1, 0)]);
+        apply_timed_action(&mut b, &RegMetaMap::new(), &tact(Action::Set { unit: 1, bank: 3, address: 0, value: 1.0 }, "f32"), 0);
+        assert_eq!(read_typed(&b, 1, 3, 0, "f32", "ABCD"), Some(1.0));
+        // Existing-only: an absent target is never created.
+        apply_timed_action(&mut b, &RegMetaMap::new(), &timed(Action::Set { unit: 1, bank: 3, address: 9, value: 5.0 }), 0);
+        assert_eq!(read_word(&b, 1, 3, 9), None);
+    }
+
+    #[test]
+    fn parse_action_accepts_float_values() {
+        let v: serde_json::Value = serde_json::from_str(r#"{"type":"set","unit":1,"bank":3,"address":0,"value":25.57}"#).unwrap();
+        assert_eq!(parse_action(&v).unwrap().action, Action::Set { unit: 1, bank: 3, address: 0, value: 25.57 });
+        let v: serde_json::Value = serde_json::from_str(r#"{"type":"inc","unit":1,"bank":3,"address":0,"by":2}"#).unwrap();
+        assert_eq!(parse_action(&v).unwrap().action, Action::Inc { unit: 1, bank: 3, address: 0, by: 2.0 });
+        let v: serde_json::Value = serde_json::from_str(r#"{"type":"dec","unit":1,"bank":3,"address":0}"#).unwrap();
+        assert_eq!(parse_action(&v).unwrap().action, Action::Dec { unit: 1, bank: 3, address: 0, by: 1.0 });
+    }
+
+    #[test]
+    fn read_eng_bits_words_and_missing() {
+        let mut b = banks1(&[(1, 3, 0, 235), (1, 3, 1, 7)]);
+        place_words(&mut b, 1, 1, 4, &[1]);
+        let meta = cmeta(&[(1, 3, 0, "u16", 0.1), (1, 1, 4, "bool", 1.0)]);
+        assert!((read_eng(&b, &meta, 1, 3, 0).unwrap() - 23.5).abs() < 1e-9);
+        assert_eq!(read_eng(&b, &meta, 1, 1, 4), Some(1.0));
+        assert_eq!(read_eng(&b, &meta, 1, 3, 1), None, "word present but no register metadata");
+        assert_eq!(read_eng(&b, &meta, 1, 1, 5), None, "bit absent");
+        // A hold "bool" on a word bank reads its word as-is.
+        let meta = cmeta(&[(1, 3, 1, "bool", 1.0)]);
+        assert_eq!(read_eng(&b, &meta, 1, 3, 1), Some(7.0));
+    }
+
+    #[test]
+    fn f32_reads_shortest_round_trip_so_set_value_conditions_fire() {
+        for v in [230.7, 23.3, 49.95] {
+            let mut b = banks1(&[(1, 3, 0, 0), (1, 3, 1, 0)]);
+            let meta = cmeta(&[(1, 3, 0, "f32", 1.0)]);
+            apply_timed_action(&mut b, &meta, &timed(Action::Set { unit: 1, bank: 3, address: 0, value: v }), 0);
+            assert_eq!(read_eng(&b, &meta, 1, 3, 0), Some(v), "f32 noise for {v}");
+            for op in [">=", "==", "<="] {
+                let rules = vec![cond_rule(1, Join::All, vec![cnd(1, 3, 0, op, v, 0.0)])];
+                let mut st = HashMap::new();
+                assert_eq!(eval_rules(&rules, &mut st, &b, &meta, 0.0, &[]).len(), 1, "{op} {v}");
+            }
+            // The legacy stored-type path (no meta) decodes the same way.
+            assert_eq!(read_typed(&b, 1, 3, 0, "f32", "ABCD"), Some(v));
+        }
+        // Scaled f32: raw 230.7 × 0.5 + 1 = 116.35.
+        let mut b = HashMap::new();
+        place_words(&mut b, 1, 4, 0, &encode_value("f32", "ABCD", 230.7).unwrap());
+        let mut meta = cmeta(&[(1, 4, 0, "f32", 0.5)]);
+        meta.get_mut(&(1, 4, 0)).unwrap().offset = 1.0;
+        assert_eq!(read_eng(&b, &meta, 1, 4, 0), Some(230.7 * 0.5 + 1.0));
+    }
+
+    #[tokio::test]
+    async fn condition_follows_register_scale_change_while_running() {
+        let hold = |addr: i64, hold_value: i64| SimRegister {
+            id: addr + 1, unit_id: 1, function_code: 3, address: addr, alias: "".into(), data_type: "u16".into(),
+            hold_value, value_source: "hold".into(), byte_order: "ABCD".into(), source_params: "{}".into(),
+            interval_ms: 1000, sort_order: 0, device_instance_id: None,
+            unit: None, display_format: None, scale: None, scale_offset: None, decimals: None,
+        };
+        let temp = hold(0, 300);
+        let count = hold(1, 0);
+        // Constant 50 (engineering): raw 50 at scale 1, raw 500 at scale 0.1.
+        let generator = SimRegister {
+            id: 10, unit_id: 1, function_code: 4, address: 0, alias: "".into(), data_type: "u16".into(),
+            hold_value: 0, value_source: "generator".into(), byte_order: "ABCD".into(),
+            source_params: "{\"kind\":\"ramp\",\"min\":50,\"max\":50,\"periodMs\":1000}".into(),
+            interval_ms: 20, sort_order: 0, device_instance_id: None,
+            unit: None, display_format: None, scale: None, scale_offset: None, decimals: None,
+        };
+        let rules_raw = vec![SimRule {
+            id: 1, name: "hot".into(), enabled: true,
+            trigger: "{\"type\":\"condition\",\"join\":\"all\",\"conditions\":[{\"unit\":1,\"bank\":3,\"address\":0,\"op\":\">=\",\"value\":35.0}]}".into(),
+            actions: "[{\"type\":\"inc\",\"unit\":1,\"bank\":3,\"address\":1,\"by\":1}]".into(),
+            sort_order: 0,
+        }];
+        let regs = vec![temp.clone(), count.clone(), generator.clone()];
+        let banks = registers_to_banks(&regs);
+        let dynamics: Vec<DynReg> = regs.iter().filter_map(parse_dynamic).collect();
+        let rules: Vec<RuleDef> = rules_raw.iter().filter_map(parse_rule).collect();
+
+        let mut engine = SimEngine::new();
+        // Mirror `simulator_start`: metadata is in place before the first tick.
+        engine.set_register_meta(build_reg_meta(&regs));
+        let info = engine.start(NoopSink, "ws".into(), "127.0.0.1", 0, 20, banks, dynamics, Default::default(), Default::default(), rules).await.unwrap();
+        let addr: std::net::SocketAddr = info.bound.parse().unwrap();
+        let mut c = tokio_modbus::client::tcp::connect_slave(addr, tokio_modbus::prelude::Slave(1)).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(c.read_holding_registers(1, 1).await.unwrap().unwrap(), vec![1], "eng 300 >= 35 fires once");
+        assert_eq!(c.read_input_registers(0, 1).await.unwrap().unwrap(), vec![50], "generator at scale 1");
+
+        // Hot-apply: the same registers, now scaled 0.1 (rule unchanged).
+        let scaled = vec![
+            SimRegister { scale: Some(0.1), ..temp.clone() },
+            count.clone(),
+            SimRegister { scale: Some(0.1), ..generator.clone() },
+        ];
+        apply_live_config(&engine, Some(&scaled), Some(&rules_raw), |_, _| 0);
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(c.read_holding_registers(1, 1).await.unwrap().unwrap(), vec![1], "eng 30.0 < 35: no fire");
+        assert_eq!(c.read_input_registers(0, 1).await.unwrap().unwrap(), vec![500], "generator output follows the new scale on the next tick");
+
+        c.write_single_register(0, 360).await.unwrap().unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(c.read_holding_registers(1, 1).await.unwrap().unwrap(), vec![2], "eng 36.0 >= 35 fires");
+        engine.stop().await;
     }
 }

@@ -53,6 +53,8 @@ export type Screen2OutletContext = {
     trafficAvailable: boolean;
     trafficContext?: { slaveId?: number | null };
   }) => void;
+  /** Analyzer focus view: while on, the sidebar, app header and logs pane are hidden and main has no padding. */
+  setFocusMode?: (on: boolean) => void;
 };
 
 export default function Screen2Layout() {
@@ -71,6 +73,7 @@ export default function Screen2Layout() {
   const [pendingPath, setPendingPath] = useState<string | null>(null);
   const [pendingExit, setPendingExit] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(readSidebarCollapsed);
+  const [focusMode, setFocusMode] = useState(false);
   const [logViewerOpen, setLogViewerOpen] = useState(false);
   const [logViewerFullscreen, setLogViewerFullscreen] = useState(false);
   const [logPaneHeight, setLogPaneHeight] = useState(288);
@@ -143,24 +146,36 @@ export default function Screen2Layout() {
     void getCurrentWebviewWindow().setTitle(title);
   }, [workspaceName]);
 
+  // Leaving a workspace stops its Analyzer polling and TCP simulator and closes
+  // its connections (waiting until the serial port is really free), so another
+  // workspace or the slave scanner can open the same port straight away.
   async function disconnectAll(name: string) {
     if (!name.trim()) return;
     try {
-      await invoke<void>("modbus_tcp_disconnect", { name });
+      await invoke<void>("close_workspace_connections", { name });
     } catch {
-      // ignore
-    }
-    try {
-      await invoke<void>("modbus_rtu_disconnect", { name });
-    } catch {
-      // ignore
+      // ignore — best effort on the way out
     }
   }
 
+  // Runs once when the workspace really closes (exit, switch, or the layout
+  // unmounting). The close is deferred a tick and cancelled if the same
+  // workspace mounts again straight away — React StrictMode's dev-only
+  // mount → unmount → mount must not stop a running simulator on entry.
+  const pendingCloseRef = useRef<{ name: string; timer: number } | null>(null);
   useEffect(() => {
     const name = workspaceName;
+    const pending = pendingCloseRef.current;
+    if (pending && pending.name === name) {
+      window.clearTimeout(pending.timer);
+      pendingCloseRef.current = null;
+    }
     return () => {
-      void disconnectAll(name);
+      const timer = window.setTimeout(() => {
+        if (pendingCloseRef.current?.timer === timer) pendingCloseRef.current = null;
+        void disconnectAll(name);
+      }, 0);
+      pendingCloseRef.current = { name, timer };
     };
   }, [workspaceName]);
 
@@ -182,7 +197,6 @@ export default function Screen2Layout() {
       setPendingExit(true);
       setNavGuardOpen(true);
     } else {
-      void disconnectAll(workspaceName);
       navigate("/");
     }
   }
@@ -249,6 +263,7 @@ export default function Screen2Layout() {
       workspace,
       refreshWorkspace,
       setHasUnsavedChanges,
+      setFocusMode,
       setInspectorContext: (value) => {
         setTrafficAvailable(value.trafficAvailable);
         setTrafficContext(value.trafficContext ?? null);
@@ -557,317 +572,329 @@ export default function Screen2Layout() {
 
   return (
     <div className="flex h-screen flex-col overflow-hidden bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100">
-      <header className="sticky top-0 z-30 border-b border-slate-200 bg-white/80 backdrop-blur-sm dark:border-slate-800 dark:bg-slate-900/80">
-        <div className="flex w-full items-center justify-between gap-3 px-4 py-2">
-          <div className="flex min-w-0 items-center gap-3">
-            <div className="flex min-w-0 items-center gap-1">
-              <img
-                className="h-10 w-10 dark:hidden"
-                src="/logo-dark.svg"
-                alt="INOWIO"
-                width={256}
-                height={256}
-              />
-              <img
-                className="hidden h-10 w-10 dark:block"
-                src="/logo.svg"
-                alt="INOWIO"
-                width={256}
-                height={256}
-              />
-              <div className="ml-1 md:ml-2">
-                <p className="text-xs uppercase font-semibold  dark:font-normal tracking-[0.45em] text-emerald-700 dark:text-emerald-400">
-                  <span className="brand-name">INOWIO</span>
-                </p>
-                <div className="truncate tracking-widest text-lg">Modbus Workbench</div>
+      {focusMode ? null : (
+        <header className="sticky top-0 z-30 border-b border-slate-200 bg-white/80 backdrop-blur-sm dark:border-slate-800 dark:bg-slate-900/80">
+          <div className="flex w-full items-center justify-between gap-3 px-4 py-2">
+            <div className="flex min-w-0 items-center gap-3">
+              <div className="flex min-w-0 items-center gap-1">
+                <img
+                  className="h-10 w-10 dark:hidden"
+                  src="/logo-dark.svg"
+                  alt="INOWIO"
+                  width={256}
+                  height={256}
+                />
+                <img
+                  className="hidden h-10 w-10 dark:block"
+                  src="/logo.svg"
+                  alt="INOWIO"
+                  width={256}
+                  height={256}
+                />
+                <div className="ml-1 md:ml-2">
+                  <p className="text-xs uppercase font-semibold  dark:font-normal tracking-[0.45em] text-emerald-700 dark:text-emerald-400">
+                    <span className="brand-name">INOWIO</span>
+                  </p>
+                  <div className="truncate tracking-widest text-lg">Modbus Workbench</div>
+                </div>
               </div>
             </div>
-          </div>
 
-          <div className="flex items-center gap-2">
-            <SimulatorStatusChip workspaceName={workspaceName} />
-            <ThemeToggleButton />
-            <button
-              type="button"
-              className="hidden items-center gap-2 rounded-full border border-slate-300 bg-slate-100 px-3 py-1.5 text-xs font-semibold text-slate-700 transition hover:border-emerald-500/60 hover:text-emerald-700 dark:border-slate-700 dark:bg-white/5 dark:text-slate-100 dark:hover:text-emerald-100 sm:inline-flex"
-              onClick={() => {
-                setLogViewerFullscreen(false);
-                setInspectorTab("logs");
-                setLogViewerOpen((prev) => {
-                  const next = !prev || inspectorTab !== "logs";
-                  void persistLogsPaneOpen(next);
-                  return next;
-                });
-              }}
-              title="Toggle logs"
-            >
-              <FiList className="h-3 w-3" aria-hidden="true" />
-              <span className="truncate">Logs</span>
-            </button>
-            {trafficAvailable ? (
+            <div className="flex items-center gap-2">
+              <SimulatorStatusChip workspaceName={workspaceName} />
+              <ThemeToggleButton />
               <button
                 type="button"
                 className="hidden items-center gap-2 rounded-full border border-slate-300 bg-slate-100 px-3 py-1.5 text-xs font-semibold text-slate-700 transition hover:border-emerald-500/60 hover:text-emerald-700 dark:border-slate-700 dark:bg-white/5 dark:text-slate-100 dark:hover:text-emerald-100 sm:inline-flex"
                 onClick={() => {
                   setLogViewerFullscreen(false);
-                  setInspectorTab("traffic");
+                  setInspectorTab("logs");
                   setLogViewerOpen((prev) => {
-                    const next = !prev || inspectorTab !== "traffic";
+                    const next = !prev || inspectorTab !== "logs";
                     void persistLogsPaneOpen(next);
                     return next;
                   });
                 }}
-                title="Traffic monitor"
+                title="Toggle logs"
               >
-                <FiActivity className="h-3 w-3" aria-hidden="true" />
-                <span className="truncate">Traffic Monitor</span>
+                <FiList className="h-3 w-3" aria-hidden="true" />
+                <span className="truncate">Logs</span>
               </button>
-            ) : null}
-            <button
-              type="button"
-              className="hidden items-center gap-2 rounded-full border border-slate-300 bg-slate-100 px-3 py-1.5 text-xs font-semibold text-slate-700 transition hover:border-emerald-500/60 hover:text-emerald-700 dark:border-slate-700 dark:bg-white/5 dark:text-slate-100 dark:hover:text-emerald-100 sm:inline-flex"
-              onClick={() => openHelp({ section: helpSectionForPath(location.pathname) })}
-              title="Open help"
-            >
-              <FiBookOpen className="h-3 w-3" aria-hidden="true" />
-              <span className="truncate">Help</span>
-            </button>
-            <button
-              type="button"
-              className="inline-flex h-10 w-10 items-center justify-center rounded-full border border-slate-300 bg-slate-100 text-slate-700 transition hover:border-slate-400 dark:border-slate-700 dark:bg-white/5 dark:text-slate-100 dark:hover:border-slate-600 lg:hidden"
-              onClick={() => setMenuOpen((v) => !v)}
-              aria-label="Toggle menu"
-              title="Menu"
-            >
-              <FiMenu className="h-4 w-4" aria-hidden="true" />
-            </button>
-          </div>
-        </div>
-      </header>
-
-      <div className="relative flex flex-1 overflow-hidden">
-        <aside
-          className={`fixed left-0 right-0 top-16 z-20 border-b border-slate-200 bg-white/80 p-4 backdrop-blur-sm transition-transform duration-150 lg:static lg:top-auto lg:z-auto ${sidebarWidthClass} lg:flex-none lg:translate-y-0 lg:border-b-0 lg:border-r lg:bg-white/60 lg:backdrop-blur-0 dark:border-slate-800 dark:bg-slate-900/80 dark:lg:bg-slate-900/50 ${menuOpen ? "translate-y-0" : "-translate-y-full"
-            }`}
-        >
-          <nav className="flex flex-col gap-2 mt-8 lg:mt-0">
-            <div className="mb-2 hidden justify-end lg:flex">
+              {trafficAvailable ? (
+                <button
+                  type="button"
+                  className="hidden items-center gap-2 rounded-full border border-slate-300 bg-slate-100 px-3 py-1.5 text-xs font-semibold text-slate-700 transition hover:border-emerald-500/60 hover:text-emerald-700 dark:border-slate-700 dark:bg-white/5 dark:text-slate-100 dark:hover:text-emerald-100 sm:inline-flex"
+                  onClick={() => {
+                    setLogViewerFullscreen(false);
+                    setInspectorTab("traffic");
+                    setLogViewerOpen((prev) => {
+                      const next = !prev || inspectorTab !== "traffic";
+                      void persistLogsPaneOpen(next);
+                      return next;
+                    });
+                  }}
+                  title="Traffic monitor"
+                >
+                  <FiActivity className="h-3 w-3" aria-hidden="true" />
+                  <span className="truncate">Traffic Monitor</span>
+                </button>
+              ) : null}
               <button
                 type="button"
-                className="inline-flex items-center justify-center rounded-full border border-slate-200 bg-slate-100 px-3 py-2 text-xs font-semibold text-slate-700 transition hover:border-slate-300 dark:border-slate-900 dark:bg-white/5 dark:text-slate-200 dark:hover:border-slate-700"
-                onClick={() => setSidebarCollapsed((v) => { const next = !v; writeSidebarCollapsed(next); return next; })}
-                title={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+                className="hidden items-center gap-2 rounded-full border border-slate-300 bg-slate-100 px-3 py-1.5 text-xs font-semibold text-slate-700 transition hover:border-emerald-500/60 hover:text-emerald-700 dark:border-slate-700 dark:bg-white/5 dark:text-slate-100 dark:hover:text-emerald-100 sm:inline-flex"
+                onClick={() => openHelp({ section: helpSectionForPath(location.pathname) })}
+                title="Open help"
               >
-                {sidebarCollapsed ? (
-                  <LuPanelLeftOpen className="h-4 w-4" aria-hidden="true" />
-                ) : (
-                  <LuPanelRightOpen className="h-4 w-4" aria-hidden="true" />
-                )}
+                <FiBookOpen className="h-3 w-3" aria-hidden="true" />
+                <span className="truncate">Help</span>
+              </button>
+              <button
+                type="button"
+                className="inline-flex h-10 w-10 items-center justify-center rounded-full border border-slate-300 bg-slate-100 text-slate-700 transition hover:border-slate-400 dark:border-slate-700 dark:bg-white/5 dark:text-slate-100 dark:hover:border-slate-600 lg:hidden"
+                onClick={() => setMenuOpen((v) => !v)}
+                aria-label="Toggle menu"
+                title="Menu"
+              >
+                <FiMenu className="h-4 w-4" aria-hidden="true" />
               </button>
             </div>
-            <div className="hidden border-t border-slate-200 pt-2 lg:block dark:border-slate-800" />
-            <NavLink
-              className={({ isActive }) =>
-                `flex items-center gap-3 rounded-2xl border px-3 py-2 text-sm font-semibold no-underline transition ${isActive
-                  ? "border-emerald-500/50 bg-emerald-500/10 text-emerald-800 dark:text-emerald-100"
-                  : "border-slate-200 bg-white text-slate-700 hover:border-slate-300 dark:border-slate-800 dark:bg-white/5 dark:text-slate-100 dark:hover:border-slate-700"
-                }`
-              }
-              title={`${sidebarCollapsed ? "Workspace" : ""}`}
-              to={`/app/${encodeURIComponent(workspaceName)}/workspace`}
-              onClick={(e) => {
-                e.preventDefault();
-                guardedNavigate(`/app/${encodeURIComponent(workspaceName)}/workspace`);
-              }}
-            >
-              <FiGrid className="h-4 w-4" aria-hidden="true" />
-              <span className={`truncate ${sidebarCollapsed ? "lg:hidden" : "inline"}`}>Workspace</span>
-            </NavLink>
+          </div>
+        </header>
+      )}
 
-            <NavLink
-              className={({ isActive }) =>
-                `flex items-center gap-3 rounded-2xl border px-3 py-2 text-sm font-semibold no-underline transition ${isActive
-                  ? "border-emerald-500/50 bg-emerald-500/10 text-emerald-800 dark:text-emerald-100"
-                  : "border-slate-200 bg-white text-slate-700 hover:border-slate-300 dark:border-slate-800 dark:bg-white/5 dark:text-slate-100 dark:hover:border-slate-700"
-                }`
-              }
-              to={`/app/${encodeURIComponent(workspaceName)}/connection`}
-              title={`${sidebarCollapsed ? "Connection" : ""}`}
-              onClick={(e) => {
-                e.preventDefault();
-                guardedNavigate(`/app/${encodeURIComponent(workspaceName)}/connection`);
-              }}
-            >
-              <FiLink className="h-4 w-4" aria-hidden="true" />
-              <span className={`truncate ${sidebarCollapsed ? "lg:hidden" : "inline"}`}>Connection</span>
-            </NavLink>
+      <div className="relative flex flex-1 overflow-hidden">
+        {focusMode ? null : (
+          <aside
+            className={`fixed left-0 right-0 top-16 z-20 border-b border-slate-200 bg-white/80 p-4 backdrop-blur-sm transition-transform duration-150 lg:static lg:top-auto lg:z-auto ${sidebarWidthClass} lg:flex-none lg:translate-y-0 lg:border-b-0 lg:border-r lg:bg-white/60 lg:backdrop-blur-0 dark:border-slate-800 dark:bg-slate-900/80 dark:lg:bg-slate-900/50 ${menuOpen ? "translate-y-0" : "-translate-y-full"
+              }`}
+          >
+            <nav className="flex flex-col gap-2 mt-8 lg:mt-0">
+              <div className="mb-2 hidden justify-end lg:flex">
+                <button
+                  type="button"
+                  className="inline-flex items-center justify-center rounded-full border border-slate-200 bg-slate-100 px-3 py-2 text-xs font-semibold text-slate-700 transition hover:border-slate-300 dark:border-slate-900 dark:bg-white/5 dark:text-slate-200 dark:hover:border-slate-700"
+                  onClick={() => setSidebarCollapsed((v) => { const next = !v; writeSidebarCollapsed(next); return next; })}
+                  title={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+                >
+                  {sidebarCollapsed ? (
+                    <LuPanelLeftOpen className="h-4 w-4" aria-hidden="true" />
+                  ) : (
+                    <LuPanelRightOpen className="h-4 w-4" aria-hidden="true" />
+                  )}
+                </button>
+              </div>
+              <div className="hidden border-t border-slate-200 pt-2 lg:block dark:border-slate-800" />
+              <NavLink
+                className={({ isActive }) =>
+                  `flex items-center gap-3 rounded-2xl border px-3 py-2 text-sm font-semibold no-underline transition ${isActive
+                    ? "border-emerald-500/50 bg-emerald-500/10 text-emerald-800 dark:text-emerald-100"
+                    : "border-slate-200 bg-white text-slate-700 hover:border-slate-300 dark:border-slate-800 dark:bg-white/5 dark:text-slate-100 dark:hover:border-slate-700"
+                  }`
+                }
+                title={`${sidebarCollapsed ? "Workspace" : ""}`}
+                to={`/app/${encodeURIComponent(workspaceName)}/workspace`}
+                onClick={(e) => {
+                  e.preventDefault();
+                  guardedNavigate(`/app/${encodeURIComponent(workspaceName)}/workspace`);
+                }}
+              >
+                <FiGrid className="h-4 w-4" aria-hidden="true" />
+                <span className={`truncate ${sidebarCollapsed ? "lg:hidden" : "inline"}`}>Workspace</span>
+              </NavLink>
 
-            <NavLink
-              className={({ isActive }) =>
-                `flex items-center gap-3 rounded-2xl border px-3 py-2 text-sm font-semibold no-underline transition ${isActive
-                  ? "border-emerald-500/50 bg-emerald-500/10 text-emerald-800 dark:text-emerald-100"
-                  : "border-slate-200 bg-white text-slate-700 hover:border-slate-300 dark:border-slate-800 dark:bg-white/5 dark:text-slate-100 dark:hover:border-slate-700"
-                }`
-              }
-              to={`/app/${encodeURIComponent(workspaceName)}/slaves`}
-              title={`${sidebarCollapsed ? "Slaves" : ""}`}
-              onClick={(e) => {
-                e.preventDefault();
-                guardedNavigate(`/app/${encodeURIComponent(workspaceName)}/slaves`);
-              }}
-            >
-              <PiNetwork className="h-4 w-4" aria-hidden="true" />
-              <span className={`truncate ${sidebarCollapsed ? "lg:hidden" : "inline"}`}>Slaves</span>
-            </NavLink>
+              <NavLink
+                className={({ isActive }) =>
+                  `flex items-center gap-3 rounded-2xl border px-3 py-2 text-sm font-semibold no-underline transition ${isActive
+                    ? "border-emerald-500/50 bg-emerald-500/10 text-emerald-800 dark:text-emerald-100"
+                    : "border-slate-200 bg-white text-slate-700 hover:border-slate-300 dark:border-slate-800 dark:bg-white/5 dark:text-slate-100 dark:hover:border-slate-700"
+                  }`
+                }
+                to={`/app/${encodeURIComponent(workspaceName)}/connection`}
+                title={`${sidebarCollapsed ? "Connection" : ""}`}
+                onClick={(e) => {
+                  e.preventDefault();
+                  guardedNavigate(`/app/${encodeURIComponent(workspaceName)}/connection`);
+                }}
+              >
+                <FiLink className="h-4 w-4" aria-hidden="true" />
+                <span className={`truncate ${sidebarCollapsed ? "lg:hidden" : "inline"}`}>Connection</span>
+              </NavLink>
 
-            <NavLink
-              className={({ isActive }) =>
-                `flex items-center gap-3 rounded-2xl border px-3 py-2 text-sm font-semibold no-underline transition ${isActive
-                  ? "border-emerald-500/50 bg-emerald-500/10 text-emerald-800 dark:text-emerald-100"
-                  : "border-slate-200 bg-white text-slate-700 hover:border-slate-300 dark:border-slate-800 dark:bg-white/5 dark:text-slate-100 dark:hover:border-slate-700"
-                }`
-              }
-              to={`/app/${encodeURIComponent(workspaceName)}/analyzer`}
-              title={`${sidebarCollapsed ? "Analyzer" : ""}`}
-              onClick={(e) => {
-                e.preventDefault();
-                guardedNavigate(`/app/${encodeURIComponent(workspaceName)}/analyzer`);
-              }}
-            >
-              <FiActivity className="h-4 w-4" aria-hidden="true" />
-              <span className={`truncate ${sidebarCollapsed ? "lg:hidden" : "inline"}`}>Analyzer</span>
-            </NavLink>
+              <NavLink
+                className={({ isActive }) =>
+                  `flex items-center gap-3 rounded-2xl border px-3 py-2 text-sm font-semibold no-underline transition ${isActive
+                    ? "border-emerald-500/50 bg-emerald-500/10 text-emerald-800 dark:text-emerald-100"
+                    : "border-slate-200 bg-white text-slate-700 hover:border-slate-300 dark:border-slate-800 dark:bg-white/5 dark:text-slate-100 dark:hover:border-slate-700"
+                  }`
+                }
+                to={`/app/${encodeURIComponent(workspaceName)}/slaves`}
+                title={`${sidebarCollapsed ? "Slaves" : ""}`}
+                onClick={(e) => {
+                  e.preventDefault();
+                  guardedNavigate(`/app/${encodeURIComponent(workspaceName)}/slaves`);
+                }}
+              >
+                <PiNetwork className="h-4 w-4" aria-hidden="true" />
+                <span className={`truncate ${sidebarCollapsed ? "lg:hidden" : "inline"}`}>Slaves</span>
+              </NavLink>
 
-            <NavLink
-              className={({ isActive }) =>
-                `flex items-center gap-3 rounded-2xl border px-3 py-2 text-sm font-semibold no-underline transition ${isActive
-                  ? "border-emerald-500/50 bg-emerald-500/10 text-emerald-800 dark:text-emerald-100"
-                  : "border-slate-200 bg-white text-slate-700 hover:border-slate-300 dark:border-slate-800 dark:bg-white/5 dark:text-slate-100 dark:hover:border-slate-700"
-                }`
-              }
-              to={`/app/${encodeURIComponent(workspaceName)}/tcp-simulator`}
-              title={`${sidebarCollapsed ? "TCP Simulator" : ""}`}
-              onClick={(e) => {
-                e.preventDefault();
-                guardedNavigate(`/app/${encodeURIComponent(workspaceName)}/tcp-simulator`);
-              }}
-            >
-              <FiServer className="h-4 w-4" aria-hidden="true" />
-              <span className={`truncate ${sidebarCollapsed ? "lg:hidden" : "inline"}`}>TCP Simulator</span>
-            </NavLink>
+              <NavLink
+                className={({ isActive }) =>
+                  `flex items-center gap-3 rounded-2xl border px-3 py-2 text-sm font-semibold no-underline transition ${isActive
+                    ? "border-emerald-500/50 bg-emerald-500/10 text-emerald-800 dark:text-emerald-100"
+                    : "border-slate-200 bg-white text-slate-700 hover:border-slate-300 dark:border-slate-800 dark:bg-white/5 dark:text-slate-100 dark:hover:border-slate-700"
+                  }`
+                }
+                to={`/app/${encodeURIComponent(workspaceName)}/analyzer`}
+                title={`${sidebarCollapsed ? "Analyzer" : ""}`}
+                onClick={(e) => {
+                  e.preventDefault();
+                  guardedNavigate(`/app/${encodeURIComponent(workspaceName)}/analyzer`);
+                }}
+              >
+                <FiActivity className="h-4 w-4" aria-hidden="true" />
+                <span className={`truncate ${sidebarCollapsed ? "lg:hidden" : "inline"}`}>Analyzer</span>
+              </NavLink>
 
-            <NavLink
-              className={({ isActive }) =>
-                `flex items-center gap-3 rounded-2xl border px-3 py-2 text-sm font-semibold no-underline transition ${isActive
-                  ? "border-emerald-500/50 bg-emerald-500/10 text-emerald-800 dark:text-emerald-100"
-                  : "border-slate-200 bg-white text-slate-700 hover:border-slate-300 dark:border-slate-800 dark:bg-white/5 dark:text-slate-100 dark:hover:border-slate-700"
-                }`
-              }
-              to={`/app/${encodeURIComponent(workspaceName)}/client`}
-              title={`${sidebarCollapsed ? "Settings" : ""}`}
-              onClick={(e) => {
-                e.preventDefault();
-                guardedNavigate(`/app/${encodeURIComponent(workspaceName)}/client`);
-              }}
-            >
-              <LuSettings className="h-4 w-4" aria-hidden="true" />
-              <span className={`truncate ${sidebarCollapsed ? "lg:hidden" : "inline"}`}>Settings</span>
-            </NavLink>
-            <button
-              type="button"
-              className="flex items-center gap-3 rounded-2xl border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-700 transition hover:border-slate-300 lg:hidden dark:border-slate-800 dark:bg-white/5 dark:text-slate-100 dark:hover:border-slate-700"
-              onClick={() => {
-                setMenuOpen(false);
-                setLogViewerFullscreen(false);
-                setInspectorTab("logs");
-                setLogViewerOpen((prev) => {
-                  const next = !prev || inspectorTab !== "logs";
-                  void persistLogsPaneOpen(next);
-                  return next;
-                });
-              }}
-              title="Toggle logs"
-            >
-              <FiList className="h-4 w-4" aria-hidden="true" />
-              Logs
-            </button>
-            {trafficAvailable ? (
+              <NavLink
+                className={({ isActive }) =>
+                  `flex items-center gap-3 rounded-2xl border px-3 py-2 text-sm font-semibold no-underline transition ${isActive
+                    ? "border-emerald-500/50 bg-emerald-500/10 text-emerald-800 dark:text-emerald-100"
+                    : "border-slate-200 bg-white text-slate-700 hover:border-slate-300 dark:border-slate-800 dark:bg-white/5 dark:text-slate-100 dark:hover:border-slate-700"
+                  }`
+                }
+                to={`/app/${encodeURIComponent(workspaceName)}/tcp-simulator`}
+                title={`${sidebarCollapsed ? "TCP Simulator" : ""}`}
+                onClick={(e) => {
+                  e.preventDefault();
+                  guardedNavigate(`/app/${encodeURIComponent(workspaceName)}/tcp-simulator`);
+                }}
+              >
+                <FiServer className="h-4 w-4" aria-hidden="true" />
+                <span className={`truncate ${sidebarCollapsed ? "lg:hidden" : "inline"}`}>TCP Simulator</span>
+              </NavLink>
+
+              <NavLink
+                className={({ isActive }) =>
+                  `flex items-center gap-3 rounded-2xl border px-3 py-2 text-sm font-semibold no-underline transition ${isActive
+                    ? "border-emerald-500/50 bg-emerald-500/10 text-emerald-800 dark:text-emerald-100"
+                    : "border-slate-200 bg-white text-slate-700 hover:border-slate-300 dark:border-slate-800 dark:bg-white/5 dark:text-slate-100 dark:hover:border-slate-700"
+                  }`
+                }
+                to={`/app/${encodeURIComponent(workspaceName)}/client`}
+                title={`${sidebarCollapsed ? "Settings" : ""}`}
+                onClick={(e) => {
+                  e.preventDefault();
+                  guardedNavigate(`/app/${encodeURIComponent(workspaceName)}/client`);
+                }}
+              >
+                <LuSettings className="h-4 w-4" aria-hidden="true" />
+                <span className={`truncate ${sidebarCollapsed ? "lg:hidden" : "inline"}`}>Settings</span>
+              </NavLink>
               <button
                 type="button"
                 className="flex items-center gap-3 rounded-2xl border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-700 transition hover:border-slate-300 lg:hidden dark:border-slate-800 dark:bg-white/5 dark:text-slate-100 dark:hover:border-slate-700"
                 onClick={() => {
                   setMenuOpen(false);
                   setLogViewerFullscreen(false);
-                  setInspectorTab("traffic");
-                  setLogViewerOpen(true);
-                  void persistLogsPaneOpen(true);
+                  setInspectorTab("logs");
+                  setLogViewerOpen((prev) => {
+                    const next = !prev || inspectorTab !== "logs";
+                    void persistLogsPaneOpen(next);
+                    return next;
+                  });
                 }}
-                title="Traffic monitor"
+                title="Toggle logs"
               >
-                <FiActivity className="h-4 w-4" aria-hidden="true" />
-                Traffic Monitor
+                <FiList className="h-4 w-4" aria-hidden="true" />
+                Logs
               </button>
-            ) : null}
-            <NavLink
-              className={({ isActive }) =>
-                `flex items-center gap-3 rounded-2xl border px-3 py-2 text-sm font-semibold no-underline transition ${isActive
-                  ? "border-emerald-500/50 bg-emerald-500/10 text-emerald-800 dark:text-emerald-100"
-                  : "border-slate-200 bg-white text-slate-700 hover:border-slate-300 dark:border-slate-800 dark:bg-white/5 dark:text-slate-100 dark:hover:border-slate-700"
-                }`
-              }
-              to={`/app/${encodeURIComponent(workspaceName)}/about`}
-              title={`${sidebarCollapsed ? "About" : ""}`}
-              onClick={(e) => {
-                e.preventDefault();
-                guardedNavigate(`/app/${encodeURIComponent(workspaceName)}/about`);
-              }}
-            >
-              <FiInfo className="h-4 w-4" aria-hidden="true" />
-              <span className={`truncate ${sidebarCollapsed ? "lg:hidden" : "inline"}`}>About</span>
-            </NavLink>
-            <div className="mt-2 hidden border-t border-slate-200 pt-2 lg:block dark:border-slate-800" />
-            <button
-              type="button"
-              className="hidden items-center gap-3 rounded-2xl border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-700 transition hover:border-slate-300 lg:flex dark:border-slate-800 dark:bg-white/5 dark:text-slate-100 dark:hover:border-slate-700"
-              onClick={() => {
-                requestExitWorkspace();
-              }}
-              title={`${sidebarCollapsed ? "Exit Workspace" : ""}`}
-            >
-              <FiX className="h-4 w-4" aria-hidden="true" />
-              <span className={`truncate ${sidebarCollapsed ? "lg:hidden" : "inline"}`}>Exit Workspace</span>
-            </button>
+              {trafficAvailable ? (
+                <button
+                  type="button"
+                  className="flex items-center gap-3 rounded-2xl border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-700 transition hover:border-slate-300 lg:hidden dark:border-slate-800 dark:bg-white/5 dark:text-slate-100 dark:hover:border-slate-700"
+                  onClick={() => {
+                    setMenuOpen(false);
+                    setLogViewerFullscreen(false);
+                    setInspectorTab("traffic");
+                    setLogViewerOpen(true);
+                    void persistLogsPaneOpen(true);
+                  }}
+                  title="Traffic monitor"
+                >
+                  <FiActivity className="h-4 w-4" aria-hidden="true" />
+                  Traffic Monitor
+                </button>
+              ) : null}
+              <NavLink
+                className={({ isActive }) =>
+                  `flex items-center gap-3 rounded-2xl border px-3 py-2 text-sm font-semibold no-underline transition ${isActive
+                    ? "border-emerald-500/50 bg-emerald-500/10 text-emerald-800 dark:text-emerald-100"
+                    : "border-slate-200 bg-white text-slate-700 hover:border-slate-300 dark:border-slate-800 dark:bg-white/5 dark:text-slate-100 dark:hover:border-slate-700"
+                  }`
+                }
+                to={`/app/${encodeURIComponent(workspaceName)}/about`}
+                title={`${sidebarCollapsed ? "About" : ""}`}
+                onClick={(e) => {
+                  e.preventDefault();
+                  guardedNavigate(`/app/${encodeURIComponent(workspaceName)}/about`);
+                }}
+              >
+                <FiInfo className="h-4 w-4" aria-hidden="true" />
+                <span className={`truncate ${sidebarCollapsed ? "lg:hidden" : "inline"}`}>About</span>
+              </NavLink>
+              <div className="mt-2 hidden border-t border-slate-200 pt-2 lg:block dark:border-slate-800" />
+              <button
+                type="button"
+                className="hidden items-center gap-3 rounded-2xl border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-700 transition hover:border-slate-300 lg:flex dark:border-slate-800 dark:bg-white/5 dark:text-slate-100 dark:hover:border-slate-700"
+                onClick={() => {
+                  requestExitWorkspace();
+                }}
+                title={`${sidebarCollapsed ? "Exit Workspace" : ""}`}
+              >
+                <FiX className="h-4 w-4" aria-hidden="true" />
+                <span className={`truncate ${sidebarCollapsed ? "lg:hidden" : "inline"}`}>Exit Workspace</span>
+              </button>
 
-            <div className="mt-2 border-t border-slate-200 pt-2 lg:hidden dark:border-slate-800" />
+              <div className="mt-2 border-t border-slate-200 pt-2 lg:hidden dark:border-slate-800" />
 
-            <button
-              type="button"
-              className="flex items-center gap-3 rounded-2xl border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-700 transition hover:border-slate-300 lg:hidden dark:border-slate-800 dark:bg-white/5 dark:text-slate-100 dark:hover:border-slate-700"
-              onClick={() => {
-                setMenuOpen(false);
-                openHelp({ section: helpSectionForPath(location.pathname) });
-              }}
-              title="Open help"
-            >
-              <FiBookOpen className="h-4 w-4" aria-hidden="true" />
-              Help
-            </button>
-            <button
-              type="button"
-              className="flex items-center gap-3 rounded-2xl border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-700 transition hover:border-slate-300 lg:hidden dark:border-slate-800 dark:bg-white/5 dark:text-slate-100 dark:hover:border-slate-700"
-              onClick={() => {
-                requestExitWorkspace();
-              }}
-              title="Close workspace"
-            >
-              <FiX className="h-4 w-4" aria-hidden="true" />
-              Exit Workspace
-            </button>
-          </nav>
-        </aside>
+              <button
+                type="button"
+                className="flex items-center gap-3 rounded-2xl border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-700 transition hover:border-slate-300 lg:hidden dark:border-slate-800 dark:bg-white/5 dark:text-slate-100 dark:hover:border-slate-700"
+                onClick={() => {
+                  setMenuOpen(false);
+                  openHelp({ section: helpSectionForPath(location.pathname) });
+                }}
+                title="Open help"
+              >
+                <FiBookOpen className="h-4 w-4" aria-hidden="true" />
+                Help
+              </button>
+              <button
+                type="button"
+                className="flex items-center gap-3 rounded-2xl border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-700 transition hover:border-slate-300 lg:hidden dark:border-slate-800 dark:bg-white/5 dark:text-slate-100 dark:hover:border-slate-700"
+                onClick={() => {
+                  requestExitWorkspace();
+                }}
+                title="Close workspace"
+              >
+                <FiX className="h-4 w-4" aria-hidden="true" />
+                Exit Workspace
+              </button>
+            </nav>
+          </aside>
+        )}
 
         <div className="flex min-w-0 w-full flex-1 flex-col">
-          <main className={logViewerOpen && logViewerFullscreen ? "hidden" : "min-w-0 w-full flex-1 overflow-y-auto py-4 sm:px-4"}>
+          <main
+            className={
+              focusMode
+                ? "min-w-0 w-full flex-1 overflow-y-auto"
+                : logViewerOpen && logViewerFullscreen
+                  ? "hidden"
+                  : "min-w-0 w-full flex-1 overflow-y-auto py-4 sm:px-4"
+            }
+          >
             {error ? (
               <div className="max-w-5xl rounded-xl border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-200">
                 {error}
@@ -881,7 +908,7 @@ export default function Screen2Layout() {
             {workspace && ctx ? <Outlet context={ctx} /> : null}
           </main>
 
-          {logViewerOpen ? (
+          {logViewerOpen && !focusMode ? (
             <div className="bg-slate-50/95 dark:bg-slate-950/95">
               <div
                 className="flex flex-col border border-slate-200 bg-white p-2 shadow-2xl dark:border-slate-800 dark:bg-slate-900"
@@ -1011,7 +1038,6 @@ export default function Screen2Layout() {
                   const exit = pendingExit;
                   dismissNavGuard();
                   if (exit) {
-                    void disconnectAll(workspaceName);
                     navigate("/");
                   } else if (target) {
                     navigate(target);

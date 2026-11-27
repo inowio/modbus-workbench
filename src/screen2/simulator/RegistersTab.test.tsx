@@ -1,7 +1,17 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import { createLiveStore, type SnapshotRow } from "./liveValues";
 import RegistersTab from "./RegistersTab";
+
+const liveOf = (rows: SnapshotRow[]) => {
+  const s = createLiveStore();
+  s.apply({ full: true, rows });
+  return s;
+};
+const wordRow = (address: number, valueWord: number, o: Partial<SnapshotRow> = {}): SnapshotRow => ({
+  unitId: 1, functionCode: 3, address, valueWord, valueBit: null, ...o,
+});
 
 const reg = (o: any = {}) => ({
   id: 1,
@@ -25,7 +35,7 @@ const base = () => ({
   registers: [reg(), reg({ id: 2, unitId: 2, alias: "Volt", valueSource: "device" })],
   devices: [],
   status: { running: false, listen: null, clientCount: 0 },
-  snapshotFor: () => undefined,
+  live: createLiveStore(),
   addrFmt: "dec" as const,
   onAddrFmt: vi.fn(),
   onSelectRegister: vi.fn(),
@@ -37,6 +47,55 @@ const base = () => ({
 beforeEach(() => localStorage.clear());
 
 describe("RegistersTab", () => {
+  it("rows are focusable, selectable with Enter/Space, and flag the selected one (S6)", () => {
+    const onSelectRegister = vi.fn();
+    render(<RegistersTab {...base()} selectedId={2} onSelectRegister={onSelectRegister} />);
+    const rows = screen.getAllByRole("row").slice(1);
+    expect(rows[0]).toHaveAttribute("tabindex", "0");
+    expect(rows[0]).not.toHaveAttribute("aria-current");
+    expect(rows[1]).toHaveAttribute("aria-current", "true");
+    expect(rows[1]).not.toHaveAttribute("aria-selected");
+    expect(rows[1].className).toMatch(/bg-emerald/);
+    fireEvent.keyDown(rows[0], { key: "Enter" });
+    fireEvent.keyDown(rows[0], { key: " " });
+    expect(onSelectRegister).toHaveBeenCalledTimes(2);
+    expect(onSelectRegister).toHaveBeenCalledWith(expect.objectContaining({ id: 1 }));
+  });
+
+  it("ignores Enter on the row's own Delete button (S6)", () => {
+    const onSelectRegister = vi.fn();
+    render(<RegistersTab {...base()} onSelectRegister={onSelectRegister} />);
+    fireEvent.keyDown(screen.getByRole("button", { name: /delete register temp/i }), { key: "Enter" });
+    expect(onSelectRegister).not.toHaveBeenCalled();
+  });
+
+  it("shows a muted source summary in the Value column while stopped (S7)", () => {
+    const regs = [
+      reg({ id: 1, holdValue: 7 }),
+      reg({ id: 2, alias: "G", valueSource: "generator", sourceParams: JSON.stringify({ kind: "sine", min: 0, max: 100 }) }),
+      reg({ id: 3, alias: "D", valueSource: "device", sourceParams: JSON.stringify({ preset: "temperature" }) }),
+      reg({ id: 4, alias: "R", valueSource: "route", sourceParams: JSON.stringify({ slaveUnitId: 3, functionCode: 3, address: 257 }) }),
+    ];
+    render(<RegistersTab {...base()} registers={regs} addrFmt="hex" />);
+    expect(screen.getByText("hold 7")).toBeInTheDocument();
+    expect(screen.getByText("sine 0–100")).toBeInTheDocument();
+    expect(screen.getByText("preset temperature")).toBeInTheDocument();
+    expect(screen.getByText("route → unit 3 holding 0x0101")).toBeInTheDocument();
+  });
+
+  it("replaces the summary with the live value while running (S7)", () => {
+    render(
+      <RegistersTab
+        {...base()}
+        registers={[reg({ holdValue: 7 })]}
+        status={{ running: true, listen: null, clientCount: 0 }}
+        live={liveOf([wordRow(5, 42)])}
+      />,
+    );
+    expect(screen.getByText("42")).toBeInTheDocument();
+    expect(screen.queryByText("hold 7")).toBeNull();
+  });
+
   it("renders all rows then filters by search", () => {
     render(<RegistersTab {...base()} />);
     expect(screen.getAllByRole("row").length).toBeGreaterThan(2);
@@ -108,5 +167,61 @@ describe("RegistersTab", () => {
     expect(screen.getByLabelText(/toggle unit column/i)).toBeInTheDocument();
     fireEvent.mouseDown(document.body);
     expect(screen.queryByLabelText(/toggle unit column/i)).not.toBeInTheDocument();
+  });
+
+  it("shows scaled engineering values while running and in the stopped summary", () => {
+    const scaled = reg({ dataType: "u16", unit: "°C", scale: 0.1, holdValue: 235 });
+    const { unmount } = render(
+      <RegistersTab
+        {...base()}
+        registers={[scaled]}
+        status={{ running: true, listen: null, clientCount: 0 }}
+        live={liveOf([wordRow(5, 235)])}
+      />,
+    );
+    expect(screen.getByText("23.5 °C")).toBeInTheDocument();
+    unmount();
+    const gen = reg({ id: 2, alias: "G", unit: "°C", scale: 0.1, valueSource: "generator", sourceParams: JSON.stringify({ kind: "sine", min: 20, max: 30 }) });
+    render(<RegistersTab {...base()} registers={[scaled, gen]} />);
+    expect(screen.getByText("hold 23.5 °C")).toBeInTheDocument();
+    expect(screen.getByText("sine 20–30 °C")).toBeInTheDocument();
+  });
+
+  it("decodes a two-word f32 live value", () => {
+    const f = reg({ dataType: "f32", address: 10 });
+    const words: Record<number, number> = { 10: 0x420e, 11: 0 };
+    render(
+      <RegistersTab
+        {...base()}
+        registers={[f]}
+        status={{ running: true, listen: null, clientCount: 0 }}
+        live={liveOf(Object.entries(words).map(([a, w]) => wordRow(Number(a), w)))}
+      />,
+    );
+    expect(screen.getByText("35.5")).toBeInTheDocument();
+  });
+
+  it("shows the scaled value and the stale badge from the store", () => {
+    render(
+      <RegistersTab
+        {...base()}
+        registers={[reg({ unit: "°C", scale: 0.1 })]}
+        status={{ running: true, listen: null, clientCount: 0 }}
+        live={liveOf([wordRow(5, 235, { sourceStatus: "stale" })])}
+      />,
+    );
+    expect(screen.getByText("23.5 °C")).toBeInTheDocument();
+    expect(screen.getByText("stale")).toBeInTheDocument();
+  });
+
+  it("shows the device name from the devices list", () => {
+    render(
+      <RegistersTab
+        {...base()}
+        registers={[reg({ deviceInstanceId: 3 })]}
+        devices={[{ id: 3, templateKey: "t", name: "Roof Sensor", unitId: 1, baseAddress: 0, sortOrder: 0 }]}
+      />,
+    );
+    expect(screen.getByText("Roof Sensor")).toBeInTheDocument();
   });
 });

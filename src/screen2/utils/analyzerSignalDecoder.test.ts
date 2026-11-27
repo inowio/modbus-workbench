@@ -20,6 +20,13 @@ describe("analyzerSignalDecoder", () => {
     expect(cfg).toEqual({ bit: 2, scale: 2.5, offset: 1, decimals: 2, unit: "V" });
   });
 
+  it("parses show and math from decoder JSON", () => {
+    const cfg = parseAnalyzerDecoderConfig('{"show":"y","math":{"version":1,"inputs":[],"variables":[]}}');
+    expect(cfg.show).toBe("y");
+    expect(cfg.math).toEqual({ version: 1, inputs: [], variables: [] });
+    expect(parseAnalyzerDecoderConfig('{"math":{"version":2}}').math).toBeUndefined();
+  });
+
   it("returns formatted errors for non-ok states", () => {
     const res = decodeAnalyzerSignal({
       state: "DISCONNECTED",

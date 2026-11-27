@@ -1,7 +1,14 @@
-import { render, screen } from "@testing-library/react";
-import { describe, it, expect } from "vitest";
+import { fireEvent, render, screen } from "@testing-library/react";
+import { describe, it, expect, vi } from "vitest";
 
+import { createLiveStore, type SnapshotRow } from "./liveValues";
 import LiveValuesTab from "./LiveValuesTab";
+
+const liveOf = (rows: SnapshotRow[] = []) => {
+  const s = createLiveStore();
+  s.apply({ full: true, rows });
+  return s;
+};
 
 const reg = (o: any = {}) => ({
   id: 1,
@@ -25,18 +32,32 @@ describe("LiveValuesTab", () => {
     render(
       <LiveValuesTab
         registers={[]}
-        snapshotFor={() => undefined}
+        live={liveOf()}
         status={{ running: false, listen: null, clientCount: 0 }}
       />
     );
     expect(screen.getByText(/start the server/i)).toBeInTheDocument();
   });
 
+  it("offers a Start button when stopped (S8)", () => {
+    const onStart = vi.fn();
+    render(
+      <LiveValuesTab
+        registers={[]}
+        live={liveOf()}
+        status={{ running: false, listen: null, clientCount: 0 }}
+        onStart={onStart}
+      />
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Start" }));
+    expect(onStart).toHaveBeenCalled();
+  });
+
   it("renders a row per register with live word value when running", () => {
     render(
       <LiveValuesTab
         registers={[reg()]}
-        snapshotFor={() => ({ unitId: 1, functionCode: 3, address: 5, valueWord: 42, valueBit: null, sourceStatus: "ok" })}
+        live={liveOf([{ unitId: 1, functionCode: 3, address: 5, valueWord: 42, valueBit: null, sourceStatus: "ok" }])}
         status={{ running: true, listen: { bound: "0.0.0.0", port: 502, addresses: ["127.0.0.1:502"] }, clientCount: 1 }}
       />
     );
@@ -49,14 +70,33 @@ describe("LiveValuesTab", () => {
     render(
       <LiveValuesTab
         registers={[reg({ id: 2, alias: "Coil", functionCode: 1 }), reg({ id: 3, alias: "NoData", address: 9 })]}
-        snapshotFor={(u, fc, a) =>
-          fc === 1 ? { unitId: u, functionCode: fc, address: a, valueWord: null, valueBit: true, sourceStatus: "stale" } : undefined
-        }
+        live={liveOf([{ unitId: 1, functionCode: 1, address: 5, valueWord: null, valueBit: true, sourceStatus: "stale" }])}
         status={{ running: true, listen: null, clientCount: 0 }}
       />
     );
     expect(screen.getByText("ON")).toBeInTheDocument();
     expect(screen.getByText(/stale/i)).toBeInTheDocument();
     expect(screen.getByText("NoData")).toBeInTheDocument();
+  });
+
+  it("shows addresses in hex and searches hex when the Hex toggle is on (F10)", () => {
+    const running = { running: true, listen: null, clientCount: 0 };
+    const regs = [reg({ id: 1, address: 257, alias: "A" }), reg({ id: 2, address: 5, alias: "B" })];
+    render(<LiveValuesTab registers={regs} live={liveOf()} status={running} addrFmt="hex" />);
+    expect(screen.getByText("0x0101")).toBeInTheDocument();
+    fireEvent.change(screen.getByPlaceholderText(/search/i), { target: { value: "0x101" } });
+    expect(screen.getByText("A")).toBeInTheDocument();
+    expect(screen.queryByText("B")).toBeNull();
+  });
+
+  it("shows the scaled value with its unit", () => {
+    render(
+      <LiveValuesTab
+        registers={[reg({ unit: "°C", scale: 0.1 })]}
+        live={liveOf([{ unitId: 1, functionCode: 3, address: 5, valueWord: 235, valueBit: null }])}
+        status={{ running: true, listen: null, clientCount: 0 }}
+      />
+    );
+    expect(screen.getByText("23.5 °C")).toBeInTheDocument();
   });
 });

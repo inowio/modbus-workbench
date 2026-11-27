@@ -108,6 +108,9 @@ pub struct SlaveCreate {
     pub poll_interval_ms: Option<i64>,
     #[serde(default)]
     pub address_offset: Option<i64>,
+    /// "serial" (the default) or "tcp".
+    #[serde(default)]
+    pub connection_kind: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -198,6 +201,7 @@ pub struct AnalyzerTile {
     pub polling_enabled: bool,
     pub created_at: String,
     pub updated_at: String,
+    pub tab_id: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -242,6 +246,8 @@ pub struct AnalyzerTileCreate {
     pub layouts: Vec<AnalyzerTileLayoutUpsert>,
     #[serde(default)]
     pub signal_links: Vec<AnalyzerTileSignalLink>,
+    #[serde(default)]
+    pub tab_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -264,6 +270,7 @@ pub struct AnalyzerTileSignalInfo {
     pub tile_id: i64,
     pub signal_id: String,
     pub role: String,
+    pub kind: String,
     pub function_code: i64,
     pub address: i64,
     pub alias: String,
@@ -281,12 +288,20 @@ pub struct AnalyzerTileSignalInfo {
 #[serde(rename_all = "camelCase")]
 pub struct AnalyzerSignal {
     pub id: String,
-    pub slave_id: i64,
+    pub kind: String,
+    pub slave_id: Option<i64>,
     pub connection_kind: String,
     pub function_kind: String,
-    pub register_row_id: i64,
-    pub address: i64,
+    pub register_row_id: Option<i64>,
+    pub address: Option<i64>,
+    pub function_code: Option<i64>,
+    pub alias: Option<String>,
+    pub data_type: Option<String>,
+    pub order: Option<String>,
+    pub display_format: Option<String>,
     pub decoder_json: String,
+    #[serde(default)]
+    pub input_signal_ids: Vec<String>,
     #[serde(default)]
     pub last_value_json: Option<String>,
     #[serde(default)]
@@ -296,13 +311,22 @@ pub struct AnalyzerSignal {
     pub error_json: Option<String>,
 }
 
+fn default_signal_kind() -> String {
+    "register".to_string()
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AnalyzerSignalUpsert {
     pub id: String,
-    pub slave_id: i64,
+    #[serde(default = "default_signal_kind")]
+    pub kind: String,
+    #[serde(default)]
+    pub slave_id: Option<i64>,
+    #[serde(default)]
     pub function_kind: String,
-    pub register_row_id: i64,
+    #[serde(default)]
+    pub register_row_id: Option<i64>,
     #[serde(default)]
     pub decoder_json: String,
 }
@@ -346,6 +370,15 @@ pub struct SimRegister {
     pub unit: Option<String>,
     #[serde(default)]
     pub display_format: Option<String>,
+    /// Engineering scale (eng = raw * scale + offset); `None` = 1.
+    #[serde(default)]
+    pub scale: Option<f64>,
+    /// Engineering offset; `None` = 0.
+    #[serde(default)]
+    pub scale_offset: Option<f64>,
+    /// Display decimals; `None` = auto.
+    #[serde(default)]
+    pub decimals: Option<i64>,
 }
 
 fn default_u16_type() -> String { "u16".to_string() }

@@ -5,16 +5,17 @@ import type { HelpSectionDefinition } from "../types";
 const settingsSection: HelpSectionDefinition = {
   slug: "settings",
   title: "Settings",
-  description: "Workspace-level timeouts, retries, logging, and cleanup to keep communications reliable.",
-  keywords: ["settings", "timeouts", "logging", "retries", "retention", "workspace"],
+  description: "Workspace-level timeouts, retries, logging, and cleanup to keep communications reliable, plus the app-wide register address format.",
+  keywords: ["settings", "timeouts", "logging", "retries", "retention", "workspace", "display", "register addresses", "hex", "decimal"],
   searchText:
-    "Settings covers logging levels, delete-log ranges, response/connect timeouts, retry attempts/delay, save behavior, practical configurations, best practices, and scope limitations.",
+    "Settings covers logging levels, delete-log ranges, response/connect timeouts, retry attempts/delay, the app-wide Display setting for register addresses (Dec / Hex), save behavior, practical configurations, best practices, and scope limitations.",
   anchors: [
     { id: "overview", label: "What is Settings?" },
     { id: "logging", label: "Logging" },
     { id: "delete-logs", label: "Delete logs" },
     { id: "timing", label: "Timing" },
     { id: "retry", label: "Retry" },
+    { id: "display", label: "Display" },
     { id: "save", label: "Save" },
     { id: "examples", label: "Examples" },
     { id: "best", label: "Best practices" },
@@ -27,6 +28,7 @@ const settingsSection: HelpSectionDefinition = {
         <p>
           The Settings screen tunes logging verbosity, communication timing, retry strategy, and log retention for the <strong>active workspace only</strong>.
           It doesn’t touch register maps or dashboards, but it directly impacts stability, performance, and diagnostics.
+          The one exception is <strong>Display</strong>, which applies to every workspace on this machine.
         </p>
       </SectionBlock>
       <SectionBlock section="settings" anchor="logging" title="Logging">
@@ -56,6 +58,17 @@ const settingsSection: HelpSectionDefinition = {
           <strong>Retries</strong> sets how many additional attempts follow a failure (e.g., 3 = initial + 3 retries). Higher counts improve resilience; lower counts keep the bus lean.</p>
         <p>
           <strong>Retry Delay (ms)</strong> inserts a pause between attempts to avoid re-flooding the bus. Example: 200 ms prevents hammering slow devices.</p>
+      </SectionBlock>
+      <SectionBlock section="settings" anchor="display" title="Display">
+        <p>
+          <strong>Register addresses</strong> chooses whether register addresses are written in decimal (<strong>Dec</strong>, e.g. <code>40</code>) or hexadecimal (<strong>Hex</strong>, e.g. <code>0x0028</code>).
+          The Analyzer and the TCP Simulator both follow it.
+        </p>
+        <ul className="list-disc space-y-1 pl-5">
+          <li>It is <strong>app-wide</strong>: it applies to all workspaces on this machine, not just the active one.</li>
+          <li>It takes effect as soon as you pick it and is remembered; it doesn’t need the Save button.</li>
+          <li>It only changes how addresses are written, never register values.</li>
+        </ul>
       </SectionBlock>
       <SectionBlock section="settings" anchor="save" title="Saving changes">
         <p>
@@ -98,7 +111,7 @@ const settingsSection: HelpSectionDefinition = {
         <ul className="list-disc space-y-1 pl-5">
           <li>No effect on Modbus register definitions.</li>
           <li>Doesn’t alter Analyzer layouts or signal decoding.</li>
-          <li>Changes aren’t global—every workspace keeps its own profile.</li>
+          <li>Apart from Display, changes aren’t global—every workspace keeps its own profile.</li>
         </ul>
       </SectionBlock>
       <SectionBlock section="settings" anchor="summary" title="Summary">

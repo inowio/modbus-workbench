@@ -2,8 +2,9 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen as tauriListen, type UnlistenFn } from "@tauri-apps/api/event";
 import { useCallback, useEffect, useState } from "react";
 
+import { createLiveStore, type SimValuesEvent } from "./liveValues";
 import type { DeviceTemplate } from "../components/AddDeviceModal";
-import type { SimRegister } from "../components/SimRegisterModal";
+import type { SimRegister } from "./simRegister";
 import type { SimRule } from "../components/SimRuleModal";
 
 export type SimConfig = { enabled: boolean; host: string; port: number; tickMs: number };
@@ -17,7 +18,7 @@ export type SimStatus = {
   startedAtMs?: number | null;
   clients?: ClientInfo[];
 };
-export type SnapshotRow = { unitId: number; functionCode: number; address: number; valueWord: number | null; valueBit: boolean | null; sourceStatus?: string | null };
+export type { SnapshotRow } from "./liveValues";
 export type SimDevice = { id: number; templateKey: string; name: string; unitId: number; baseAddress: number; sortOrder: number };
 export type PageRegister = SimRegister & { deviceInstanceId?: number | null };
 
@@ -43,7 +44,7 @@ export function useSimulatorData(ws: string) {
   const [rules, setRules] = useState<SimRule[]>([]);
   const [status, setStatus] = useState<SimStatus>({ running: false, listen: null, clientCount: 0 });
   const [listen, setListen] = useState<ListenInfo | null>(null);
-  const [snapshot, setSnapshot] = useState<SnapshotRow[]>([]);
+  const [live] = useState(() => createLiveStore());
   const [events, setEvents] = useState<SimEvent[]>([]);
   const [deviceTemplates, setDeviceTemplates] = useState<DeviceTemplate[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -81,7 +82,7 @@ export function useSimulatorData(ws: string) {
   // Poll status (client list) + events every 2s while running; live values arrive
   // via the `simulator_values` push event (subscribed below) instead of polling.
   useEffect(() => {
-    if (!status.running) { setSnapshot([]); return; }
+    if (!status.running) { live.clear(); return; }
     let cancelled = false;
     const tick = async () => {
       try {
@@ -89,37 +90,50 @@ export function useSimulatorData(ws: string) {
           invoke<SimStatus>("simulator_status", { name: ws }),
           invoke<SimEvent[]>("simulator_events", { name: ws }),
         ]);
-        if (!cancelled) { setStatus(st); setEvents(evs ?? []); }
+        if (cancelled) return;
+        // Only update state when something differs, so an idle poll re-renders nothing.
+        setStatus((cur) => (JSON.stringify(cur) === JSON.stringify(st) ? cur : st));
+        setEvents((cur) => (JSON.stringify(cur) === JSON.stringify(evs ?? []) ? cur : (evs ?? [])));
       } catch { /* transient */ }
     };
     const id = window.setInterval(tick, 2000);
     return () => { cancelled = true; window.clearInterval(id); };
-  }, [status.running, ws]);
+  }, [status.running, ws, live]);
 
   // Subscribe to live register values for this workspace.
   useEffect(() => {
     let unlisten: UnlistenFn | null = null;
     let disposed = false;
     (async () => {
-      const un = await tauriListen<{ workspace: string; rows: SnapshotRow[] }>("simulator_values", (event) => {
+      const un = await tauriListen<SimValuesEvent>("simulator_values", (event) => {
         if (event.payload.workspace !== ws) return;
-        setSnapshot(event.payload.rows);
+        live.apply(event.payload);
       });
       if (disposed) { void un(); return; }
       unlisten = un;
+      // Ask for a full snapshot now that we're listening, so values show immediately.
+      try { await invoke("simulator_request_full", { name: ws }); } catch { /* not running or transient */ }
     })();
     return () => {
       disposed = true;
       if (unlisten) void unlisten();
     };
-  }, [ws]);
+  }, [ws, live]);
 
-  const saveConfig = useCallback(async (patch: Partial<SimConfig>) => {
-    if (!config) return;
+  /** Optimistic save; resolves false (error set, saved config restored) on failure. */
+  const saveConfig = useCallback(async (patch: Partial<SimConfig>): Promise<boolean> => {
+    if (!config) return false;
     const next = { ...config, ...patch };
     setConfig(next);
-    try { await invoke("simulator_set_config", { name: ws, config: next }); }
-    catch (e) { setError(String(e)); }
+    try {
+      await invoke("simulator_set_config", { name: ws, config: next });
+      return true;
+    } catch (e) {
+      setError(String(e));
+      // Roll back unless something newer replaced the optimistic value.
+      setConfig((cur) => (cur === next ? config : cur));
+      return false;
+    }
   }, [config, ws]);
 
   const start = useCallback(async () => {
@@ -128,11 +142,7 @@ export function useSimulatorData(ws: string) {
       const st = await invoke<SimStatus>("simulator_start", { name: ws });
       setStatus(st);
       if (st.listen) setListen(st.listen);
-      // Fetch an immediate snapshot so values show before the first push event arrives.
-      try {
-        const rows = await invoke<SnapshotRow[]>("simulator_snapshot", { name: ws });
-        setSnapshot(rows);
-      } catch { /* transient */ }
+      // No snapshot fetch: the first values event after Start is a full one.
     } catch (e) { setError(String(e)); }
     finally { setBusy(false); }
   }, [ws]);
@@ -150,14 +160,14 @@ export function useSimulatorData(ws: string) {
     finally { setBusy(false); }
   }, [ws]);
 
-  const addRegister = useCallback(async (reg: SimRegister) => {
-    try { await invoke("simulator_add_register", { name: ws, register: reg }); await reload(); }
-    catch (e) { setError(String(e)); }
+  const addRegister = useCallback(async (reg: SimRegister): Promise<boolean> => {
+    try { await invoke("simulator_add_register", { name: ws, register: reg }); await reload(); return true; }
+    catch (e) { setError(String(e)); return false; }
   }, [ws, reload]);
 
-  const updateRegister = useCallback(async (reg: SimRegister) => {
-    try { await invoke("simulator_update_register", { name: ws, register: reg }); await reload(); }
-    catch (e) { setError(String(e)); }
+  const updateRegister = useCallback(async (reg: SimRegister): Promise<boolean> => {
+    try { await invoke("simulator_update_register", { name: ws, register: reg }); await reload(); return true; }
+    catch (e) { setError(String(e)); return false; }
   }, [ws, reload]);
 
   const deleteRegister = useCallback(async (id: number) => {
@@ -199,7 +209,7 @@ export function useSimulatorData(ws: string) {
     catch (e) { setError(String(e)); }
   }, [ws, reload, registers]);
 
-  const addDevice = useCallback(async (payload: AddDevicePayload) => {
+  const addDevice = useCallback(async (payload: AddDevicePayload): Promise<boolean> => {
     try {
       await invoke("simulator_add_device", {
         name: ws,
@@ -209,12 +219,13 @@ export function useSimulatorData(ws: string) {
         baseAddress: payload.baseAddress,
       });
       await reload();
-    } catch (e) { setError(String(e)); }
+      return true;
+    } catch (e) { setError(String(e)); return false; }
   }, [ws, reload]);
 
   // Instantiate a device from an inline template (a "Workspace" slave device
   // whose route map is built on the fly, not in the shared catalog).
-  const addSlaveDevice = useCallback(async (template: DeviceTemplate, payload: AddDevicePayload) => {
+  const addSlaveDevice = useCallback(async (template: DeviceTemplate, payload: AddDevicePayload): Promise<boolean> => {
     try {
       await invoke("simulator_add_inline_device", {
         name: ws,
@@ -224,7 +235,8 @@ export function useSimulatorData(ws: string) {
         baseAddress: payload.baseAddress,
       });
       await reload();
-    } catch (e) { setError(String(e)); }
+      return true;
+    } catch (e) { setError(String(e)); return false; }
   }, [ws, reload]);
 
   const updateDevice = useCallback(async (device: SimDevice) => {
@@ -247,14 +259,14 @@ export function useSimulatorData(ws: string) {
     catch (e) { setError(String(e)); }
   }, [ws, reload]);
 
-  const addRule = useCallback(async (rule: SimRule) => {
-    try { await invoke("simulator_add_rule", { name: ws, rule }); await reload(); }
-    catch (e) { setError(String(e)); }
+  const addRule = useCallback(async (rule: SimRule): Promise<boolean> => {
+    try { await invoke("simulator_add_rule", { name: ws, rule }); await reload(); return true; }
+    catch (e) { setError(String(e)); return false; }
   }, [ws, reload]);
 
-  const updateRule = useCallback(async (rule: SimRule) => {
-    try { await invoke("simulator_update_rule", { name: ws, rule }); await reload(); }
-    catch (e) { setError(String(e)); }
+  const updateRule = useCallback(async (rule: SimRule): Promise<boolean> => {
+    try { await invoke("simulator_update_rule", { name: ws, rule }); await reload(); return true; }
+    catch (e) { setError(String(e)); return false; }
   }, [ws, reload]);
 
   const deleteRule = useCallback(async (id: number) => {
@@ -303,14 +315,8 @@ export function useSimulatorData(ws: string) {
     } catch (e) { setError(String(e)); return false; }
   }, [reload]);
 
-  const snapshotFor = useCallback(
-    (unitId: number, fc: number, address: number): SnapshotRow | undefined =>
-      snapshot.find((s) => s.unitId === unitId && s.functionCode === fc && s.address === address),
-    [snapshot]
-  );
-
   return {
-    config, registers, devices, rules, status, listen, snapshot, events,
+    config, registers, devices, rules, status, listen, live, events,
     deviceTemplates, error, busy, lastUpdated,
     reload, saveConfig, start, stop,
     addRegister, updateRegister, deleteRegister, duplicateRegister,
@@ -318,6 +324,5 @@ export function useSimulatorData(ws: string) {
     addRule, updateRule, deleteRule,
     exportProfile, importProfile, buildDeviceTemplate, saveCustomTemplate,
     setError,
-    snapshotFor,
   };
 }

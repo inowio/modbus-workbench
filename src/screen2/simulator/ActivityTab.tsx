@@ -1,5 +1,4 @@
-import { useEffect, useState } from "react";
-
+import { fmtDuration, useNow } from "./useNow";
 import type { SimEvent, SimStatus } from "./useSimulatorData";
 
 export type ActivityTabProps = {
@@ -20,27 +19,6 @@ function fmtClock(epochMs: number): string {
   } catch {
     return "—";
   }
-}
-
-function fmtDuration(ms: number): string {
-  if (ms < 0) ms = 0;
-  const s = Math.floor(ms / 1000);
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  const sec = s % 60;
-  const pad = (n: number) => String(n).padStart(2, "0");
-  return h > 0 ? `${h}:${pad(m)}:${pad(sec)}` : `${m}:${pad(sec)}`;
-}
-
-// Re-render once a second so uptime/durations tick.
-function useNow(active: boolean): number {
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    if (!active) return;
-    const id = window.setInterval(() => setNow(Date.now()), 1000);
-    return () => window.clearInterval(id);
-  }, [active]);
-  return now;
 }
 
 export default function ActivityTab({ status, events }: ActivityTabProps) {

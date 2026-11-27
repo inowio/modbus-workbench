@@ -1,31 +1,37 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useOutletContext } from "react-router-dom";
 import type { Screen2OutletContext } from "../Screen2Layout";
 import ConfirmDialog from "../../components/ConfirmDialog";
 import { useErrorToast, useToast } from "../../components/ToastProvider";
 import { FiActivity, FiSave } from "react-icons/fi";
 import {
+  createAnalyzerTab,
   createAnalyzerTile,
+  deleteAnalyzerTab,
+  duplicateAnalyzerTile,
+  moveAnalyzerTileToTab,
   deleteAnalyzerTile,
   listAnalyzerSignals,
+  listAnalyzerTabs,
   listAnalyzerTileLayouts,
   listAnalyzerTileSignals,
   listAnalyzerTiles,
+  renameAnalyzerTab,
+  reorderAnalyzerTabs,
   saveAnalyzerTileLayouts,
   setAnalyzerTilePollingEnabled,
   startAnalyzerPolling,
   stopAnalyzerPolling,
   updateAnalyzerTile,
   type AnalyzerSignal,
+  type AnalyzerTab,
   type AnalyzerTile,
+  type AnalyzerTileLayout,
   type AnalyzerTileSignalInfo,
 } from "../api/analyzer";
-import {
-  decodeAnalyzerSignal,
-  parseAnalyzerRawSnapshotFromJson,
-} from "../utils/analyzerSignalDecoder";
+import type { SignalEvaluation } from "../utils/analyzerSignalEval";
 import { listSlaves, type SlaveItem } from "../api/slaves";
 import type { AnalyzerTrendPoint } from "../components/AnalyzerTrendTile";
 import {
@@ -34,15 +40,30 @@ import {
   PortItem as SerialPortItem,
   normalizeConnectionSettings,
 } from "../components/ConnectionSettingsForm";
-import AnalyzerHeaderCard from "./analyzer/AnalyzerHeaderCard";
+import AnalyzerControlBar from "./analyzer/AnalyzerControlBar";
 import AnalyzerTilesCard from "./analyzer/AnalyzerTilesCard";
 import AnalyzerAddEditTileModal from "./analyzer/AnalyzerAddEditTileModal";
 import AnalyzerConfigureSignalsModal from "./analyzer/AnalyzerConfigureSignalsModal";
+import AnalyzerTabsStrip from "./analyzer/AnalyzerTabsStrip";
+import AnalyzerFocusOverlay from "./analyzer/AnalyzerFocusOverlay";
+import { useFocusView, useTabCycle } from "./analyzer/useFocusView";
+import DeleteTabDialog from "./analyzer/DeleteTabDialog";
+import {
+  nextTabId,
+  readLastTabId,
+  resolveSelectedTab,
+  tabStatus,
+  useTabShortcuts,
+  writeLastTabId,
+  type TabStatus,
+} from "./analyzer/tabs";
 import { getChartKind } from "./analyzer/chartKind";
+import { computeSignalEvaluations, dependentsBySignalId, type LiveSignalUpdate } from "./analyzer/signalEvaluations";
 import type { BreakpointLayouts, GridLayout } from "./analyzer/layoutTypes";
 import { buildLayoutsFromSaved } from "./analyzer/layoutTypes";
 import { logEvent, type LogLevel } from "../api/logs";
-import { formatAnalyzerAddress, type AnalyzerAddressFormat } from "../utils/analyzerAddressFormat";
+import { formatAnalyzerAddress } from "../utils/analyzerAddressFormat";
+import { useAppAddressFormat } from "../utils/addressFormatPref";
 
 type AnalyzerSignalUpdate = {
   workspace: string;
@@ -61,8 +82,27 @@ type AnalyzerPollingBackoffEvent = {
   attempt: number;
 };
 
+type PendingLayoutSave = { tileId: number; breakpoint: "desktop" | "mobile"; x: number; y: number; w: number; h: number };
+
+/** Default placement is per tab (each tab's grid starts at the top), saved rows override it. */
+function buildLayoutsPerTab(tiles: AnalyzerTile[], saved: AnalyzerTileLayout[]): BreakpointLayouts {
+  const byTab = new Map<number, AnalyzerTile[]>();
+  for (const t of tiles) {
+    const group = byTab.get(t.tabId) ?? [];
+    group.push(t);
+    byTab.set(t.tabId, group);
+  }
+  const out: BreakpointLayouts = { desktop: [], mobile: [] };
+  for (const group of byTab.values()) {
+    const layouts = buildLayoutsFromSaved(group, saved);
+    out.desktop.push(...layouts.desktop);
+    out.mobile.push(...layouts.mobile);
+  }
+  return out;
+}
+
 export default function AnalyzerPage() {
-  const { workspace } = useOutletContext<Screen2OutletContext>();
+  const { workspace, setFocusMode } = useOutletContext<Screen2OutletContext>();
   const { pushToast } = useToast();
 
   const [loading, setLoading] = useState(false);
@@ -79,9 +119,18 @@ export default function AnalyzerPage() {
   const [tileSignals, setTileSignals] = useState<Record<number, AnalyzerTileSignalInfo[]>>({});
   const tileSignalsRef = useRef(tileSignals);
 
+  const [tabs, setTabs] = useState<AnalyzerTab[]>([]);
+  const [selectedTabId, setSelectedTabId] = useState<number | null>(null);
+  const selectedTabIdRef = useRef<number | null>(null);
+  const [deleteTabTarget, setDeleteTabTarget] = useState<AnalyzerTab | null>(null);
+  const [deleteTabBusy, setDeleteTabBusy] = useState(false);
+  const [deleteTabError, setDeleteTabError] = useState<string | null>(null);
+
   const [layoutEditMode, setLayoutEditMode] = useState(false);
+  // Layouts of every tile on every tab; the grid only gets the selected tab's.
   const [gridLayouts, setGridLayouts] = useState<BreakpointLayouts>({ desktop: [], mobile: [] });
   const layoutSaveTimerRef = useRef<number | null>(null);
+  const pendingLayoutSavesRef = useRef<Map<string, PendingLayoutSave>>(new Map());
   const gridHostRef = useRef<HTMLDivElement | null>(null);
   const [gridWidth, setGridWidth] = useState<number>(0);
   const gridWidthMeasureTimerRef = useRef<number | null>(null);
@@ -103,8 +152,10 @@ export default function AnalyzerPage() {
   const [liveUpdates, setLiveUpdates] = useState<Record<string, AnalyzerSignalUpdate>>({});
   const [historyByTileId, setHistoryByTileId] = useState<Record<number, AnalyzerTrendPoint[]>>({});
   const [trendWindowMinutes, setTrendWindowMinutes] = useState<number | null>(5);
-  const [addressFormat, setAddressFormat] = useState<AnalyzerAddressFormat>("dec");
-  const signalInfoBySignalIdRef = useRef<Record<string, AnalyzerTileSignalInfo>>({});
+  const [addressFormat] = useAppAddressFormat();
+  const latestLiveRef = useRef<Record<string, AnalyzerSignalUpdate>>({});
+  const signalsRef = useRef<AnalyzerSignal[]>([]);
+  const getSignalPollIntervalMsRef = useRef<(signalId: string, seen?: Set<string>) => number>(() => 1000);
   const pendingLiveUpdatesRef = useRef<Record<string, AnalyzerSignalUpdate>>({});
   const pendingHistoryPointsRef = useRef<Record<number, AnalyzerTrendPoint[]>>({});
   const pendingFlushTimerRef = useRef<number | null>(null);
@@ -236,6 +287,67 @@ export default function AnalyzerPage() {
     tilesRef.current = tiles;
   }, [tiles]);
 
+  // A tile whose tab is unknown (never expected: the backend reads NULL as the first tab) shows on the first tab.
+  const tabIdOfTile = useMemo(() => {
+    const known = new Set(tabs.map((t) => t.id));
+    const firstTabId = resolveSelectedTab(tabs, null);
+    return (tile: AnalyzerTile) => (known.has(tile.tabId) ? tile.tabId : firstTabId);
+  }, [tabs]);
+
+  // Only rendering is filtered by tab: live values and trend history stay page-wide for all tiles.
+  const visibleTiles = useMemo(
+    () => (selectedTabId == null ? [] : tiles.filter((t) => tabIdOfTile(t) === selectedTabId)),
+    [tiles, selectedTabId, tabIdOfTile],
+  );
+
+  const visibleGridLayouts = useMemo<BreakpointLayouts>(() => {
+    const ids = new Set(visibleTiles.map((t) => String(t.id)));
+    return {
+      desktop: gridLayouts.desktop.filter((l) => ids.has(l.i)),
+      mobile: gridLayouts.mobile.filter((l) => ids.has(l.i)),
+    };
+  }, [gridLayouts, visibleTiles]);
+
+  // The grid reports only the selected tab's tiles: replace those and keep every other tab's layouts.
+  function onVisibleGridLayoutsChange(next: BreakpointLayouts) {
+    const merge = (prev: GridLayout, incoming: GridLayout): GridLayout => {
+      const ids = new Set(incoming.map((l) => l.i));
+      return [...prev.filter((l) => !ids.has(l.i)), ...incoming];
+    };
+    setGridLayouts((prev) => ({
+      desktop: merge(prev.desktop, next.desktop),
+      mobile: merge(prev.mobile, next.mobile),
+    }));
+  }
+
+  function selectTab(id: number) {
+    selectedTabIdRef.current = id;
+    setSelectedTabId(id);
+    writeLastTabId(workspaceNameRef.current, id);
+  }
+
+  // Stays enabled in focus view too.
+  useTabShortcuts(tabs, selectTab, true);
+
+  function stepTab(dir: 1 | -1) {
+    const current = selectedTabIdRef.current;
+    if (current == null) return;
+    const id = nextTabId(tabs, current, dir);
+    if (id !== current) selectTab(id);
+  }
+
+  const focusView = useFocusView({ setFocusMode, onError: setError });
+  const focusMode = focusView.focus;
+  const [focusOverlayHovered, setFocusOverlayHovered] = useState(false);
+  // An open tile Info dialog pauses cycling like hovering the overlay does.
+  const [tileInfoOpen, setTileInfoOpen] = useState(false);
+  const [cycleSeconds, setCycleSeconds] = useTabCycle({
+    workspace: workspaceName,
+    active: focusMode && !focusOverlayHovered && !tileInfoOpen,
+    currentTabId: selectedTabId,
+    advance: () => stepTab(1),
+  });
+
   const slavesById = useMemo(() => {
     const out = new Map<number, { pollIntervalMs: number }>();
     for (const s of slaves) {
@@ -252,25 +364,73 @@ export default function AnalyzerPage() {
     return out;
   }, [signals]);
 
-  function getSignalPollIntervalMs(signalId: string): number {
+  function getSignalPollIntervalMs(signalId: string, seen: Set<string> = new Set()): number {
     const sig = signalsById.get(signalId) ?? null;
     if (!sig) return 1000;
-    const slave = slavesById.get(sig.slaveId) ?? null;
+    if (sig.kind === "calculated") {
+      // A calculated signal updates whenever one of its inputs does: use the fastest input.
+      if (seen.has(signalId)) return 1000;
+      seen.add(signalId);
+      let min = Infinity;
+      for (const inputId of sig.inputSignalIds ?? []) {
+        min = Math.min(min, getSignalPollIntervalMs(inputId, seen));
+      }
+      return Number.isFinite(min) ? min : 1000;
+    }
+    const slave = slavesById.get(sig.slaveId ?? -1) ?? null;
     const interval = slave?.pollIntervalMs ?? 0;
     return interval > 0 ? interval : 1000;
   }
+  getSignalPollIntervalMsRef.current = getSignalPollIntervalMs;
 
   useEffect(() => {
-    const next: Record<string, AnalyzerTileSignalInfo> = {};
-    for (const links of Object.values(tileSignals)) {
-      for (const l of links) {
-        if (!next[l.signalId]) {
-          next[l.signalId] = l;
-        }
-      }
-    }
-    signalInfoBySignalIdRef.current = next;
-  }, [tileSignals]);
+    signalsRef.current = signals;
+  }, [signals]);
+
+  // Same stale rule the tiles always used: a base state of OK turns STALE/DISCONNECTED by age.
+  function deriveUiState(
+    signal: { id: string; state?: string | null; lastUpdatedTsMs?: number | null },
+    live: LiveSignalUpdate | null,
+    nowMs: number,
+  ): string {
+    const baseState = (live?.state ?? signal.state ?? "DISCONNECTED").toString().toUpperCase();
+    if (baseState !== "OK") return baseState;
+
+    const expectedMs = getSignalPollIntervalMsRef.current(signal.id);
+    const staleAfterMs = Math.max(1500, Math.round(expectedMs * 2.5));
+    const lastTs = live?.tsMs ?? signal.lastUpdatedTsMs ?? null;
+    if (lastTs == null) return "DISCONNECTED";
+
+    const age = nowMs - lastTs;
+    if (Number.isFinite(age) && age > staleAfterMs) return "STALE";
+    return "OK";
+  }
+
+  const evaluations = useMemo(
+    () =>
+      computeSignalEvaluations({
+        signals,
+        live: pollingWanted ? liveUpdates : {},
+        // Age staleness applies only while polling; at rest values decode from the stored state alone.
+        uiState: pollingWanted ? (sig, live) => deriveUiState(sig, live, nowTsMs) : undefined,
+      }),
+    // deriveUiState reads poll intervals derived from signals/slaves.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [signals, slaves, liveUpdates, pollingWanted, nowTsMs],
+  );
+
+  const staticEvaluations = useMemo(
+    () =>
+      computeSignalEvaluations({
+        signals,
+        live: {},
+      }),
+    [signals],
+  );
+
+  const dependents = useMemo(() => dependentsBySignalId(signals), [signals]);
+  const dependentsRef = useRef(dependents);
+  dependentsRef.current = dependents;
 
   useEffect(() => {
     return () => {
@@ -286,7 +446,12 @@ export default function AnalyzerPage() {
     };
   }, []);
 
-  useEffect(() => {
+  // The grid host only exists while the selected tab has tiles, so re-attach when that changes
+  // (and when focus view hides or shows the chrome around it).
+  // Measured before paint (layout effect), so tiles are placed at their final size on the first
+  // frame instead of rendering at a guessed width and then moving. Later resizes are coalesced
+  // to one measurement per animation frame.
+  useLayoutEffect(() => {
     const el = gridHostRef.current;
     if (!el) return;
 
@@ -299,28 +464,22 @@ export default function AnalyzerPage() {
       setGridWidth(next);
     };
 
-    const schedule = () => {
-      if (gridWidthMeasureTimerRef.current != null) {
-        window.clearTimeout(gridWidthMeasureTimerRef.current);
-      }
-      gridWidthMeasureTimerRef.current = window.setTimeout(measureAndSet, 120);
-    };
-
-    schedule();
+    measureAndSet();
 
     const ro = new ResizeObserver(() => {
-      schedule();
+      if (gridWidthMeasureTimerRef.current != null) return;
+      gridWidthMeasureTimerRef.current = window.requestAnimationFrame(measureAndSet);
     });
 
     ro.observe(el);
     return () => {
       ro.disconnect();
       if (gridWidthMeasureTimerRef.current != null) {
-        window.clearTimeout(gridWidthMeasureTimerRef.current);
+        window.cancelAnimationFrame(gridWidthMeasureTimerRef.current);
         gridWidthMeasureTimerRef.current = null;
       }
     };
-  }, [layoutEditMode, tiles.length]);
+  }, [layoutEditMode, visibleTiles.length, focusMode]);
 
   useEffect(() => {
     return () => {
@@ -429,33 +588,6 @@ export default function AnalyzerPage() {
     });
   }, [tiles]);
 
-  function deriveNumericSample(update: AnalyzerSignalUpdate, info: AnalyzerTileSignalInfo): number | null {
-    const state = (update.state || "").toUpperCase();
-    if (state !== "OK") return null;
-
-    const rawWords = update.rawWords ?? null;
-    const rawBools = update.rawBools ?? null;
-    const decoded = decodeAnalyzerSignal({
-      state,
-      error: update.error ?? null,
-      rawWords,
-      rawBools,
-      functionCode: info.functionCode,
-      dataType: info.dataType,
-      order: info.order,
-      displayFormat: info.displayFormat,
-      decoderJson: info.decoderJson,
-    });
-
-    if (!decoded.ok) return null;
-    if (decoded.value.kind === "bool") return decoded.value.value ? 1 : 0;
-    if (decoded.value.kind === "bigint") {
-      const n = Number(decoded.value.value);
-      return Number.isFinite(n) ? n : null;
-    }
-    return Number.isFinite(decoded.value.value) ? decoded.value.value : null;
-  }
-
   function openAddTileModal(kind: "trend" | "value") {
     setTileModalError(null);
     setTileModalMode("add");
@@ -510,17 +642,181 @@ export default function AnalyzerPage() {
     }
     setTileSignals(next);
 
-    setGridLayouts(buildLayoutsFromSaved(rows, savedLayouts));
+    setGridLayouts(buildLayoutsPerTab(rows, savedLayouts));
 
     return rows;
+  }
+
+  /** Loads tabs and selects `wanted` (default: the current or remembered tab), falling back to the first tab. */
+  async function refreshTabs(wanted?: number | null): Promise<AnalyzerTab[]> {
+    const ws = workspaceName;
+    const rows = await listAnalyzerTabs(ws);
+    setTabs(rows);
+    const want = wanted !== undefined ? wanted : (selectedTabIdRef.current ?? readLastTabId(ws));
+    const id = resolveSelectedTab(rows, want);
+    if (id > 0) selectTab(id);
+    return rows;
+  }
+
+  async function createTab(name: string) {
+    const tab = await createAnalyzerTab(workspaceName, name);
+    setTabs((prev) => [...prev, tab]);
+    selectTab(tab.id);
+    logWorkspace("info", "Analyzer tab created", { tabId: tab.id, name: tab.name });
+  }
+
+  async function renameTab(id: number, name: string) {
+    const updated = await renameAnalyzerTab(workspaceName, id, name);
+    setTabs((prev) => prev.map((t) => (t.id === updated.id ? updated : t)));
+    logWorkspace("info", "Analyzer tab renamed", { tabId: updated.id, name: updated.name });
+  }
+
+  async function reorderTabs(ids: number[]) {
+    setTabs((prev) =>
+      prev.map((t) => {
+        const position = ids.indexOf(t.id);
+        return position >= 0 ? { ...t, position } : t;
+      }),
+    );
+    try {
+      await reorderAnalyzerTabs(workspaceName, ids);
+    } catch (e) {
+      logWorkspace("error", "Analyzer tab reorder failed", { error: String(e) });
+      setError(String(e));
+      try {
+        await refreshTabs();
+      } catch {
+        /* the reorder error is already shown */
+      }
+    }
+  }
+
+  function confirmDeleteTab(opts: { moveTilesTo?: number; deleteTiles?: boolean }) {
+    const tab = deleteTabTarget;
+    if (!tab) return;
+    setDeleteTabBusy(true);
+    setDeleteTabError(null);
+    void (async () => {
+      try {
+        if (opts.moveTilesTo != null) {
+          const moving = tiles.filter((t) => tabIdOfTile(t) === tab.id).map((t) => t.id);
+          if (moving.length > 0) await pinShownLayouts(opts.moveTilesTo, moving);
+        }
+        await deleteAnalyzerTab(workspaceName, tab.id, opts);
+      } catch (e) {
+        logWorkspace("error", "Analyzer tab delete failed", { tabId: tab.id, error: String(e) });
+        setDeleteTabError(String(e));
+        setDeleteTabBusy(false);
+        return;
+      }
+      logWorkspace("info", "Analyzer tab deleted", { tabId: tab.id, ...opts });
+      setDeleteTabTarget(null);
+      setDeleteTabBusy(false);
+      pushToast("Tab deleted", "info");
+      // Deleting the selected tab lands on the move target, or the first tab when its tiles were deleted.
+      const current = selectedTabIdRef.current;
+      const wanted = current === tab.id ? (opts.moveTilesTo ?? null) : current;
+      try {
+        await Promise.all([refreshTabs(wanted), refreshTiles()]);
+      } catch (e) {
+        setError(String(e));
+      }
+    })();
+  }
+
+  /**
+   * Layout rows are only written in Edit layout, so most tiles have none and sit at a per-tab default spot.
+   * The backend places moved / duplicated tiles below the target tab's rows, so first write the positions
+   * shown now (both breakpoints) for the target tab's tiles and the arriving ones; nothing visible moves.
+   */
+  async function pinShownLayouts(targetTabId: number, arrivingTileIds: number[]) {
+    const ids = new Set<number>(arrivingTileIds);
+    for (const t of tiles) {
+      if (tabIdOfTile(t) === targetTabId) ids.add(t.id);
+    }
+    const ws = workspaceNameRef.current;
+    const shown = {
+      desktop: new Map(gridLayouts.desktop.map((l) => [l.i, l])),
+      mobile: new Map(gridLayouts.mobile.map((l) => [l.i, l])),
+    };
+    await Promise.all(
+      [...ids].map((tileId) => {
+        const rows: Array<Omit<PendingLayoutSave, "tileId">> = [];
+        for (const breakpoint of ["desktop", "mobile"] as const) {
+          // A pending debounced save is the freshest position; drop it so it can't overwrite the placement.
+          const key = `${tileId}:${breakpoint}`;
+          const pending = pendingLayoutSavesRef.current.get(key);
+          pendingLayoutSavesRef.current.delete(key);
+          const l = pending ?? shown[breakpoint].get(String(tileId));
+          if (!l) continue;
+          rows.push({
+            breakpoint,
+            x: Math.max(0, Math.round(l.x)),
+            y: Math.max(0, Math.round(l.y)),
+            w: Math.max(1, Math.round(l.w)),
+            h: Math.max(1, Math.round(l.h)),
+          });
+        }
+        return rows.length > 0 ? saveAnalyzerTileLayouts(ws, tileId, rows) : Promise.resolve();
+      }),
+    );
+  }
+
+  async function reloadTilesAfterTabChange() {
+    try {
+      await refreshTiles();
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  async function moveTile(tile: AnalyzerTile, tabId: number) {
+    try {
+      await pinShownLayouts(tabId, [tile.id]);
+      await moveAnalyzerTileToTab(workspaceName, tile.id, tabId);
+      logWorkspace("info", "Analyzer tile moved", { tileId: tile.id, tabId });
+    } catch (e) {
+      logWorkspace("error", "Analyzer tile move failed", { tileId: tile.id, error: String(e) });
+      setError(String(e));
+      return;
+    }
+    await reloadTilesAfterTabChange();
+  }
+
+  async function duplicateTile(tile: AnalyzerTile, tabId: number) {
+    try {
+      await pinShownLayouts(tabId, [tile.id]);
+      const copy = await duplicateAnalyzerTile(workspaceName, tile.id, tabId);
+      logWorkspace("info", "Analyzer tile duplicated", { tileId: tile.id, copyId: copy.id, tabId });
+    } catch (e) {
+      logWorkspace("error", "Analyzer tile duplicate failed", { tileId: tile.id, error: String(e) });
+      setError(String(e));
+      return;
+    }
+    await reloadTilesAfterTabChange();
   }
 
   async function deleteTile(tile: AnalyzerTile) {
     setConfirmDeleteTile(tile);
   }
 
+  // Saves upsert one (tile, breakpoint) row each, so only the tiles the grid shows (the selected tab's) are written.
+  // Pending rows are keyed per tile+breakpoint so switching tabs within the debounce doesn't drop the previous tab's.
   function schedulePersistLayouts(breakpoint: "desktop" | "mobile", layout: GridLayout) {
     if (!layoutEditMode) return;
+
+    for (const item of layout) {
+      const tileId = Number(item.i);
+      if (!Number.isFinite(tileId) || tileId <= 0) continue;
+      pendingLayoutSavesRef.current.set(`${tileId}:${breakpoint}`, {
+        tileId,
+        breakpoint,
+        x: Math.max(0, Math.round(item.x)),
+        y: Math.max(0, Math.round(item.y)),
+        w: Math.max(1, Math.round(item.w)),
+        h: Math.max(1, Math.round(item.h)),
+      });
+    }
 
     if (layoutSaveTimerRef.current != null) {
       window.clearTimeout(layoutSaveTimerRef.current);
@@ -528,23 +824,14 @@ export default function AnalyzerPage() {
     }
 
     layoutSaveTimerRef.current = window.setTimeout(() => {
+      layoutSaveTimerRef.current = null;
       const ws = workspaceNameRef.current;
+      const rows = [...pendingLayoutSavesRef.current.values()];
+      pendingLayoutSavesRef.current.clear();
       void (async () => {
         try {
           await Promise.all(
-            layout.map(async (item) => {
-              const tileId = Number(item.i);
-              if (!Number.isFinite(tileId) || tileId <= 0) return;
-              await saveAnalyzerTileLayouts(ws, tileId, [
-                {
-                  breakpoint,
-                  x: Math.max(0, Math.round(item.x)),
-                  y: Math.max(0, Math.round(item.y)),
-                  w: Math.max(1, Math.round(item.w)),
-                  h: Math.max(1, Math.round(item.h)),
-                },
-              ]);
-            }),
+            rows.map(({ tileId, ...row }) => saveAnalyzerTileLayouts(ws, tileId, [row])),
           );
         } catch (e) {
           setError(String(e));
@@ -557,7 +844,7 @@ export default function AnalyzerPage() {
     setLoading(true);
     setError(null);
     try {
-      const [, , nextTiles] = await Promise.all([refreshSignals(), refreshSlaves(), refreshTiles()]);
+      const [, , nextTiles] = await Promise.all([refreshSignals(), refreshSlaves(), refreshTiles(), refreshTabs()]);
 
       if (pollingWantedRef.current && nextTiles.length > 0) {
         await startAnalyzerPolling(workspaceName);
@@ -618,6 +905,10 @@ export default function AnalyzerPage() {
   }
 
   useEffect(() => {
+    latestLiveRef.current = {};
+    // Tab ids belong to a workspace: forget the selection so the new workspace's remembered tab applies.
+    selectedTabIdRef.current = null;
+    setSelectedTabId(null);
     void refreshAll();
   }, [workspaceName]);
 
@@ -638,9 +929,46 @@ export default function AnalyzerPage() {
           if (!pollingWantedRef.current) return;
 
           pendingLiveUpdatesRef.current[payload.signalId] = payload;
+          latestLiveRef.current[payload.signalId] = payload;
 
-          const info = signalInfoBySignalIdRef.current[payload.signalId] ?? null;
-          if (info) {
+          {
+            const currentSignals = signalsRef.current;
+            const deps = dependentsRef.current;
+            const byId = new Map(currentSignals.map((sg) => [sg.id, sg] as const));
+
+            // affected = the updated signal plus every calculated signal reading it (transitively).
+            const affected = new Set<string>([payload.signalId]);
+            const queue = [payload.signalId];
+            while (queue.length > 0) {
+              const id = queue.pop() as string;
+              for (const d of deps[id] ?? []) {
+                if (!affected.has(d)) {
+                  affected.add(d);
+                  queue.push(d);
+                }
+              }
+            }
+
+            // needed = affected plus everything those need as inputs (closure over inputs).
+            const needed = new Set<string>(affected);
+            const need = [...affected];
+            while (need.length > 0) {
+              const sg = byId.get(need.pop() as string);
+              if (!sg || sg.kind !== "calculated") continue;
+              for (const inId of sg.inputSignalIds ?? []) {
+                if (!needed.has(inId)) {
+                  needed.add(inId);
+                  need.push(inId);
+                }
+              }
+            }
+
+            const evals = computeSignalEvaluations({
+              signals: currentSignals.filter((sg) => needed.has(sg.id)),
+              live: latestLiveRef.current,
+              uiState: (sg, live) => deriveUiState(sg, live, Date.now()),
+            });
+
             const currentTiles = tilesRef.current;
             const currentTileSignals = tileSignalsRef.current;
 
@@ -655,13 +983,15 @@ export default function AnalyzerPage() {
               const links = currentTileSignals[t.id] ?? [];
               const primary = links.find((s) => s.role === "primary") ?? links[0] ?? null;
               if (!primary) continue;
-              if (primary.signalId !== payload.signalId) continue;
+              if (!affected.has(primary.signalId)) continue;
+              const evaluation = evals[primary.signalId];
+              if (!evaluation) continue;
               const tsMs = payload.tsMs ?? Date.now();
-              const sample = deriveNumericSample(payload, primary);
+              const sample = evaluation.sample;
               const existing = pendingHistoryPointsRef.current[t.id] ?? [];
               const last = existing.length > 0 ? existing[existing.length - 1] : null;
 
-              const expectedMs = getSignalPollIntervalMs(primary.signalId);
+              const expectedMs = getSignalPollIntervalMsRef.current(primary.signalId);
               const gapBreakMs = Math.max(1000, Math.round(expectedMs * 6));
               if (last && Number.isFinite(last.tsMs) && tsMs - last.tsMs >= gapBreakMs) {
                 existing.push({ tsMs: last.tsMs + 1, value: null });
@@ -790,18 +1120,8 @@ export default function AnalyzerPage() {
     }
   }
 
-  function deriveUiState(primary: AnalyzerTileSignalInfo, live: AnalyzerSignalUpdate | null): string {
-    const baseState = (live?.state ?? primary.state ?? "DISCONNECTED").toString().toUpperCase();
-    if (baseState !== "OK") return baseState;
-
-    const expectedMs = getSignalPollIntervalMs(primary.signalId);
-    const staleAfterMs = Math.max(1500, Math.round(expectedMs * 2.5));
-    const lastTs = live?.tsMs ?? primary.lastUpdatedTsMs ?? null;
-    if (lastTs == null) return "DISCONNECTED";
-
-    const age = nowTsMs - lastTs;
-    if (Number.isFinite(age) && age > staleAfterMs) return "STALE";
-    return "OK";
+  function evaluationFor(signalId: string, isRunning: boolean): SignalEvaluation | null {
+    return (isRunning ? evaluations : staticEvaluations)[signalId] ?? null;
   }
 
   function renderTileValue(tile: AnalyzerTile, isRunning: boolean): { label: string; state: string } {
@@ -809,37 +1129,9 @@ export default function AnalyzerPage() {
     const primary = links.find((s) => s.role === "primary") ?? links[0] ?? null;
     if (!primary) return { label: "No signal", state: "DISCONNECTED" };
 
-    const live = isRunning ? (liveUpdates[primary.signalId] ?? null) : null;
-
-    const uiState = deriveUiState(primary, live);
-    const decoderState = (live?.state ?? primary.state ?? "DISCONNECTED").toString();
-
-    const rawFromLive = {
-      rawWords: live?.rawWords ?? undefined,
-      rawBools: live?.rawBools ?? undefined,
-    };
-
-    const rawFromDb = parseAnalyzerRawSnapshotFromJson(primary.lastValueJson ?? null);
-
-    const rawWords = rawFromLive.rawWords ?? rawFromDb?.rawWords ?? null;
-    const rawBools = rawFromLive.rawBools ?? rawFromDb?.rawBools ?? null;
-
-    const decoded = decodeAnalyzerSignal({
-      state: decoderState,
-      error: live?.error ?? null,
-      errorJson: primary.errorJson ?? null,
-      rawWords,
-      rawBools,
-      functionCode: primary.functionCode,
-      dataType: primary.dataType,
-      order: primary.order,
-      displayFormat: primary.displayFormat,
-      decoderJson: primary.decoderJson,
-    });
-
-    if (!decoded.ok) return { label: decoded.formatted, state: uiState };
-
-    return { label: decoded.formatted, state: uiState };
+    const evaluation = evaluationFor(primary.signalId, isRunning);
+    if (!evaluation) return { label: "No signal", state: "DISCONNECTED" };
+    return { label: evaluation.formatted, state: evaluation.state };
   }
 
   function renderTrendTile(tile: AnalyzerTile, isRunning: boolean): { points: AnalyzerTrendPoint[]; state: string } {
@@ -847,10 +1139,19 @@ export default function AnalyzerPage() {
     const primary = links.find((s) => s.role === "primary") ?? links[0] ?? null;
     if (!primary) return { points: [], state: "DISCONNECTED" };
 
-    const live = isRunning ? (liveUpdates[primary.signalId] ?? null) : null;
-    const state = deriveUiState(primary, live);
+    const state = evaluationFor(primary.signalId, isRunning)?.state ?? "DISCONNECTED";
     const points = historyByTileId[tile.id] ?? [];
     return { points, state };
+  }
+
+  // The dot uses the same per-tile state the tiles render (value and trend tiles share the primary signal's state).
+  const statusByTabId: Record<number, TabStatus> = {};
+  for (const tab of tabs) {
+    statusByTabId[tab.id] = tabStatus(
+      tiles.filter((t) => tabIdOfTile(t) === tab.id),
+      (t) => renderTileValue(t, Boolean(pollingWanted && t.pollingEnabled)).state,
+      pollingWanted,
+    );
   }
 
   function getTilePollingIntervalMs(tileId: number): number | null {
@@ -892,6 +1193,8 @@ export default function AnalyzerPage() {
     registerAddress: number | null;
     registerAddressFormatted: string;
     registerType: string;
+    /** "Calculated · inputs: A, B" for calculated signals (they have no register); otherwise null. */
+    calculatedSource: string | null;
     pollIntervalMs: number | null;
   } | null {
     const tile = tiles.find((t) => t.id === tileId) ?? null;
@@ -920,6 +1223,10 @@ export default function AnalyzerPage() {
     const registerType = formatRegisterType(primary?.functionCode ?? null);
 
     const pollIntervalMs = getTilePollingIntervalMs(tileId);
+    const calculatedSource =
+      (sig ? sig.kind : primary?.kind) === "calculated"
+        ? `Calculated · inputs: ${(sig?.inputSignalIds ?? []).join(", ") || "none"}`
+        : null;
 
     return {
       tileType,
@@ -931,6 +1238,7 @@ export default function AnalyzerPage() {
       registerAddress,
       registerAddressFormatted,
       registerType,
+      calculatedSource,
       pollIntervalMs,
     };
   }
@@ -947,15 +1255,54 @@ export default function AnalyzerPage() {
   }, [tileModalEditingTile, tileSignals]);
 
   return (
-    <div className="flex flex-1 flex-col gap-4">
-      <AnalyzerHeaderCard
-        loading={loading}
-        onRefresh={() => void refreshAll()}
-        trendWindowMinutes={trendWindowMinutes}
-        onChangeTrendWindowMinutes={setTrendWindowMinutes}
-        addressFormat={addressFormat}
-        onChangeAddressFormat={setAddressFormat}
-      />
+    <div className={`flex flex-1 flex-col gap-4 ${focusMode ? "p-3" : ""}`}>
+      {focusMode ? (
+        <AnalyzerFocusOverlay
+          tabName={tabs.find((t) => t.id === selectedTabId)?.name ?? ""}
+          pollingWanted={pollingWanted}
+          onRun={() => void onStartPolling()}
+          onStop={() => void onStopPolling()}
+          onPrev={() => stepTab(-1)}
+          onNext={() => stepTab(1)}
+          cycleSeconds={cycleSeconds}
+          onCycleChange={setCycleSeconds}
+          fullscreen={focusView.fullscreen}
+          onToggleFullscreen={focusView.toggleFullscreen}
+          onExit={focusView.exit}
+          onHoverChange={setFocusOverlayHovered}
+        />
+      ) : (
+        <AnalyzerControlBar
+          loading={loading}
+          trendWindowMinutes={trendWindowMinutes}
+          onChangeTrendWindowMinutes={setTrendWindowMinutes}
+          pollingWanted={pollingWanted}
+          onRun={() => void onStartPolling()}
+          onStop={() => void onStopPolling()}
+          onConfigureSignals={() => setConfigureSignalsOpen(true)}
+          onOpenConnectionSettings={() => void openConnectionModal()}
+          onAddTile={() => openAddTileModalDefault()}
+          layoutEditMode={layoutEditMode}
+          onToggleLayoutEditMode={() => setLayoutEditMode((prev) => !prev)}
+          onRefresh={() => void refreshAll()}
+          onEnterFocus={focusView.enter}
+        >
+          <AnalyzerTabsStrip
+            tabs={tabs}
+            selectedTabId={selectedTabId}
+            statusByTabId={statusByTabId}
+            onSelect={selectTab}
+            onCreate={createTab}
+            onRename={renameTab}
+            onReorder={reorderTabs}
+            onRequestDelete={(id) => {
+              const tab = tabs.find((t) => t.id === id) ?? null;
+              setDeleteTabError(null);
+              setDeleteTabTarget(tab);
+            }}
+          />
+        </AnalyzerControlBar>
+      )}
 
       {error ? (
         <div className="rounded-xl border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-800 dark:text-rose-200">
@@ -964,17 +1311,16 @@ export default function AnalyzerPage() {
       ) : null}
 
       <AnalyzerTilesCard
-        tiles={tiles}
+        tiles={visibleTiles}
+        workspaceHasTiles={tiles.length > 0}
         pollingWanted={pollingWanted}
-        onStartPollingAll={() => void onStartPolling()}
-        onStopPollingAll={() => void onStopPolling()}
         gridReady={gridReady}
         layoutEditMode={layoutEditMode}
-        onToggleLayoutEditMode={() => setLayoutEditMode((prev) => !prev)}
+        focusMode={focusMode}
         gridHostRef={gridHostRef}
         effectiveGridWidth={effectiveGridWidth}
-        gridLayouts={gridLayouts}
-        onGridLayoutsChange={setGridLayouts}
+        gridLayouts={visibleGridLayouts}
+        onGridLayoutsChange={onVisibleGridLayoutsChange}
         derivedBreakpoint={derivedBreakpoint}
         schedulePersistLayouts={schedulePersistLayouts}
         renderTileValue={renderTileValue}
@@ -984,8 +1330,6 @@ export default function AnalyzerPage() {
         getTilePollingIntervalMs={getTilePollingIntervalMs}
         getTilePrimarySignalId={getTilePrimarySignalId}
         getTileInfo={getTileInfo}
-        onRefresh={() => void refreshAll()}
-        onOpenConnectionSettings={() => void openConnectionModal()}
         onConfigureSignals={() => {
           setConfigureSignalsOpen(true);
         }}
@@ -993,6 +1337,10 @@ export default function AnalyzerPage() {
         onToggleTilePolling={(t: AnalyzerTile) => void toggleTilePolling(t)}
         onEditTile={openEditTileModal}
         onDeleteTile={deleteTile}
+        tabs={tabs}
+        onMoveTile={(t, tabId) => void moveTile(t, tabId)}
+        onDuplicateTile={(t, tabId) => void duplicateTile(t, tabId)}
+        onInfoOpenChange={setTileInfoOpen}
       />
 
       <AnalyzerConfigureSignalsModal
@@ -1004,6 +1352,9 @@ export default function AnalyzerPage() {
         isPollingWanted={pollingWanted}
         nowTsMs={nowTsMs}
         getSignalPollIntervalMs={getSignalPollIntervalMs}
+        tiles={tiles}
+        tileSignals={tileSignals}
+        evaluations={evaluations}
         onClose={() => setConfigureSignalsOpen(false)}
         onAfterMutation={async () => {
           await refreshSignals();
@@ -1017,7 +1368,7 @@ export default function AnalyzerPage() {
         open={tileModalOpen}
         mode={tileModalMode}
         signals={signals}
-        slavesById={slavesById}
+        getSignalPollIntervalMs={getSignalPollIntervalMs}
         editingTile={tileModalEditingTile}
         editingTilePrimary={editingTilePrimary}
         initialKind={tileModalInitialKind}
@@ -1037,11 +1388,14 @@ export default function AnalyzerPage() {
               const configJson = input.kind === "trend" ? JSON.stringify({ chartKind: "trend" }) : "{}";
 
               if (tileModalMode === "add") {
+                const tabId = selectedTabIdRef.current;
+                if (tabId == null) throw new Error("Tabs are still loading");
                 await createAnalyzerTile(workspaceName, {
                   kind,
                   title: input.title,
                   configJson,
                   pollingEnabled: true,
+                  tabId,
                   layouts: [],
                   signalLinks: [
                     {
@@ -1081,6 +1435,7 @@ export default function AnalyzerPage() {
               }
 
               setTileModalOpen(false);
+              await refreshSignals();
               await refreshTiles();
             } catch (e) {
               logWorkspace("error", "Analyzer tile save failed", {
@@ -1098,10 +1453,20 @@ export default function AnalyzerPage() {
 
       {connectionModalOpen && connectionFormValue ? (
         <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/60 backdrop-blur-xs">
-          <div className="w-full max-w-2xl rounded-2xl border border-slate-200 bg-white p-6 text-slate-900 shadow-sm dark:border-slate-800 dark:bg-slate-900 dark:text-slate-100">
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="analyzer-connection-settings-title"
+            className="w-full max-w-2xl rounded-2xl border border-slate-200 bg-white p-6 text-slate-900 shadow-sm dark:border-slate-800 dark:bg-slate-900 dark:text-slate-100"
+          >
             <div className="mb-4 flex items-center justify-between">
               <div>
-                <div className="text-sm font-semibold text-emerald-700 dark:text-emerald-400">Connection settings</div>
+                <div
+                  id="analyzer-connection-settings-title"
+                  className="text-sm font-semibold text-emerald-700 dark:text-emerald-400"
+                >
+                  Connection settings
+                </div>
                 <div className="mt-1 text-xs text-slate-600 dark:text-slate-300">
                   Configure serial/TCP parameters for this workspace. Changes apply to all slaves.
                 </div>
@@ -1171,6 +1536,22 @@ export default function AnalyzerPage() {
         </div>
       ) : null}
 
+      {deleteTabTarget ? (
+        <DeleteTabDialog
+          tab={deleteTabTarget}
+          tileCount={tiles.filter((t) => tabIdOfTile(t) === deleteTabTarget.id).length}
+          otherTabs={tabs.filter((t) => t.id !== deleteTabTarget.id)}
+          busy={deleteTabBusy}
+          error={deleteTabError}
+          onCancel={() => {
+            if (deleteTabBusy) return;
+            setDeleteTabError(null);
+            setDeleteTabTarget(null);
+          }}
+          onConfirm={confirmDeleteTab}
+        />
+      ) : null}
+
       <ConfirmDialog
         open={confirmDeleteTile != null}
         title="Delete tile"
@@ -1196,6 +1577,7 @@ export default function AnalyzerPage() {
               pushToast("Tile deleted", "info");
               logWorkspace("info", "Analyzer tile deleted", { tileId: tile.id });
               setConfirmDeleteTile(null);
+              await refreshSignals();
               await refreshTiles();
             } catch (e) {
               logWorkspace("error", "Analyzer tile delete failed", { tileId: tile.id, error: String(e) });
